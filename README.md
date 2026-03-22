@@ -1,7 +1,8 @@
 <div align="center">  
-  <h1 align="center"><img src="assets/icon.png" width="40" style="vertical-align: middle;">  Click and Traverse </h1>
+  <img src="assets/icon.png" width="150" style="vertical-align: middle;">
+  <h1 align="center"> Click and Traverse </h1>
+Collision-Free Humanoid Traversal in Cluttered Indoor Scenes
   <h3 align="center"> Tsinghua · GALBOT </h3>
-
 
 [中文](README_zh.md) | [English](README.md)
 
@@ -14,13 +15,6 @@
 - 2026/01/08: We release the official implementation of CAT!
 
 ---
-
-This repository provides the **official implementation** of the paper:
-
-> **Collision-Free Humanoid Traversal in Cluttered Indoor Scenes**
-> *Han Xue et al.*
-> arXiv preprint: [arXiv:2601.16035](https://arxiv.org/abs/2601.16035).
-> project page: [https://axian12138.github.io/CAT/](https://axian12138.github.io/CAT/).
 
 The project addresses the problem of enabling humanoid robots to safely traverse **cluttered indoor scenes**, which we define as environments that simultaneously exhibit:
 
