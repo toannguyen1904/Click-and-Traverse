@@ -142,7 +142,7 @@ Click-and-Traverse/
 │   |   ├── TypiObs/                # typical obstacles
 │   |   └── unitree_g1/             # humanoid assets
 │   └── logs/
-|       └── G1_mj_axis/             # downloaded checkpoints
+|       └── origin/             # downloaded checkpoints
 ├── deploy/                         # Real-world deployment
 │   ├── gx_loco_deploy/             # deploy helpers
 │   ├── scripts/
