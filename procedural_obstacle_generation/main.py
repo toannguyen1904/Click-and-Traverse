@@ -6,6 +6,9 @@ from pf_modular import make_sdf, make_guidance_field_progressive, grad3, PFConfi
 import numpy as np
 from utills import marching_cubes_mesh, occupancy_to_points, preview_matplotlib, combine_meshes
 import itertools
+
+
+# function fo generating random obstacles
 def generate_random_obstacle(difficulty, seed, n_rect_R, n_rect_F, n_rect_C):
     n_rect_L=n_rect_R
     prefix = f"D{int(difficulty*10)}G{n_rect_F:01d}L{n_rect_R:01d}O{n_rect_C:01d}S{seed}/"
@@ -56,6 +59,7 @@ def generate_random_obstacle(difficulty, seed, n_rect_R, n_rect_F, n_rect_C):
     os.makedirs(f"fig/", exist_ok=True)
     visualize_all(xv, yv, zv, sdf, T, gf, obs_mask, cfg.start_w, cfg.goal_w, title_prefix=f'fig/{prefix[:-1]}')
 
+# function fo generating typical obstacles
 def generate_typical_obstacle(scene_type):
     prefix = f"{scene_type}/"
     obs_cfg = ObsCfg()

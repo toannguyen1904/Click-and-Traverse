@@ -3,74 +3,97 @@ import torch
 from dataclasses import dataclass
 from scipy.ndimage import binary_closing, binary_opening, binary_erosion, rotate as ndi_rotate
 import os
+
+
 @dataclass
 class Cfg:
-    Lx: float = 3.0; Ly: float = 2.0; Lz: float = 1.5
-    voxel: float = 0.04
-    origin_w: tuple = (-0.5, -1.0, 0.0)
-    start_w:  tuple = (0.0,  0.0, 0.75)
-    goal_w:   tuple = (2.0,  0.0, 0.75)
+    # --- Scene dimensions (metres) ---
+    Lx: float = 3.0   # length along X (robot travel direction)
+    Ly: float = 2.0   # width  along Y (lateral)
+    Lz: float = 1.5   # height along Z
 
-    difficulty: float = 0.9
-    seed: int = 42
+    # --- Voxel resolution ---
+    voxel: float = 0.04  # edge length of one voxel in metres (4 cm)
 
-    rect_factor: float = 1.0
-    density_bias: float = 0.25
+    # --- World-frame anchor points ---
+    origin_w: tuple = (-0.5, -1.0, 0.0)   # world-space origin of the voxel grid (x,y,z)
+    start_w:  tuple = (0.0,  0.0, 0.75)   # robot start position; kept obstacle-free
+    goal_w:   tuple = (2.0,  0.0, 0.75)   # robot goal  position; kept obstacle-free
 
-    block_dx_L: tuple = (0.3, 0.50)     # lateral left
-    block_dz_L: tuple = (0.6, 0.80)
+    # --- Difficulty & reproducibility ---
+    difficulty: float = 0.9  # global difficulty in [0, 1]; scales obstacle count, size, and gap tightness
+    seed: int = 42            # random seed for full reproducibility
 
-    block_dx_R: tuple = (0.3, 0.50)     # lateral right
-    block_dz_R: tuple = (0.6, 0.80)
+    # --- Obstacle density knobs ---
+    rect_factor:  float = 1.0   # multiplier on the auto-computed number of rectangles per layer
+    density_bias: float = 0.25  # additive bias on top of difficulty when computing rectangle count
 
-    block_dx_F: tuple = (0.10, 0.25)    # floor
-    block_dy_F: tuple = (0.4, 1.60) 
+    # --- Per-obstacle block size ranges (min, max) in metres ---
+    block_dx_L: tuple = (0.3, 0.50)   # X-thickness of each left-wall  block
+    block_dz_L: tuple = (0.6, 0.80)   # Z-height    of each left-wall  block
 
-    block_dx_C: tuple = (0.18, 0.60)    # ceiling
-    block_dy_C: tuple = (0.4, 1.60)  
+    block_dx_R: tuple = (0.3, 0.50)   # X-thickness of each right-wall block
+    block_dz_R: tuple = (0.6, 0.80)   # Z-height    of each right-wall block
 
-    n_rect_L: int = 9 # 0-9
-    n_rect_R: int = 9 # 0-9
-    n_rect_F: int = 3 # 0-3
-    n_rect_C: int = 3 # 0-3
+    block_dx_F: tuple = (0.10, 0.25)  # X-thickness of each floor   block
+    block_dy_F: tuple = (0.4,  1.60)  # Y-width     of each floor   block
 
-    y_center: float = 0.0
-    gap_half_min: float = 0.16
-    gap_half_max: float = 0.3
-    gap_margin:   float = 0.05
-    curve_knots_per_m: float = 0.9
-    curve_smooth_vox: int = 9
+    block_dx_C: tuple = (0.18, 0.60)  # X-thickness of each ceiling block
+    block_dy_C: tuple = (0.4,  1.60)  # Y-width     of each ceiling block
 
-    lr_thick_ratio_min: float = 0.3
-    lr_thick_ratio_max: float = 1.0
+    # --- Number of rectangular blocks per obstacle layer ---
+    n_rect_L: int = 9  # left-wall  blocks  (0 = no left-wall obstacles)
+    n_rect_R: int = 9  # right-wall blocks  (0 = no right-wall obstacles)
+    n_rect_F: int = 3  # floor      blocks  (0 = no floor obstacles)
+    n_rect_C: int = 3  # ceiling    blocks  (0 = no ceiling obstacles)
 
-    gate_segments_per_meter: float = 0.8
-    gate_min_len: float = 0.30
-    gate_max_len: float = 0.40
-    gate_join_gap: float = 0.2
-    gate_dir_jitter: float = 0.10
+    # --- Corridor path parameters ---
+    y_center: float = 0.0          # nominal Y-center of the passable corridor
+    gap_half_min: float = 0.16     # minimum half-width of the corridor gap (metres)
+    gap_half_max: float = 0.3      # maximum half-width of the corridor gap (metres)
+    gap_margin:   float = 0.05     # extra safety margin so walls never touch the gap edge
+    curve_knots_per_m: float = 0.9 # spatial frequency of the corridor center-line curvature
+    curve_smooth_vox: int = 9      # box-filter kernel size (in voxels) for smoothing the curve
 
-    floor_max_h: float = 0.25
-    ceil_min_z:  float = 1.0
+    # --- Lateral wall thickness ---
+    lr_thick_ratio_min: float = 0.3  # minimum wall thickness as a fraction of the available Y-space
+    lr_thick_ratio_max: float = 1.0  # maximum wall thickness as a fraction of the available Y-space
 
-    rot_max_deg_L: float = 10.0
-    rot_max_deg_R: float = 10.0
-    rot_max_deg_F: float = 8.0
-    rot_max_deg_C: float = 10.0
+    # --- Gate / opening parameters ---
+    gate_segments_per_meter: float = 0.8  # expected number of gate openings per metre along X
+    gate_min_len: float = 0.30            # minimum X-length of a gate segment (metres)
+    gate_max_len: float = 0.40            # maximum X-length of a gate segment (metres)
+    gate_join_gap: float = 0.2            # minimum gap between consecutive gate segments (metres)
+    gate_dir_jitter: float = 0.10         # noise added to the gate placement probability weights
 
-    closing_iters: int = 1
-    closing_kernel: int = 3
+    # --- Floor / ceiling extent limits ---
+    floor_max_h: float = 0.25  # maximum height of a floor obstacle (metres)
+    ceil_min_z:  float = 1.0   # minimum Z at which ceiling obstacles may appear (metres)
 
-    narrow_thresh: float = 0.45
-    widen_extra:   float = 0.2
-    top_band_z:    float = 0.30
-    bot_band_z:    float = 0.20
+    # --- Random rotation applied to 2D obstacle masks ---
+    rot_max_deg_L: float = 10.0  # max rotation for left-wall  masks (degrees)
+    rot_max_deg_R: float = 10.0  # max rotation for right-wall masks (degrees)
+    rot_max_deg_F: float = 8.0   # max rotation for floor      masks (degrees)
+    rot_max_deg_C: float = 10.0  # max rotation for ceiling    masks (degrees)
+
+    # --- Morphological smoothing ---
+    closing_iters:  int = 1  # iterations of binary closing  (fills small gaps)
+    closing_kernel: int = 3  # structuring element size for closing/opening (3, 5, or 7)
+
+    # --- Narrow-corridor widening pass ---
+    narrow_thresh: float = 0.45  # corridor widths below this (metres) trigger the widening pass
+    widen_extra:   float = 0.2   # extra clearance added when widening a tight corridor (metres)
+    top_band_z:    float = 0.30  # height of the top band checked for overhead obstacles during widening
+    bot_band_z:    float = 0.20  # height of the bottom band checked for floor obstacles during widening
 
 
-def _lerp(a, b, t): 
+def _lerp(a, b, t):
+    # linear interpolation between a and b, t is the interpolation factor
     return a + (b - a) * float(np.clip(t, 0.0, 1.0))
 
 def make_axes(cfg: Cfg):
+    """Convert scene dimensions and voxel size into world-space coordinate arrays xv, yv, zv.
+    Each value is the centre of its voxel (offset by 0.5 * voxel from the grid origin)."""
     Nx = int(round(cfg.Lx / cfg.voxel))
     Ny = int(round(cfg.Ly / cfg.voxel))
     Nz = int(round(cfg.Lz / cfg.voxel))
@@ -81,6 +104,8 @@ def make_axes(cfg: Cfg):
     return xv, yv, zv
 
 def _smooth1d(a, k):
+    """Apply a uniform box-filter of width k (forced odd) to 1D array a.
+    Edge values are padded to avoid boundary artifacts."""
     k = max(3, int(k) | 1)
     w = np.ones(k, np.float32) / k
     p = k // 2
@@ -88,18 +113,25 @@ def _smooth1d(a, k):
     return np.convolve(ap, w, mode='valid')
 
 def _value_noise_1d(n, knots, rng):
+    """Generate a 1D value-noise signal of length n by placing random values at sparse
+    knot positions and linearly interpolating between them."""
     xs = np.linspace(0, n-1, max(2, knots)).astype(np.float32)
     vs = rng.uniform(0.0, 1.0, size=xs.shape[0]).astype(np.float32)
     x  = np.arange(n, dtype=np.float32)
     return np.interp(x, xs, vs)
 
 def _perlin1d_0_1(n, knots, smooth_vox, rng):
+    """Produce a smooth random curve in [0, 1] of length n.
+    Combines value noise with a box-filter smoothing pass and min-max normalisation."""
     v = _value_noise_1d(n, knots, rng)
     v = _smooth1d(v, smooth_vox)
     v = (v - v.min()) / (np.ptp(v) + 1e-6)
     return v
 
 def rect_mask_xz(Nx, Nz, x_min, x_max, n_rect, min_wx, max_wx, min_wz, max_wz, rng):
+    """Build a 2D binary mask in the X-Z plane by placing n_rect random rectangles.
+    Used for left/right lateral wall obstacles — each rectangle defines a block that
+    spans some X range and some height range, to be extruded inward along Y later."""
     M = np.zeros((Nx, Nz), np.uint8)
     for _ in range(n_rect):
         wx = int(rng.integers(min_wx, max_wx+1))
@@ -113,10 +145,14 @@ def rect_mask_xz(Nx, Nz, x_min, x_max, n_rect, min_wx, max_wx, min_wz, max_wz, r
     return M
 
 def rect_mask_xy(Nx, Ny, x_min, x_max, n_rect, min_wx, max_wx, min_wy, max_wy, difficulty, rng):
+    """Build a 2D binary mask in the X-Y plane by placing n_rect random rectangles.
+    Used for floor/ceiling obstacles — each rectangle defines a patch that will be
+    extruded upward (floor) or downward (ceiling) along Z later.
+    Y-width scales with difficulty so harder scenes have wider-spanning obstacles."""
     M = np.zeros((Nx, Ny), np.uint8)
     for _ in range(n_rect):
         wx = int(rng.integers(min_wx, max_wx+1))
-        wy = int(_lerp(min_wy, max_wy, difficulty)) 
+        wy = int(_lerp(min_wy, max_wy, difficulty))
         wx = max(wx, 1); wy = max(wy, 1)
         if wx > Nx: wx = Nx
         if wy > Ny: wy = Ny
@@ -126,6 +162,10 @@ def rect_mask_xy(Nx, Ny, x_min, x_max, n_rect, min_wx, max_wx, min_wy, max_wy, d
     return M
 
 def closing_opening_padded(occ, iters=3, kernel=3):
+    """Smooth a 3D occupancy grid using morphological closing followed by opening.
+    Closing fills small gaps/holes between obstacle voxels; opening removes isolated
+    stray voxels. The grid is padded with solid walls before closing so boundary
+    voxels are treated consistently."""
     assert kernel in (3,5,7)
     rad = (kernel//2) * iters
     pad = max(1, rad)
@@ -151,16 +191,22 @@ def closing_opening_padded(occ, iters=3, kernel=3):
     return occ_crop.astype(bool)
 
 def get_elevation(obs_mask: np.ndarray):
+    """For each (X, Y) column, find the lowest free voxel index (ground surface)
+    and the highest free voxel index (ceiling surface).
+    Returns -1 for columns that are entirely occupied."""
     nonzero_mask = obs_mask == 0
 
     ground_idx = np.argmax(nonzero_mask, axis=2)
-    ground_idx[~np.any(nonzero_mask, axis=2)] = -1 
+    ground_idx[~np.any(nonzero_mask, axis=2)] = -1
 
     ceil_idx = obs_mask.shape[2] - 1 - np.argmax(nonzero_mask[..., ::-1], axis=2)
     ceil_idx[~np.any(nonzero_mask, axis=2)] = -1
     return ground_idx, ceil_idx
 
 def extract_surface_voxels(occ: np.ndarray, structure=None) -> np.ndarray:
+    """Return only the outer shell of an occupancy grid — voxels that are occupied
+    but have at least one empty face-neighbour. Used to reduce point cloud density
+    when saving or visualising obstacle meshes."""
     structure = np.ones((3,3,3), dtype=bool)
     eroded = binary_erosion(occ, structure=structure, border_value=1)
     eroded[0,:,:] = occ[0,:,:]
@@ -174,6 +220,9 @@ def extract_surface_voxels(occ: np.ndarray, structure=None) -> np.ndarray:
     return surface
 
 def make_y_center_curve(cfg: Cfg, xv, rng, anchor_len=0.30, margin=0.05):
+    """Generate the winding Y center-line of the passable corridor as a 1D curve over X.
+    Uses smooth random noise to deviate left/right, but anchors the curve back to
+    y_center near the start and goal positions so the robot can always enter and exit."""
     Nx = len(xv)
     base = _perlin1d_0_1(Nx, int(cfg.curve_knots_per_m * cfg.Lx)+2, cfg.curve_smooth_vox, rng)
     base = 2.0*base - 1.0
@@ -189,6 +238,10 @@ def make_y_center_curve(cfg: Cfg, xv, rng, anchor_len=0.30, margin=0.05):
     return y_curve.astype(np.float32)
 
 def make_gap_half_curve_jumpy(cfg: Cfg, xv, rng, min_seg=0.18, max_seg=0.60, smooth=2):
+    """Generate the corridor half-width as a varying 1D signal over X.
+    The width jumps between random values in piecewise-constant segments, with higher
+    difficulty increasing the probability of landing on a very narrow segment near
+    gap_half_min. A light smoothing pass rounds the sharp jumps."""
     Nx = len(xv)
     min_seg_v = max(1, int(np.ceil(min_seg / cfg.voxel)))
     max_seg_v = max(min_seg_v+1, int(np.ceil(max_seg / cfg.voxel)))
@@ -205,6 +258,9 @@ def make_gap_half_curve_jumpy(cfg: Cfg, xv, rng, min_seg=0.18, max_seg=0.60, smo
     return np.clip(g, cfg.gap_half_min, min(cfg.gap_half_max, cfg.Ly/2 - cfg.gap_margin)).astype(np.float32)
 
 def passband_indices_from_curve(yv, y_curve, gap_half_curve):
+    """Convert the corridor center curve and half-width curve into integer voxel
+    index arrays j_left and j_right — the left and right boundary of the free
+    corridor at each X slice. Walls must not intrude past these indices."""
     y_left  = y_curve - gap_half_curve
     y_right = y_curve + gap_half_curve
     j_left  = np.searchsorted(yv, y_left,  side='right')
@@ -216,6 +272,12 @@ def build_occ_from_masks_thick_xyxz(cfg: Cfg,
     F_mask_xy, C_mask_xy,    # (Nx, Ny)
     rng, j_left_cut, j_right_cut
 ):
+    """Assemble the full 3D occupancy grid from the four 2D obstacle layer masks.
+    Each layer is extruded into 3D and clipped to respect the corridor boundaries:
+      - Left/right walls: extruded inward from the scene edges up to j_left/j_right
+      - Floor: extruded upward from z=0 by a per-voxel random thickness
+      - Ceiling: extruded downward from z=top, only above ceil_min_z
+    Wall thickness scales with difficulty via lr_thick_ratio."""
     xv, yv, zv = make_axes(cfg)
     Nx, Ny, Nz = len(xv), len(yv), len(zv)
     vox = cfg.voxel
@@ -282,6 +344,9 @@ def build_occ_from_masks_thick_xyxz(cfg: Cfg,
     return occ_left | occ_right | occ_floor | occ_ceil
 
 def rotate_mask_2d(mask: np.ndarray, max_deg: float, rng) -> np.ndarray:
+    """Randomly rotate a 2D obstacle mask in-plane by up to max_deg degrees.
+    Adds visual variety so obstacles are not always perfectly axis-aligned.
+    Uses nearest-neighbour interpolation to keep the result binary."""
     if max_deg <= 0: return mask
     ang = float(rng.uniform(-max_deg, max_deg))
     R = ndi_rotate(mask.astype(np.uint8), angle=ang, reshape=False,
@@ -294,6 +359,10 @@ def sample_gate_segments(
     nseg, gap_min_vox,
     jitter=0.0
 ):
+    """Sample a binary 1D mask of length Nx marking which X-slices belong to a
+    gate (opening) segment. nseg segments of random length are placed according
+    to probability weights p_x, with optional jitter to break uniform placement.
+    The result is used to punch gaps through wall layers at specific X positions."""
     # gap_min_vox = max(1, int(np.ceil(gap_min_m / cfg.voxel)))
     keep = np.zeros(Nx, np.uint8)
 
@@ -325,7 +394,90 @@ def sample_gate_segments(
     return keep
 
 
-def generate_and_save(cfg: Cfg, prefix="occ", save=True):
+def _preview_dir(prefix: str) -> str:
+    """Return the path to the preview subfolder for a given output prefix."""
+    p = prefix.replace("\\", "/").rstrip("/")
+    return f"{p}/preview"
+
+
+def _write_occ_preview_png(occ, xv, yv, zv, cfg: Cfg, preview_dir: str) -> None:
+    """Save three 3D scatter views (perspective, top-down, front) into *preview_dir*.
+
+    Each image follows the style of typical_obstacle.py: s=0.5 dots coloured by Z
+    height with the plasma colormap, start/goal markers, and matching axis formatting.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+    os.makedirs(preview_dir, exist_ok=True)
+
+    idx = np.argwhere(occ)
+    if len(idx) > 8000:
+        idx = idx[np.random.choice(len(idx), 8000, replace=False)]
+
+    ox, oy, oz = cfg.origin_w
+    pts = idx * cfg.voxel + np.array([ox, oy, oz], dtype=np.float32)
+
+    views = [
+        ("perspective", 20, -60),
+        ("top",         88, -90),
+        ("front",        0,  90),
+    ]
+
+    xl = (float(xv[0]), float(xv[-1]))
+    yl = (float(yv[0]), float(yv[-1]))
+    zl = (float(zv[0]), float(zv[-1]))
+
+    for name, elev, azim in views:
+        fig = plt.figure(figsize=(7, 6))
+        ax = fig.add_subplot(111, projection="3d")
+        if len(pts):
+            ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], s=0.5, c=pts[:, 2],
+                       cmap="plasma", depthshade=True)
+        ax.scatter(
+            [cfg.start_w[0]], [cfg.start_w[1]], [cfg.start_w[2]],
+            c="lime", s=60, marker="o", edgecolors="k", linewidths=0.5,
+            label="start", depthshade=False,
+        )
+        ax.scatter(
+            [cfg.goal_w[0]], [cfg.goal_w[1]], [cfg.goal_w[2]],
+            c="tomato", s=90, marker="*", edgecolors="k", linewidths=0.5,
+            label="goal", depthshade=False,
+        )
+        ax.set_xlim(*xl)
+        ax.set_ylim(*yl)
+        ax.set_zlim(*zl)
+        ax.set_xlabel("X", fontsize=7)
+        ax.set_ylabel("Y", fontsize=7)
+        ax.set_zlabel("Z", fontsize=7)
+        ax.tick_params(labelsize=6)
+        ax.view_init(elev=elev, azim=azim)
+        ax.set_title(f"Random obstacle — {name} view", fontsize=9)
+        ax.legend(fontsize=7, loc="upper left")
+        plt.tight_layout()
+        fig.savefig(os.path.join(preview_dir, f"{name}.png"), dpi=120, bbox_inches="tight")
+        plt.close(fig)
+
+
+def generate_and_save(cfg: Cfg, prefix="occ", save=True, preview=None):
+    """Main pipeline that generates a complete random obstacle scene in 5 stages:
+      S1 — place raw rectangular obstacle blocks for all four layers
+      S2 — apply gate segments to punch openings through walls (currently a pass-through)
+      S3 — apply small random rotations to each layer mask for visual variety;
+           then clear a circular region around start and goal so they stay obstacle-free
+      S4 — smooth the voxel grid with morphological closing + opening
+      S5 — widen any corridor cross-section that is narrower than narrow_thresh,
+           ensuring the scene always has a physically passable path
+    Returns the final occupancy grid and coordinate axes (xv, yv, zv).
+
+    When ``save`` is True, also writes ``preview.png`` (3D occupancy scatter) under the
+    output folder (or ``{prefix}_preview.png`` if ``prefix`` has no trailing slash), unless
+    ``preview=False``."""
+    if preview is None:
+        preview = save
     rng = np.random.default_rng(cfg.seed)
     xv, yv, zv = make_axes(cfg)
     Nx, Ny, Nz = len(xv), len(yv), len(zv)
@@ -489,18 +641,25 @@ def generate_and_save(cfg: Cfg, prefix="occ", save=True):
 
     if save:
         torch.save(torch.from_numpy(occ_S5.astype(np.uint8)), f"{prefix}_05_final.pt")
+    if preview:
+        _write_occ_preview_png(occ_S5, xv, yv, zv, cfg, _preview_dir(prefix))
     return occ_S5, xv, yv, zv
 
 
 
 if __name__ == "__main__":
+    _out_base = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "data", "assets", "New_RandObs")
+    )
     difficulty = 0.2
     seed = 42
     n_rect_L = 9 # 0-9
     n_rect_R = 9 # 0-9
     n_rect_F = 3 # 0-3
     n_rect_C = 3 # 0-3
-    prefix = f"D{difficulty:.1f}_S{seed}_L{n_rect_L:01d}_R{n_rect_R:01d}_F{n_rect_F:01d}_C{n_rect_C:01d}/"
-    os.makedirs(prefix, exist_ok=True)
+    scene = f"D{int(difficulty * 10)}G{n_rect_F:01d}L{n_rect_R:01d}O{n_rect_C:01d}S{seed}"
+    out_dir = os.path.join(_out_base, scene)
+    os.makedirs(out_dir, exist_ok=True)
+    prefix = out_dir + "/"
     cfg = Cfg(difficulty=difficulty, seed=seed, n_rect_L=n_rect_L, n_rect_R=n_rect_R, n_rect_F=n_rect_F, n_rect_C=n_rect_C)
     generate_and_save(cfg, prefix=prefix)
