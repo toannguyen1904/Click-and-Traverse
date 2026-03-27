@@ -248,13 +248,19 @@ python -m cat_ppo.eval.brax2onnx \
 To evaluate the model without privileged observation, run:
 
 ```bash
-python -m cat_ppo.eval.mj_onnx_play --task G1Cat --exp_name 12051223_G1LocoPFR10_OdonoiseSlowV2_xP2xMxK00xlowcorner --obs_path data/assets/TypiObs/lowcorner
+# python -m cat_ppo.eval.mj_onnx_play --task G1Cat --exp_name 12051223_G1LocoPFR10_OdonoiseSlowV2_xP2xMxK00xlowcorner --obs_path data/assets/TypiObs/lowcorner
+python -m cat_ppo.eval.mj_onnx_play --task G1Cat --exp_name G1Cat_lowcorner --obs_path data/assets/TypiObs/lowcorner
 ```
 
 To evaluate the model with privileged observation, run:
 
 ```bash
 python -m cat_ppo.eval.mj_onnx_play --task G1CatPri --pri --exp_name G1CatPri_narrow1 --obs_path data/assets/TypiObs/narrow1
+```
+
+or
+```bash
+python -m cat_ppo.eval.mj_onnx_play --task G1CatPri --pri --exp_name G1CatPri_D8G2L1O0S25 --obs_path data/assets/RandObs/D8G2L1O0S25
 ```
 
 ---

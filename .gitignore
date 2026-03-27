@@ -188,3 +188,4 @@ cython_debug/
 /data/assets/RandObs/
 /data/assets/TypiObs/
 /output_logs/
+eval_videos/
