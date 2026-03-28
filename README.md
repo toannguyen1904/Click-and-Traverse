@@ -226,6 +226,17 @@ If you want to train a specific experiment, you can run:
 python -m train_ppo --task {task} --restore_name {restore_name} --exp_name {exp_name}  --ground {ground} --lateral {lateral} --overhead {overhead} --term_collision_threshold {term_collision_threshold} --obs_path {obs_path}
 ```
 
+To train the model on the newly generated scene, use:
+```bash
+python train_ppo.py \
+  --task G1CatPri \
+  --exp_name G1CatPri_D2G3L9O3S42 \
+  --restore_name none \
+  --ground 1.0 --lateral 1.0 --overhead 1.0 \
+  --term_collision_threshold 0.04 \
+  --obs_path data/assets/RandObs/D2G3L9O3S42
+```
+
 Supported tasks:
 
 - `G1Cat`: default task (can be directly used for sim-to-real deployment)
@@ -261,6 +272,11 @@ python -m cat_ppo.eval.mj_onnx_play --task G1CatPri --pri --exp_name G1CatPri_na
 or
 ```bash
 python -m cat_ppo.eval.mj_onnx_play --task G1CatPri --pri --exp_name G1CatPri_D8G2L1O0S25 --obs_path data/assets/RandObs/D8G2L1O0S25
+```
+
+or
+```bash
+python -m cat_ppo.eval.mj_onnx_play --task G1CatPri --pri --exp_name 03271649_G1CatPri_G1CatPri_D2G3L9O3S42xG10xL10xO10xT004xdataassetsRandObsD2G3L9O3S42 --obs_path data/assets/RandObs/D2G3L9O3S42
 ```
 
 ---

@@ -1,7 +1,3 @@
-import swanlab
-
-swanlab.sync_wandb()
-
 import inspect
 import functools
 import time
@@ -12,7 +8,6 @@ from datetime import datetime
 from absl import logging
 import tqdm
 import tyro
-import wandb
 import numpy as np
 import jax
 
@@ -24,6 +19,13 @@ from cat_ppo import update_file_handler
 from cat_ppo.constant import PATH_LOG
 from cat_ppo.learning.policy.ppo import train as ppo # brax.training.agents.ppo
 from cat_ppo.learning.train.pf_utils import wrap_for_brax_training_reset
+
+if os.environ.get("SWANLAB_SYNC_WANDB", "").strip().lower() in ("1", "true", "yes"):
+    import swanlab
+
+    swanlab.sync_wandb()
+
+import wandb  # noqa: E402
 
 xla_flags = os.environ.get("XLA_FLAGS", "")
 xla_flags += " --xla_gpu_triton_gemm_any=True"
