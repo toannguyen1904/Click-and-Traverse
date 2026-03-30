@@ -1,4 +1,8 @@
 # pf_modular.py
+"""
+This is the core HumanoidPF construction code, which takes an obstacle occupancy grid
+and computes all the spatial fields the policy needs.
+"""
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -11,28 +15,32 @@ class PFConfig:
     Ly: float = 2.0               # y-axis (m) left
     Lz: float = 1.5               # z-axis (m) up
     origin_w: np.ndarray = np.array([-0.5, -1.0, 0.0], dtype=np.float32) # pre-defined origin in canonical frame (m)
-    start_w:  np.ndarray = np.array([0.0,  0.0, 0.75], dtype=np.float32)
-    goal_w:   np.ndarray = np.array([2.0,  0.0, 0.75], dtype=np.float32)
+    start_w:  np.ndarray = np.array([0.0,  0.0, 0.75], dtype=np.float32)    # start position in canonical frame (m)
+    goal_w:   np.ndarray = np.array([2.0,  0.0, 0.75], dtype=np.float32)    # goal position in canonical frame (m)
 
     v_max: float = 0.6          # max velocity far from goal (m/s)
-    k_decay: float = 0.6        # decay radius near goal (m)
-    goal_seed_r: float = 0.12   # goal negative region radius (m)
+    k_decay: float = 0.6        # decay radius near goal (m), defined but not used
+    goal_seed_r: float = 0.12   # goal negative region radius (m), for the fmm
 
 def world_to_local(p_w, cfg: PFConfig):
     return p_w - cfg.origin_w
 
 def make_sdf(obs_mask: np.ndarray, voxel: float) -> np.ndarray:
+    # Returns (Nx, Ny, Nz): distance to nearest obstacle surface in meters,
+    # positive outside obstacles, negative inside.
     phi_obs = np.ones(obs_mask.shape, dtype=float)
     phi_obs[obs_mask] = -1.0
     sdf = skfmm.distance(phi_obs, dx=voxel).astype(np.float32)  # signed distance (m)
     return sdf
 
 def grad3(scalar_field: np.ndarray, voxel: float):
+    # Returns (Nx, Ny, Nz, 3): 3D gradient vector at each voxel [df/dx, df/dy, df/dz].
+    # When applied to the SDF, gives the boundary field bf — outward normals at obstacle surfaces.
     dfx, dfy, dfz = np.gradient(scalar_field, voxel, voxel, voxel, edge_order=2)
     return np.stack([dfx, dfy, dfz], axis=-1).astype(np.float32)
 
 
-def make_raw_guidance_field(cfg, grids, obs_mask, goal_local, r_proj=None): # HumanoidPF
+def make_raw_guidance_field(cfg, grids, obs_mask, goal_local, r_proj=None): # not being used currently
     voxel = cfg.voxel
     eps = 1e-9
     if r_proj is None:
@@ -128,7 +136,7 @@ def make_guidance_field_progressive(cfg, grids, obs_mask, goal_local, bf, sdf, r
     gf = (dir_unit * speed).astype(np.float32)
     return T, gf
 
-def save_all(cfg: PFConfig, sdf, bf, gf, obs_mask, meta_extra=None):
+def save_all(cfg: PFConfig, sdf, bf, gf, obs_mask, meta_extra=None):    # currently not being used
     outdir = Path(cfg.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     np.save(outdir / "sdf.npy", sdf)

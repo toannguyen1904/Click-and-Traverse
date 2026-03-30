@@ -212,7 +212,7 @@ if __name__ == "__main__":
 
     fig.suptitle("Typical obstacle scenes", fontsize=13, y=1.01)
     plt.tight_layout()
-    plt.savefig("/home/tien/Code/Click-and-Traverse/renders/typical_scenes.png", dpi=120, bbox_inches="tight")
-    print("Image saved to /home/tien/Code/Click-and-Traverse/renders/typical_scenes.png")
+    plt.savefig("/home/tien/Code/Click-and-Traverse/typical_scenes.png", dpi=120, bbox_inches="tight")
+    print("Image saved to /home/tien/Code/Click-and-Traverse/typical_scenes.png")
     plt.show()
 

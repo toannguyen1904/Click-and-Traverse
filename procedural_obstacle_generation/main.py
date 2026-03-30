@@ -72,6 +72,9 @@ def generate_typical_obstacle(scene_type):
     prefix = f"{scene_type}/"
     obs_cfg = ObsCfg()
     cfg = PFConfig()
+    # Sanity check: PFConfig and ObsCfg must agree on all geometric parameters.
+    # If they diverge (e.g. voxel size changed in one but not the other), the obstacle
+    # occupancy grid and potential field would be built on incompatible grids.
     assert cfg.voxel == obs_cfg.voxel
     assert (cfg.start_w == obs_cfg.start_w).all()
     assert (cfg.goal_w == obs_cfg.goal_w).all()
@@ -79,10 +82,10 @@ def generate_typical_obstacle(scene_type):
     assert cfg.Lx == obs_cfg.Lx
     assert cfg.Ly == obs_cfg.Ly
     assert cfg.Lz == obs_cfg.Lz
-    
+
     xv, yv, zv = make_axes(cfg)
-    X, Y, Z = np.meshgrid(xv, yv, zv, indexing='ij')
-    obs_mask = build_obstacles(scene_type, (X, Y, Z))
+    X, Y, Z = np.meshgrid(xv, yv, zv, indexing='ij')    # make a 3D grid of points in the world coordinate system, with shape (Nx, Ny, Nz)
+    obs_mask = build_obstacles(scene_type, (X, Y, Z))   # build the obstacle occupancy grid for the given scene type, with shape (Nx, Ny, Nz) and dtype bool
 
     out_dir = _ASSETS / "TypiObs" / prefix.rstrip("/")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -90,10 +93,12 @@ def generate_typical_obstacle(scene_type):
     # preview_matplotlib(pts)
     spacing = (cfg.voxel, cfg.voxel, cfg.voxel)
     mesh = better_mesh(spacing, obs_mask)
-    mesh.export(str(out_dir / "obs.obj"))
+    mesh.export(str(out_dir / "obs.obj"))   # export the obstacle mesh as an OBJ file for visualization in MuJoCo or other 3D software 
 
-    sdf = make_sdf(obs_mask, cfg.voxel)
-    bf  = grad3(sdf, cfg.voxel)
+    sdf = make_sdf(obs_mask, cfg.voxel) # compute sdf
+    bf  = grad3(sdf, cfg.voxel) # compute boundary field (outward normals at obstacle surfaces) by taking the gradient of the SDF
+
+    # T: geodesic distance to goal (Nx,Ny,Nz). gf: HumanoidPF vector field (Nx,Ny,Nz,3).
     T, gf = make_guidance_field_progressive(cfg, (X, Y, Z), obs_mask, cfg.goal_w, bf, sdf)
 
     np.save(out_dir / "sdf.npy", sdf)
@@ -111,10 +116,13 @@ def generate_typical_obstacle(scene_type):
     # visualize_all(xv, yv, zv, sdf, T, gf, obs_mask, cfg.start_w, cfg.goal_w)
 
 
-def generate_pf(scene_type, pc_path):
+def generate_pf(scene_type, pc_path):   # used in deployment to generate PF from real-world occupancy (point cloud) data
     prefix = f"{scene_type}/"
     obs_cfg = ObsCfg()
     cfg = PFConfig()
+    # Sanity check: PFConfig and ObsCfg must agree on all geometric parameters.
+    # If they diverge (e.g. voxel size changed in one but not the other), the obstacle
+    # occupancy grid and potential field would be built on incompatible grids.
     assert cfg.voxel == obs_cfg.voxel
     assert (cfg.start_w == obs_cfg.start_w).all()
     assert (cfg.goal_w == obs_cfg.goal_w).all()
@@ -122,7 +130,7 @@ def generate_pf(scene_type, pc_path):
     assert cfg.Lx == obs_cfg.Lx
     assert cfg.Ly == obs_cfg.Ly
     assert cfg.Lz == obs_cfg.Lz
-    
+
     xv, yv, zv = make_axes(cfg)
     X, Y, Z = np.meshgrid(xv, yv, zv, indexing='ij')
     # obs_mask = torch.load(pc_path).cpu().numpy()
@@ -160,10 +168,13 @@ def generate_pf(scene_type, pc_path):
     # visualize_all(xv, yv, zv, sdf, T, gf, obs_mask, cfg.start_w, cfg.goal_w)
 
 
-def better_mesh(spacing, obs_mask): # for mujoco visualization
+def better_mesh(spacing, obs_mask):
+    # Clear boundary voxels to avoid open/broken geometry at grid edges.
     obs_mask[:,0,:] = 0
     obs_mask[:,-1,:] = 0
     obs_mask[:,:,-1] = 0
+    # Invert so obstacles=0, free=1. Marching cubes then traces the 0.5 isosurface,
+    # which is the outer skin of the obstacles — the geometry MuJoCo needs for rendering.
     obs_mask_erosion = 1-obs_mask
     mesh = marching_cubes_mesh(obs_mask_erosion, spacing=spacing)
     return mesh
@@ -206,4 +217,4 @@ if __name__ == "__main__":
     # generate_typical_obstacle('hole')
     # generate_random_obstacle(0.8, 13, 1, 0, 0)
     # generate_random_obstacle(0.8, 4, 1, 0, 1)
-    generate_random_obstacle(0.2, 42, 9, 3, 3)
+    generate_random_obstacle(0.9, 42, 9, 3, 3)  # generate a random obstacle scene with difficulty 0.2, seed 42, 9 left-wall blocks, 3 front-wall blocks, 3 overhead blocks
