@@ -1,3 +1,8 @@
+"""
+CPU-based (non-JAX) inference environment for the G1 CAT policy.
+Used by mj_onnx_play.py to run a trained ONNX policy in real-time MuJoCo.
+Mirrors the observation construction of G1CatEnv / G1CatPriEnv but runs on NumPy.
+"""
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -12,6 +17,8 @@ from scipy.spatial.transform import Rotation as R
 
 EPS=1e-6
 def base2navi_transform(base2world: np.ndarray) -> np.ndarray:
+    # Builds a navigation frame rotation matrix from the robot's base frame.
+    # The nav frame has x forward (projected onto ground), z up, y = z×x.
     x_proj = base2world[:, 0]
     x_proj /= np.linalg.norm(x_proj)
     z_axis = np.array([0.0, 0.0, 1.0])
@@ -21,15 +28,18 @@ def base2navi_transform(base2world: np.ndarray) -> np.ndarray:
     return np.column_stack((x_axis, y_axis, z_axis))
 
 def world_to_navi_vel(navi2world_pose: np.ndarray, vel: np.ndarray) -> np.ndarray:
+    # Transforms velocity vectors from world frame to navigation frame.
     world2navi = np.linalg.inv(navi2world_pose)
     R = world2navi[:3, :3]
     return (R @ vel.T).T
 
 def quat_conj(q):
+    # Returns the conjugate (inverse rotation) of a quaternion wxyz.
     # q: (..., 4)  wxyz
     return np.stack([q[..., 0], -q[..., 1], -q[..., 2], -q[..., 3]], axis=-1)
 
 def quat_mul(q1, q2):
+    # Hamilton product of two quaternions wxyz.
     # q1, q2: (..., 4)  wxyz
     w1, x1, y1, z1 = q1[..., 0], q1[..., 1], q1[..., 2], q1[..., 3]
     w2, x2, y2, z2 = q2[..., 0], q2[..., 1], q2[..., 2], q2[..., 3]
@@ -41,6 +51,7 @@ def quat_mul(q1, q2):
     ], axis=-1)
 
 def quat_rotate(q, v):
+    # Rotates vector v by quaternion q using the sandwich product q*v*q^-1.
     # q: (..., 4)  wxyz
     # v: (..., 3)
     zeros = np.zeros_like(v[..., :1])
@@ -48,13 +59,16 @@ def quat_rotate(q, v):
     return quat_mul(quat_mul(q, q_v), quat_conj(q))[..., 1:]
 
 def delay_body_pos(p_gt, q_gt, p_odom, q_odom, body_pos):
+    # Simulates odometry delay: transforms body positions from ground-truth pose to a delayed odometry pose.
     body_pos_local = quat_rotate(quat_conj(q_gt), body_pos - p_gt)
     return (p_odom + quat_rotate(q_odom, body_pos_local)).reshape(-1,3)
 
 def normalize(q):
+    # Normalizes a quaternion to unit length.
     return q / np.linalg.norm(q, axis=-1, keepdims=True)
 
 def noisy_rootpose(qpos_root):
+    # Adds small random position offset and yaw perturbation to simulate imperfect localization.
     dxyz = (np.random.rand(3) * 2 - 1) * 0.05  # (3,)
 
     angle = (np.random.rand() * 2 - 1) * np.deg2rad(10.0)  
@@ -91,6 +105,8 @@ from pathlib import Path
 import xml.etree.ElementTree as ET
 import os
 def set_scene_for_xml(xml_path, scene_path):
+    # Patches the robot XML to point the scene_mesh asset to the given obstacle obs.obj file.
+    # Writes a temporary XML file and returns its path.
         xml_dir = Path(xml_path).resolve().parent
 
         xml_text = Path(xml_path).read_text(encoding="utf-8")
@@ -285,6 +301,7 @@ class PlayG1CatEnv(BaseEnv):
         self._soft_uppers = c + 0.5 * r * self._config.soft_joint_pos_limit_factor
 
     def reset(self):
+        # Resets the robot to its default standing pose and initializes all info/obs fields.
         self.mj_data.qpos[:7] = consts.DEFAULT_QPOS[:7]
         self.mj_data.qpos[7:] = self._default_qpos
 
@@ -372,6 +389,7 @@ class PlayG1CatEnv(BaseEnv):
         return State(info, obs)
 
     def step(self, state: State, action: np.ndarray):
+        # Applies PD control for one policy step (dt/sim_dt substeps), updates all body positions, samples HumanoidPF fields, and returns the next state/obs.
         if self.fix_body:
             self.mj_data.qvel[:6] = 0
 
@@ -474,6 +492,7 @@ class PlayG1CatEnv(BaseEnv):
         return State(state.info, obs)
 
     def _update_phase(self, state):
+        # Advances the gait phase clock and handles move↔stop transitions with a delay buffer.
         step = state.info["step"]
         command = state.info["command"]
         last_flags = state.info["last_flags"]
@@ -509,6 +528,8 @@ class PlayG1CatEnv(BaseEnv):
         state.info["gait_mask"] = np.float32(gait_mask)
 
     def get_obs(self, info):
+        # Constructs the policy observation dict from current MuJoCo state and HumanoidPF fields.
+        # Mirrors G1CatEnv.get_obs: non-privileged branch transforms fields to nav frame; privileged branch uses world frame with body kinematics.
         # pose
         gyro_pelvis = self.get_gyro("pelvis")
         gvec_pelvis = self.mj_data.site_xmat[self._pelvis_imu_site_id].reshape(
@@ -684,12 +705,13 @@ class PlayG1CatEnv(BaseEnv):
         }
     
     def world_to_grid(self, pos):
-        """ 世界坐标 -> voxel index (浮点) """
+        # Converts world-space positions (m) to floating-point voxel indices.
         rel = pos - self.pf_origin
         idx = rel / self.dx
         return idx
 
     def sample_field(self, field, pos):
+        # Trilinearly interpolates a 3D field (gf/bf/sdf) at N world-space positions. Returns (N, C).
         idx = self.world_to_grid(pos)                         # (N,3)
         x, y, z = idx[:, 0], idx[:, 1], idx[:, 2]            # (N,)
 
@@ -726,6 +748,8 @@ class PlayG1CatEnv(BaseEnv):
 
     
     def get_goal(self, navi2world_pose):
+        # Computes [dx, dy, yaw] command in nav frame from robot pose to world-space goal.
+        # Sets self.done=True when within 0.2m of goal.
         navi2world_rot = navi2world_pose[:3, :3]
         root_pos = navi2world_pose[:3, 3]
 
@@ -741,6 +765,8 @@ class PlayG1CatEnv(BaseEnv):
         return command
 
     def compute_cmd_from_rtf(self, rtf, cgf, cbf):
+        # Adjusts root potential field velocity (rtf) to match the guidance field direction (cgf)
+        # near obstacle surfaces (cbf), preventing penetration. Returns [vx, vy, 0] command.
 
         v = rtf[:2]* 0.7  
 

@@ -28,12 +28,12 @@ if os.environ.get("SWANLAB_SYNC_WANDB", "").strip().lower() in ("1", "true", "ye
 import wandb  # noqa: E402
 
 xla_flags = os.environ.get("XLA_FLAGS", "")
-xla_flags += " --xla_gpu_triton_gemm_any=True"
+xla_flags += " --xla_gpu_triton_gemm_any=True"  # allows more GPU matrix multiplications to use the Triton GEMM path
 os.environ["XLA_FLAGS"] = xla_flags
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["MUJOCO_GL"] = "egl"
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"   # Stops JAX from grabbing most GPU memory upfront at startup.
+os.environ["MUJOCO_GL"] = "egl" # for headless rendering
 
-WANDB_PROJECT = os.environ.get("WANDB_PROJECT")
+WANDB_PROJECT = os.environ.get("WANDB_PROJECT")  # Project name in WandB
 WANDB_ENTITY = os.environ.get("WANDB_ENTITY")
 
 @dataclass
@@ -50,6 +50,7 @@ class Args:
     term_collision_threshold: float = 0.04
     obs_path: str = 'data/assets/TypiObs/empty'
     def generate_exp_name(self):
+        # generate a unique experiment name based on the task, difficulty, and seed
         exp_name_parts = [self.exp_name]
 
         if self.ground != 0:
@@ -69,10 +70,12 @@ class Args:
         return "x".join(exp_name_parts)
 
 def _prepare_exp_name(task: str, exp_name: str) -> str:
+    # add a timestamp to the experiment name
     timestamp = datetime.now().strftime("%m%d%H%M")
     return f"{timestamp}_{task}_{exp_name}"
 
 def _validate_exp_name_format(exp_name: str, debug_mode: bool):
+    # validate the experiment name format
     if not debug_mode and len(exp_name.split("_")) != 4:
         raise ValueError(
             f"exp_name should be in the format <task>_<tag>_<version>, got {exp_name}"
@@ -80,6 +83,7 @@ def _validate_exp_name_format(exp_name: str, debug_mode: bool):
 
 
 def _setup_paths(exp_name: str) -> tuple[Path, Path]:
+    # setup the log directory and checkpoint directory
     logdir = Path(PATH_LOG) / exp_name
     logdir.mkdir(parents=True, exist_ok=True)
     update_file_handler(filename=f"{logdir}/info.log")
@@ -89,11 +93,15 @@ def _setup_paths(exp_name: str) -> tuple[Path, Path]:
 
 
 def _log_checkpoint_path(ckpt_path: Path):
+    # log the checkpoint path
     logging.info(f"Checkpoint path: {ckpt_path}")
 
 
 def _apply_args_to_config(args: Args, policy_cfg, env_config, debug: bool):
-    policy_cfg.num_timesteps = args.num_timesteps
+    """
+    Apply command line arguments to the policy and environment configurations.
+    """
+    policy_cfg.num_timesteps = args.num_timesteps  # total env interaction budget; controls number of PPO training epochs and acts as the hard stop condition
     if debug:
         policy_cfg.training_metrics_steps = 1000
         policy_cfg.num_evals = 5
@@ -109,24 +117,26 @@ def _apply_args_to_config(args: Args, policy_cfg, env_config, debug: bool):
         policy_cfg.num_eval_envs = 128
     # cfg.restore_checkpoint_path = Path(args.restore_checkpoint_path)
     if args.restore_name != "none":
+        # get the latest checkpoint from the log directory if resuming training
         from cat_ppo.constant import get_latest_ckpt
         policy_cfg.restore_checkpoint_path = str(get_latest_ckpt(args.restore_name))
-    env_config.reward_config.scales.feetgf = args.ground
-    env_config.reward_config.scales.feetdf = args.ground
-    env_config.reward_config.scales.headgf = args.overhead
-    env_config.reward_config.scales.headdf = args.overhead
-    env_config.reward_config.scales.handsgf = args.lateral
-    env_config.reward_config.scales.handsdf = args.lateral
-    env_config.reward_config.scales.kneesdf = args.lateral
-    env_config.reward_config.scales.shldsdf = args.lateral
-    env_config.term_collision_threshold = args.term_collision_threshold
-    env_config.pf_config.path = args.obs_path
+    env_config.reward_config.scales.feetgf = args.ground  # scale: align feet velocity with HumanoidPF guidance (ground)
+    env_config.reward_config.scales.feetdf = args.ground  # scale: SDF penalty for feet vs ground obstacles
+    env_config.reward_config.scales.headgf = args.overhead  # scale: align head motion with guidance (overhead)
+    env_config.reward_config.scales.headdf = args.overhead  # scale: SDF penalty for head vs overhead obstacles
+    env_config.reward_config.scales.handsgf = args.lateral  # scale: align hands with guidance (lateral / narrow)
+    env_config.reward_config.scales.handsdf = args.lateral  # scale: SDF penalty for hands vs side obstacles
+    env_config.reward_config.scales.kneesdf = args.lateral  # scale: SDF penalty for knees vs obstacles
+    env_config.reward_config.scales.shldsdf = args.lateral  # scale: SDF penalty for shoulders vs obstacles
+    env_config.term_collision_threshold = args.term_collision_threshold  # SDF below -threshold triggers collision termination
+    env_config.pf_config.path = args.obs_path  # directory with sdf.npy, bf.npy, gf.npy for HumanoidPF
 
 def _prepare_training_params(cfg, ckpt_path: Path):
+    # Convert config to a **kwargs dict for Brax PPO train(), injecting the custom env wrapper and network factory callable.
     params = cfg.to_dict()
-    params.pop("network_factory", None)
+    params.pop("network_factory", None)  # remove the network factory from the parameters
     params["wrap_env_fn"] = wrap_for_brax_training_reset #wrapper.wrap_for_brax_training
-    network_fn = make_ppo_networks
+    network_fn = make_ppo_networks  # make_ppo_networks is an available function from brax
     params["network_factory"] = (
         functools.partial(network_fn, **cfg.network_factory)
         if hasattr(cfg, "network_factory")
@@ -139,6 +149,9 @@ def _prepare_training_params(cfg, ckpt_path: Path):
 def _init_wandb(
     args: Args, exp_name, env_class, task_cfg, ckpt_path, config_fname="config.json"
 ):
+    """
+    WanDB initialization.
+    """
     wandb.init(
         name=exp_name,
         project=WANDB_PROJECT,
@@ -156,6 +169,7 @@ def _init_wandb(
 
 
 def _progress(num_steps, metrics, times, total_steps, debug_mode, exp_name):
+    # progres callback function to log training progress and metrics, and estimate time remaining
     now = time.monotonic()
     times.append(now)
     if metrics and not debug_mode:
@@ -177,6 +191,7 @@ def _progress(num_steps, metrics, times, total_steps, debug_mode, exp_name):
 
 
 def _report_training_time(times):
+    # report the time taken for JIT compilation and total training time, the JIT is a one-time cost that happens at the beginning of training when JAX compiles the training function for the first time, which can take a few minutes but is necessary for fast execution in subsequent steps
     if len(times) > 1:
         logging.info("Done training.")
         logging.info(f"Time to JIT compile: {times[1] - times[0]:.2f}s")
@@ -184,6 +199,9 @@ def _report_training_time(times):
 
 
 def train(args: Args):
+    """
+    Main training function.
+    """
     env_class = cat_ppo.registry.get(args.task, "train_env_class")
     task_cfg = cat_ppo.registry.get(args.task, "config")
     env_cfg = task_cfg.env_config
@@ -191,7 +209,7 @@ def train(args: Args):
     eval_config = task_cfg.eval_config
 
     exp_name = _prepare_exp_name(args.task, args.generate_exp_name())
-    debug_mode = "debug" in exp_name
+    debug_mode = "debug" in exp_name    # check if we are in the debug mode
 
     _validate_exp_name_format(exp_name, debug_mode)
 
@@ -202,10 +220,11 @@ def train(args: Args):
     task_cfg.env_config = env_cfg
     policy_params = _prepare_training_params(policy_cfg, ckpt_path)
 
+    # initialize wandb
     if not debug_mode:
         _init_wandb(args, exp_name, env_class, task_cfg, ckpt_path)
 
-    train_fn = functools.partial(ppo.train, **policy_params)
+    train_fn = functools.partial(ppo.train, **policy_params)    # prefill arguments in policy_params
     times = [time.monotonic()]
 
     env = env_class(task_type=env_cfg.task_type, config=env_cfg)

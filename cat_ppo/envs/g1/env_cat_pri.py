@@ -631,6 +631,7 @@ class G1CatPriEnv(G1LocoEnv):
         state.info["gait_mask"] = jp.float32(gait_mask)
 
     def _get_termination(self, data: mjx.Data, info: dict[str, Any]) -> jax.Array:
+        # Terminates on fall or SDF collision for head/feet/hands only (fewer body groups than G1CatEnv).
         fall_termination = self.get_gravity(data, "pelvis")[2] < 0.0
         fall_termination |= info["head_pos"][2] < 0.7
         contact_termination = collision.geoms_colliding(
@@ -655,6 +656,8 @@ class G1CatPriEnv(G1LocoEnv):
         return fall_termination | contact_termination | jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any()
 
     def _get_obs(self, data: mjx.Data, info: dict[str, Any], feet_contact: jax.Array) -> mjx_env.Observation:
+        # state (175-dim): same base as G1CatEnv + linvel_pelvis, absolute body positions/velocities, feet_contact. NOT deployable (uses ground-truth signals).
+        # privileged_state (209-dim): noiseless state + rtf + HumanoidPF fields + domain rand params (for critic only).
         # body pose
         gyro_pelvis = self.get_gyro(data, "pelvis")
         gvec_pelvis = data.site_xmat[self._pelvis_imu_site_id].T @ jp.array([0, 0, -1])

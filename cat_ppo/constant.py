@@ -1,3 +1,8 @@
+"""
+This file contains the constant variables for the cat_ppo project.
+It also contains utility functions to get the latest checkpoint and log path.
+"""
+
 import os
 from pathlib import Path
 from absl import logging

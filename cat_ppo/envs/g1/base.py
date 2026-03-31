@@ -47,7 +47,9 @@ class G1Env(mjx_env.MjxEnv):
 
     # Sensor readings.
     def get_gravity(self, data: mjx.Data, frame: str) -> jax.Array:
-        """Return the gravity vector in the world frame."""
+        """Return the gravity vector in the world frame.
+        `frame` is a Mujoco body name, e.g., "pelvis" and "torso"
+        """
         return mjx_env.get_sensor_data(
             self.mj_model, data, f"{consts.GRAVITY_SENSOR}_{frame}"
         )
