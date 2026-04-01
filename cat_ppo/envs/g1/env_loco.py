@@ -358,8 +358,8 @@ class G1LocoEnv(g1_base.G1Env):
         self._cmd_resample_steps = int(self._config.command_config.resampling_time / self.dt)
         self._cmd_stop_prob = self._config.command_config.stop_prob
 
-        self._left_hand_geom_id = self._mj_model.geom("left_hand_collision").id
-        self._right_hand_geom_id = self._mj_model.geom("right_hand_collision").id
+        self._left_hand_geom_id = self._mj_model.geom("left_palm_col").id
+        self._right_hand_geom_id = self._mj_model.geom("right_palm_col").id
         self._left_foot_geom_id = self._mj_model.geom("left_foot").id
         self._right_foot_geom_id = self._mj_model.geom("right_foot").id
         self._left_shin_geom_id = self._mj_model.geom("left_shin").id

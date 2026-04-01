@@ -24,11 +24,17 @@ ROOT_PATH = PATH_ASSET / "unitree_g1"
 FEET_ONLY_FLAT_TERRAIN_XML = ROOT_PATH / "scene_mjx_feetonly_flat_terrain.xml" # for training
 MESH_XML = ROOT_PATH / "scene_mjx_feetonly_mesh.xml" # for testing with visualization
 
+# CaTra (Carry and Traverse) scene XMLs
+CATRA_FLAT_TERRAIN_XML = ROOT_PATH / "scene_mjx_feetonly_flat_terrain_catra.xml"
+CATRA_MESH_XML = ROOT_PATH / "scene_mjx_feetonly_mesh_catra.xml"
+
 
 def task_to_xml(task_name: str) -> Path:
     return {
         "flat_terrain": FEET_ONLY_FLAT_TERRAIN_XML,
         "mesh": MESH_XML,
+        "flat_terrain_catra": CATRA_FLAT_TERRAIN_XML,
+        "mesh_catra": CATRA_MESH_XML,
     }[task_name]
 
 
@@ -153,6 +159,55 @@ OBS_JOINT_NAMES = [
     "right_shoulder_yaw_joint",
     "right_elbow_joint",
 ]
+
+# CaTra box site/geom names in the scene XML
+BOX_SITE = "box_center"
+BOX_GEOM = "box_geom"
+
+# 23-joint action space for CaTra: 12 legs + 3 waist + 8 arm (shoulder + elbow, no wrists)
+CATRA_ACTION_JOINT_NAMES = [
+    # 12 leg joints (same as ACTION_JOINT_NAMES)
+    "left_hip_pitch_joint",
+    "left_hip_roll_joint",
+    "left_hip_yaw_joint",
+    "left_knee_joint",
+    "left_ankle_pitch_joint",
+    "left_ankle_roll_joint",
+    "right_hip_pitch_joint",
+    "right_hip_roll_joint",
+    "right_hip_yaw_joint",
+    "right_knee_joint",
+    "right_ankle_pitch_joint",
+    "right_ankle_roll_joint",
+    # 3 waist joints
+    "waist_yaw_joint",
+    "waist_roll_joint",
+    "waist_pitch_joint",
+    # 8 arm joints (left then right, shoulder + elbow only; wrists stay at default)
+    "left_shoulder_pitch_joint",
+    "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint",
+    "left_elbow_joint",
+    "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",
+    "right_elbow_joint",
+]
+# num_act = 23
+
+# Carrying pose: arms pitched forward ~85°, elbows bent ~85°, hands at chest height in front.
+# TODO: tune exact values in MuJoCo viewer; the weld relpose in the XML must match.
+# fmt: off
+DEFAULT_QPOS_CATRA = np.float32([
+    0, 0, 0.8,       # root xyz
+    1, 0, 0, 0,      # root quat (identity)
+    -0.1, 0, 0, 0.3, -0.2, 0,   # left leg (same as DEFAULT_QPOS)
+    -0.1, 0, 0, 0.3, -0.2, 0,   # right leg
+    0, 0, 0,         # waist (neutral)
+    1.5, 0.0, 0, 1.5, 0, 0, 0,  # left arm: shoulder_pitch=1.5, roll=0, yaw=0, elbow=1.5, wrists=0
+    1.5, 0.0, 0, 1.5, 0, 0, 0,  # right arm (symmetric)
+])
+# fmt: on
 
 DEFAULT_CHEST_Z = 1.0
 

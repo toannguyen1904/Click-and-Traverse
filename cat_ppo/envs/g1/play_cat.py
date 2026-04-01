@@ -791,3 +791,355 @@ class PlayG1CatEnv(BaseEnv):
         command = np.where(small_cond, self._init_command, command)
         return command
 
+
+_NUM_ROBOT = 29   # robot joints / velocities
+_BOX_Q_START = 7 + _NUM_ROBOT   # 36
+
+
+@cat_ppo.registry.register("G1CaTra", "play_env_class")
+class PlayG1CaTraEnv(PlayG1CatEnv):
+    """CPU-based inference environment for the G1 CaTra policy.
+
+    Extends PlayG1CatEnv to:
+    - Load the mesh_catra scene (robot + freejoint box).
+    - Use the 23-joint CATRA_ACTION_JOINT_NAMES action space.
+    - Fix PD slicing to exclude the box freejoint DOFs.
+    - Initialise the box at the palm midpoint via FK each reset.
+    - Append box HumanoidPF fields (boxgf, boxbf, boxdf) to the observation.
+    """
+
+    def __init__(self, task_type="mesh_catra", fix_body=False, config=None,
+                 dt=0.02, sim_dt=0.002, headless=False):
+        # Bypass PlayG1CatEnv.__init__ which hard-codes "mesh"; call BaseEnv directly.
+        BaseEnv.__init__(self, "mesh_catra", config)
+        self.mj_model.opt.timestep = sim_dt
+        self.headless = headless
+        if not self.headless:
+            self.viewer = mujoco.viewer.launch_passive(self.mj_model, self.mj_data)
+        self.fix_body = fix_body
+        self._config = config
+        self._post_init()
+        self.dt = dt
+        self.sim_dt = sim_dt
+        self.pri = False
+
+        pf_path = config.pf_config.path
+        self.dx = config.pf_config.dx
+        self.sdf = np.load(f"{pf_path}/sdf.npy")[..., None]
+        self.bf  = np.load(f"{pf_path}/bf.npy")
+        self.gf  = np.load(f"{pf_path}/gf.npy")
+        self.pf_origin = np.array(config.pf_config.origin, dtype=np.float32)
+        self.Nx, self.Ny, self.Nz, _ = self.sdf.shape
+        self.current_goal_global = np.array([2.0, 0.0, 0.7])
+        self.gait_freq = 1.5
+        self.foot_height = 0.07
+
+    @property
+    def action_size(self) -> int:
+        return len(consts.CATRA_ACTION_JOINT_NAMES)
+
+    def _post_init(self):
+        super()._post_init()
+        # Override action joints to the 23-joint CaTra set.
+        self.action_joint_names = consts.CATRA_ACTION_JOINT_NAMES.copy()
+        self.action_joint_ids = np.array(
+            [self.mj_model.actuator(n).id for n in self.action_joint_names]
+        )
+        # Default qpos uses only the 29 robot joints (no box).
+        self._default_qpos = np.array(consts.DEFAULT_QPOS_CATRA[7:7 + _NUM_ROBOT])
+        # Joint limits: robot joints only (exclude box freejoint at index 30).
+        lowers, uppers = self.mj_model.jnt_range[1:1 + _NUM_ROBOT].T
+        c = (lowers + uppers) / 2
+        r = uppers - lowers
+        factor = self._config.soft_joint_pos_limit_factor
+        self._soft_lowers = c - 0.5 * r * factor
+        self._soft_uppers = c + 0.5 * r * factor
+        # Box centre site for PF sampling.
+        self._box_site_id = self.mj_model.site(consts.BOX_SITE).id
+
+    def reset(self):
+        # Robot pose.
+        self.mj_data.qpos[:7] = consts.DEFAULT_QPOS_CATRA[:7]
+        self.mj_data.qpos[7:7 + _NUM_ROBOT] = self._default_qpos
+        # Give the box a rough placeholder position so FK can run.
+        self.mj_data.qpos[_BOX_Q_START:_BOX_Q_START + 7] = [0.35, 0, 1.0, 1, 0, 0, 0]
+        mujoco.mj_forward(self.mj_model, self.mj_data)
+        # Place box at palm midpoint (FK-based init, mirroring env_catra.py).
+        left_palm  = self.mj_data.site_xpos[self._hands_site_id[0]].copy()
+        right_palm = self.mj_data.site_xpos[self._hands_site_id[1]].copy()
+        box_pos = (left_palm + right_palm) / 2.0
+        self.mj_data.qpos[_BOX_Q_START:_BOX_Q_START + 3] = box_pos
+        self.mj_data.qpos[_BOX_Q_START + 3] = 1.0
+        self.mj_data.qpos[_BOX_Q_START + 4:_BOX_Q_START + 7] = 0.0
+        mujoco.mj_forward(self.mj_model, self.mj_data)
+        if not self.headless:
+            self.viewer.sync()
+
+        phase_dt = 2 * np.pi * self.dt * self.gait_freq
+        head_pos   = self.mj_data.site_xpos[self._head_site_id]
+        feet_pos   = self.mj_data.site_xpos[self._feet_site_id]
+        hands_pos  = self.mj_data.site_xpos[self._hands_site_id]
+        knees_pos  = self.mj_data.site_xpos[self._knees_site_id]
+        shlds_pos  = self.mj_data.site_xpos[self._shlds_site_id]
+        pelv_pos   = self.mj_data.site_xpos[self._pelvis_imu_site_id].reshape(1, -1)
+        tors_pos   = self.mj_data.site_xpos[self._torso_imu_site_id].reshape(1, -1)
+        box_pos_s  = self.mj_data.site_xpos[self._box_site_id].reshape(1, -1)
+
+        all_poses = np.concatenate([
+            head_pos.reshape(1, -1), pelv_pos, tors_pos,
+            feet_pos, hands_pos, knees_pos, shlds_pos,
+        ], axis=0)
+        all_gf = self.sample_field(self.gf, all_poses)
+        all_bf = self.sample_field(self.bf, all_poses)
+        all_df = self.sample_field(self.sdf, all_poses)
+        headgf, pelvgf, torsgf, feetgf, handsgf, kneesgf, shldsgf = np.split(all_gf, [1,2,3,5,7,9], axis=0)
+        headbf, pelvbf, torsbf, feetbf, handsbf, kneesbf, shldsbf = np.split(all_bf, [1,2,3,5,7,9], axis=0)
+        headdf, pelvdf, torsdf, feetdf, handsdf, kneesdf, shldsdf = np.split(all_df, [1,2,3,5,7,9], axis=0)
+        boxgf = self.sample_field(self.gf, box_pos_s)
+        boxbf = self.sample_field(self.bf, box_pos_s)
+        boxdf = self.sample_field(self.sdf, box_pos_s)
+
+        command = self.compute_cmd_from_rtf(
+            pelvgf.reshape(-1),
+            np.concat([headgf, feetgf, handsgf]),
+            np.concat([headbf, feetbf, handsbf]),
+        )
+
+        info = {
+            "step": 0,
+            "command": command.copy(),
+            "last_command": command.copy(),
+            "flags": np.zeros(2),
+            "last_flags": np.zeros(2),
+            "last_act": np.zeros(self.action_size),
+            "phase_dt": phase_dt,
+            "phase": self._init_phase.copy(),
+            "foot_height": self.foot_height,
+            "motor_targets": self._default_qpos.copy(),
+            "timestamp_move2stop": 100,
+            "gait_mask": np.zeros(2),
+            "odom_delay": self.mj_data.qpos[:7].copy(),
+            "headgf": headgf, "headbf": headbf, "headdf": headdf,
+            "head_pos": head_pos.copy(), "head_vel": np.zeros(3),
+            "feetgf": feetgf, "feetbf": feetbf, "feetdf": feetdf,
+            "feet_pos": feet_pos.copy(), "feet_vel": np.zeros_like(feet_pos),
+            "handsgf": handsgf, "handsbf": handsbf, "handsdf": handsdf,
+            "hands_pos": hands_pos.copy(), "hands_vel": np.zeros_like(hands_pos),
+            "kneesgf": kneesgf, "kneesbf": kneesbf, "kneesdf": kneesdf,
+            "knees_pos": knees_pos.copy(),
+            "shldsgf": shldsgf, "shldsbf": shldsbf, "shldsdf": shldsdf,
+            "shlds_pos": shlds_pos.copy(),
+            "pelvgf": pelvgf, "pelvbf": pelvbf, "pelvdf": pelvdf,
+            "pelv_pos": pelv_pos.copy(),
+            "torsgf": torsgf, "torsbf": torsbf, "torsdf": torsdf,
+            "tors_pos": tors_pos.copy(),
+            "boxgf": boxgf, "boxbf": boxbf, "boxdf": boxdf,
+            "box_pos": box_pos_s.reshape(-1).copy(),
+        }
+        obs = self.get_obs(info)
+        return State(info, obs)
+
+    def step(self, state: State, action: np.ndarray):
+        if self.fix_body:
+            self.mj_data.qvel[:6] = 0
+
+        lower_motor_targets = np.clip(
+            state.info["motor_targets"][self.action_joint_ids]
+            + action * self._config.action_scale,
+            self._soft_lowers[self.action_joint_ids],
+            self._soft_uppers[self.action_joint_ids],
+        )
+        motor_targets = self._default_qpos.copy()
+        motor_targets[self.action_joint_ids] = lower_motor_targets
+        state.info["motor_targets"] = motor_targets.copy()
+
+        for _ in range(int(self.dt / self.sim_dt)):
+            # Slice robot joints only — exclude the box freejoint DOFs.
+            torques = (
+                consts.KPs * (motor_targets - self.mj_data.qpos[7:7 + _NUM_ROBOT])
+                + consts.KDs * (-self.mj_data.qvel[6:6 + _NUM_ROBOT])
+            )
+            self.mj_data.ctrl[:] = torques
+            mujoco.mj_step(self.mj_model, self.mj_data)
+
+        if not self.headless:
+            self.viewer.sync()
+            time.sleep(self.dt)
+
+        head_pos  = self.mj_data.site_xpos[self._head_site_id]
+        head_vel  = (head_pos - state.info["head_pos"]) / self.dt
+        feet_pos  = self.mj_data.site_xpos[self._feet_site_id]
+        feet_vel  = (feet_pos - state.info["feet_pos"]) / self.dt
+        hands_pos = self.mj_data.site_xpos[self._hands_site_id]
+        hands_vel = (hands_pos - state.info["hands_pos"]) / self.dt
+        knees_pos = self.mj_data.site_xpos[self._knees_site_id]
+        shlds_pos = self.mj_data.site_xpos[self._shlds_site_id]
+        pelv_pos  = self.mj_data.site_xpos[self._pelvis_imu_site_id]
+        tors_pos  = self.mj_data.site_xpos[self._torso_imu_site_id]
+        box_pos   = self.mj_data.site_xpos[self._box_site_id].reshape(1, -1)
+
+        all_poses = np.concatenate([
+            head_pos.reshape(1, -1), pelv_pos.reshape(1, -1), tors_pos.reshape(1, -1),
+            feet_pos, hands_pos, knees_pos, shlds_pos,
+        ], axis=0)
+        update_pf = (state.info["step"] % 1) == 0
+        odo_noisy = noisy_rootpose(self.mj_data.qpos[:7])
+        odom_delay = np.where(update_pf, self.mj_data.qpos[:7].copy(), state.info["odom_delay"])
+        state.info["odom_delay"] = odom_delay.copy()
+        p_gt, q_gt = self.mj_data.qpos[:3], self.mj_data.qpos[3:7]
+        p_odom, q_odom = odom_delay[:3], odom_delay[3:7]
+        all_poses_delay = delay_body_pos(p_gt, q_gt, p_odom, q_odom, all_poses)
+        box_pos_delay   = delay_body_pos(p_gt, q_gt, p_odom, q_odom, box_pos)
+
+        all_gf = self.sample_field(self.gf, all_poses_delay)
+        all_bf = self.sample_field(self.bf, all_poses_delay)
+        all_df = self.sample_field(self.sdf, all_poses_delay)
+        headgf, pelvgf, torsgf, feetgf, handsgf, kneesgf, shldsgf = np.split(all_gf, [1,2,3,5,7,9], axis=0)
+        headbf, pelvbf, torsbf, feetbf, handsbf, kneesbf, shldsbf = np.split(all_bf, [1,2,3,5,7,9], axis=0)
+        headdf, pelvdf, torsdf, feetdf, handsdf, kneesdf, shldsdf = np.split(all_df, [1,2,3,5,7,9], axis=0)
+        boxgf = self.sample_field(self.gf, box_pos_delay)
+        boxbf = self.sample_field(self.bf, box_pos_delay)
+        boxdf = self.sample_field(self.sdf, box_pos_delay)
+
+        command = self.compute_cmd_from_rtf(
+            pelvgf.reshape(-1),
+            np.concat([headgf, feetgf, handsgf]),
+            np.concat([headbf, feetbf, handsbf]),
+        )
+        state.info["command"] = command.copy()
+        self._update_phase(state)
+        move_flag = state.info["last_flags"][1]
+        all_gf = all_gf * (move_flag[None] > 0.5) / (np.linalg.norm(all_gf, axis=-1, keepdims=True) + EPS)
+        all_bf = all_bf / (np.linalg.norm(all_bf, axis=-1, keepdims=True) + EPS)
+        headgf, pelvgf, torsgf, feetgf, handsgf, kneesgf, shldsgf = np.split(all_gf, [1,2,3,5,7,9], axis=0)
+        headbf, pelvbf, torsbf, feetbf, handsbf, kneesbf, shldsbf = np.split(all_bf, [1,2,3,5,7,9], axis=0)
+
+        state.info.update({
+            "headgf": headgf, "headbf": headbf, "headdf": headdf,
+            "head_pos": head_pos.copy(), "head_vel": head_vel.copy(),
+            "feetgf": feetgf, "feetbf": feetbf, "feetdf": feetdf,
+            "feet_pos": feet_pos.copy(), "feet_vel": feet_vel.copy(),
+            "handsgf": handsgf, "handsbf": handsbf, "handsdf": handsdf,
+            "hands_pos": hands_pos.copy(), "hands_vel": hands_vel.copy(),
+            "pelvgf": pelvgf, "pelvbf": pelvbf, "pelvdf": pelvdf,
+            "torsgf": torsgf, "torsbf": torsbf, "torsdf": torsdf,
+            "kneesgf": kneesgf, "kneesbf": kneesbf, "kneesdf": kneesdf,
+            "shldsgf": shldsgf, "shldsbf": shldsbf, "shldsdf": shldsdf,
+            "boxgf": boxgf, "boxbf": boxbf, "boxdf": boxdf,
+            "box_pos": box_pos.reshape(-1).copy(),
+            "step": state.info["step"] + 1,
+            "last_act": action.copy(),
+        })
+
+        obs = self.get_obs(state.info)
+        return State(state.info, obs)
+
+    def get_obs(self, info):
+        gyro_pelvis  = self.get_gyro("pelvis")
+        gvec_pelvis  = self.mj_data.site_xmat[self._pelvis_imu_site_id].reshape(3, 3).T @ np.array([0, 0, -1])
+        linvel_pelvis = self.get_local_linvel("pelvis")
+        # Robot joints only (exclude box freejoint at qpos[36:43]).
+        joint_angles = self.mj_data.qpos[7:7 + _NUM_ROBOT]
+        joint_vel    = self.mj_data.qvel[6:6 + _NUM_ROBOT]
+        move_flag    = info["last_flags"][1]
+        pelvis2world_rot = self.mj_data.site_xmat[self._pelvis_imu_site_id].reshape(3, 3)
+        navi2world_rot   = base2navi_transform(pelvis2world_rot)
+        navi2world_pose  = np.eye(4)
+        navi2world_pose[:3, :3] = navi2world_rot
+        navi2world_pose[:2, 3]  = self.mj_data.site_xpos[self._pelvis_imu_site_id][:2]
+        navi2world_pose[2, 3]   = 0.75
+        torso2world_rot  = self.mj_data.site_xmat[self._torso_imu_site_id].reshape(3, 3)
+        torso2navi_rot   = navi2world_rot.T @ torso2world_rot
+        navi_torso_rpy   = R.from_matrix(torso2navi_rot).as_euler('xyz', degrees=False)
+        gait_phase = np.hstack([np.cos(info["phase"]), np.sin(info["phase"])])
+        floor_contact = [
+            geoms_colliding(self.mj_data, geom_id, self._floor_geom_id)
+            for geom_id in self._feet_geom_id
+        ]
+
+        headgf  = info["headgf"].copy();  headbf  = info["headbf"].copy();  headdf  = info["headdf"].copy()
+        pelvgf  = info["pelvgf"].copy();  pelvbf  = info["pelvbf"].copy();  pelvdf  = info["pelvdf"].copy()
+        torsgf  = info["torsgf"].copy();  torsbf  = info["torsbf"].copy();  torsdf  = info["torsdf"].copy()
+        feetgf  = info["feetgf"].copy();  feetbf  = info["feetbf"].copy();  feetdf  = info["feetdf"].copy()
+        handsgf = info["handsgf"].copy(); handsbf = info["handsbf"].copy(); handsdf = info["handsdf"].copy()
+        kneesgf = info["kneesgf"].copy(); kneesbf = info["kneesbf"].copy(); kneesdf = info["kneesdf"].copy()
+        shldsgf = info["shldsgf"].copy(); shldsbf = info["shldsbf"].copy(); shldsdf = info["shldsdf"].copy()
+        boxgf   = info["boxgf"].copy();   boxbf   = info["boxbf"].copy();   boxdf   = info["boxdf"].copy()
+
+        command     = info["command"].copy()
+        hands_pos   = info["hands_pos"].copy()
+        hands_vel   = info["hands_vel"].copy()
+        head_pos    = info["head_pos"].copy()
+        head_vel    = info["head_vel"].copy()
+        feet_pos    = info["feet_pos"].copy()
+        feet_vel    = info["feet_vel"].copy()
+
+        if self.pri:
+            state = np.hstack([
+                gyro_pelvis, gvec_pelvis,
+                (joint_angles - self._default_qpos)[self.obs_joint_ids],
+                joint_vel[self.obs_joint_ids],
+                info["last_act"],
+                info["motor_targets"][self.action_joint_ids],
+                [move_flag], command,
+                info["foot_height"], gait_phase,
+                linvel_pelvis,
+                headgf.reshape(-1), headbf.reshape(-1), headdf.reshape(-1),
+                feetgf.reshape(-1), feetbf.reshape(-1), feetdf.reshape(-1),
+                handsgf.reshape(-1), handsbf.reshape(-1), handsdf.reshape(-1),
+                kneesbf.reshape(-1), kneesdf.reshape(-1),
+                shldsbf.reshape(-1), shldsdf.reshape(-1),
+                head_pos.reshape(-1), head_vel.reshape(-1),
+                feet_pos.reshape(-1), feet_vel.reshape(-1),
+                hands_pos.reshape(-1), hands_vel.reshape(-1),
+                navi_torso_rpy[:2], info["gait_mask"], floor_contact,
+                boxgf.reshape(-1), boxbf.reshape(-1), boxdf.reshape(-1),
+            ])
+        else:
+            headgf  = world_to_navi_vel(navi2world_pose, headgf.reshape(-1, 3))
+            headbf  = world_to_navi_vel(navi2world_pose, headbf.reshape(-1, 3))
+            pelvgf  = world_to_navi_vel(navi2world_pose, pelvgf.reshape(-1, 3))
+            pelvbf  = world_to_navi_vel(navi2world_pose, pelvbf.reshape(-1, 3))
+            torsgf  = world_to_navi_vel(navi2world_pose, torsgf.reshape(-1, 3))
+            torsbf  = world_to_navi_vel(navi2world_pose, torsbf.reshape(-1, 3))
+            feetgf  = world_to_navi_vel(navi2world_pose, feetgf.reshape(-1, 3))
+            feetbf  = world_to_navi_vel(navi2world_pose, feetbf.reshape(-1, 3))
+            handsgf = world_to_navi_vel(navi2world_pose, handsgf.reshape(-1, 3))
+            handsbf = world_to_navi_vel(navi2world_pose, handsbf.reshape(-1, 3))
+            kneesgf = world_to_navi_vel(navi2world_pose, kneesgf.reshape(-1, 3))
+            kneesbf = world_to_navi_vel(navi2world_pose, kneesbf.reshape(-1, 3))
+            shldsgf = world_to_navi_vel(navi2world_pose, shldsgf.reshape(-1, 3))
+            shldsbf = world_to_navi_vel(navi2world_pose, shldsbf.reshape(-1, 3))
+            boxgf_n = world_to_navi_vel(navi2world_pose, boxgf.reshape(-1, 3))
+            boxbf_n = world_to_navi_vel(navi2world_pose, boxbf.reshape(-1, 3))
+            command = world_to_navi_vel(navi2world_pose, command.reshape(-1, 3)).reshape(3)
+            command[-1] = 0
+            headbf  = headbf  * (headdf  < 0.5); headdf  = np.clip(headdf,  -1.0, 0.5)
+            pelvbf  = pelvbf  * (pelvdf  < 0.5); pelvdf  = np.clip(pelvdf,  -1.0, 0.5)
+            torsbf  = torsbf  * (torsdf  < 0.5); torsdf  = np.clip(torsdf,  -1.0, 0.5)
+            feetbf  = feetbf  * (feetdf  < 0.5); feetdf  = np.clip(feetdf,  -1.0, 0.5)
+            handsbf = handsbf * (handsdf < 0.5); handsdf = np.clip(handsdf, -1.0, 0.5)
+            kneesbf = kneesbf * (kneesdf < 0.5); kneesdf = np.clip(kneesdf, -1.0, 0.5)
+            shldsbf = shldsbf * (shldsdf < 0.5); shldsdf = np.clip(shldsdf, -1.0, 0.5)
+            boxdf_c = np.clip(boxdf, -1.0, 0.5)
+            state = np.hstack([
+                gyro_pelvis, gvec_pelvis,
+                (joint_angles - self._default_qpos)[self.obs_joint_ids],
+                joint_vel[self.obs_joint_ids],
+                info["last_act"],
+                info["motor_targets"][self.action_joint_ids],
+                [move_flag], command,
+                info["foot_height"], gait_phase,
+                headgf.reshape(-1), headbf.reshape(-1), headdf.reshape(-1),
+                pelvgf.reshape(-1), pelvbf.reshape(-1), pelvdf.reshape(-1),
+                torsgf.reshape(-1), torsbf.reshape(-1), torsdf.reshape(-1),
+                feetgf.reshape(-1), feetbf.reshape(-1), feetdf.reshape(-1),
+                handsgf.reshape(-1), handsbf.reshape(-1), handsdf.reshape(-1),
+                kneesgf.reshape(-1), kneesbf.reshape(-1), kneesdf.reshape(-1),
+                shldsgf.reshape(-1), shldsbf.reshape(-1), shldsdf.reshape(-1),
+                boxgf_n.reshape(-1), boxbf_n.reshape(-1), boxdf_c.reshape(-1),
+            ])
+        self.mj_data.mocap_pos[0] = self.mj_data.xpos[self.body_ids_left_leg[1]]
+        mujoco.mj_forward(self.mj_model, self.mj_data)
+        return {"state": state, "privileged_state": None}
+

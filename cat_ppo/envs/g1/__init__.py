@@ -15,3 +15,4 @@
 
 from cat_ppo.envs.g1 import env_loco, env_cat_pri, env_cat
 from cat_ppo.envs.g1 import play_cat
+from cat_ppo.envs.g1 import env_catra
