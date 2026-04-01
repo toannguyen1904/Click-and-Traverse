@@ -227,6 +227,31 @@ python -m train_ppo --task {task} --restore_name {restore_name} --exp_name {exp_
 ```
 
 To train the model on the newly generated scene, use:
+
+```bash
+python train_ppo.py \
+  --task G1Cat \
+  --exp_name debug \
+  --restore_name none \
+  --ground 1.0 --lateral 1.0 --overhead 1.0 \
+  --term_collision_threshold 0.04 \
+  --obs_path data/assets/TypiObs/empty
+```
+
+or
+
+```bash
+python train_ppo.py \
+  --task G1Cat \
+  --exp_name G1Cat_empty \
+  --restore_name none \
+  --ground 1.0 --lateral 1.0 --overhead 1.0 \
+  --term_collision_threshold 0.04 \
+  --obs_path data/assets/TypiObs/empty
+```
+
+or
+
 ```bash
 python train_ppo.py \
   --task G1CatPri \
