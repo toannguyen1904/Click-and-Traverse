@@ -6,19 +6,23 @@ Extension of **Click-and-Traverse (CAT)** where the Unitree G1 humanoid carries 
 
 ## Overview
 
-CaTra adds a **23-DOF action space** (12 legs + 3 waist + 8 arms) and a carried box attached via MuJoCo weld equality constraints. The policy is guided by HumanoidPF fields sampled both at body sites (as in CAT) and at the box center, so the robot learns to move the box away from obstacles while traversing the scene.
+CaTra adds a **23-DOF action space** (12 legs + 3 waist + 8 arms) and a carried box that the robot holds entirely by contact forces. The policy is guided by HumanoidPF fields sampled both at body sites (as in CAT) and at the box center, so the robot learns to keep the box away from obstacles while traversing the scene.
 
 ### Key Differences from G1Cat
 
 | Aspect | G1Cat | G1CaTra |
 |--------|-------|---------|
 | Action DOF | 12 (legs only) | 23 (legs + waist + arms) |
-| Action scale | 0.5 | 0.3 |
-| Default pose | Arms neutral | Arms in carrying pose (shoulder_pitch=1.5, elbow=1.5) |
-| Observations | 162-dim | 191-dim (+7 box PF, +22 for extra actuators) |
-| Privileged obs | 224-dim | 259-dim (+35 extra) |
-| Box | None | Welded to both wrists, mass 1.5 kg |
+| Wrists | Not actuated | Not actuated (passive at default) |
+| Action scale | 0.5 | 0.3 (conservative; arm torque limits 25 Nm vs 88–139 Nm for legs) |
+| Default pose | Arms neutral/hanging | Carrying pose: `shoulder_pitch=1.5 rad`, `elbow=1.5 rad` |
+| Box | None | Free body, mass 1.5 kg (randomized 0.5–3.0 kg), held by contact |
+| Box initialization | — | Reset at palm midpoint each episode via FK |
+| Observations | 162-dim | 191-dim (+11 last_act, +11 motor_targets, +7 box PF) |
+| Privileged obs | 224-dim | 259-dim (+11, +11, +7 box PF, +6 box pos/vel) |
+| Hand collision | Single capsule | Multi-geom cupped hand (palm + fingers + thumb) |
 | Scene XMLs | flat_terrain / mesh | flat_terrain_catra / mesh_catra |
+| qpos size | 36 | 43 (robot 36 + box freejoint 7) |
 
 ---
 
@@ -37,7 +41,7 @@ python -m cat_ppo.utils.mj_playground_init   # initialize MuJoCo assets
 
 ### Basic (no obstacle rewards)
 
-Train with rigid weld, no box or body-collision reward — robot learns to walk while carrying:
+Robot learns to walk while carrying the box, with arm stabilization rewards only:
 
 ```bash
 python train_ppo.py \
@@ -53,12 +57,12 @@ Add `--ground`, `--lateral`, `--overhead`, `--box` to activate collision and box
 ```bash
 python train_ppo.py \
     --task G1CaTra \
-    --exp_name catra_v1 \
+    --exp_name G1CaTra_empty \
     --ground 1.0 \
     --lateral 1.0 \
     --overhead 1.0 \
     --box 1.0 \
-    --obs_path data/assets/TypiObs/narrow1
+    --obs_path data/assets/TypiObs/empty
 ```
 
 ### Debug run (fast iteration)
@@ -94,26 +98,31 @@ Default reward scales in `g1_catra_task_config()` (see [env_catra.py](cat_ppo/en
 
 | Reward | Scale | Description |
 |--------|-------|-------------|
-| `tracking_lin_vel` | 1.5 | Follow linear velocity command |
-| `tracking_ang_vel` | 0.75 | Follow angular velocity command |
-| `lin_vel_z` | -2.0 | Penalize vertical root velocity |
-| `ang_vel_xy` | -0.05 | Penalize roll/pitch angular velocity |
-| `orientation` | -5.0 | Penalize tilt from upright |
-| `feet_air_time` | 0.5 | Encourage foot liftoff |
-| `foot_slip` | -0.1 | Penalize foot sliding |
-| `action_rate` | -0.01 | Penalize action changes |
-| `energy` | -1e-4 | Penalize torque × velocity |
-| `alive` | 1.0 | Per-step survival bonus |
-| `arm_pose` | -0.5 | Penalize arm deviation from carrying pose |
-| `arm_smoothness` | -1e-3 | Penalize arm action magnitude |
-| `boxgf` | 0.0 | Box moves in guidance direction (activated via `--box`) |
-| `boxdf` | 0.0 | Box avoids obstacles (activated via `--box`) |
-| `feetgf` | 0.0 | Feet guidance (activated via `--ground`) |
-| `feetdf` | 0.0 | Feet SDF (activated via `--ground`) |
-| `handsgf` | 0.0 | Hands guidance (activated via `--lateral`) |
-| `handsdf` | 0.0 | Hands SDF (activated via `--lateral`) |
-| `headgf` | 0.0 | Head guidance (activated via `--overhead`) |
-| `headdf` | 0.0 | Head SDF (activated via `--overhead`) |
+| `tracking_orientation` | 2.0 | Track upright orientation + torso alignment |
+| `tracking_root_field` | 1.0 | Root velocity follows HumanoidPF guidance direction |
+| `body_motion` | -0.5 | Penalize unintended body linear/angular motion |
+| `body_rotation` | 1.0 | Reward torso facing the travel direction |
+| `foot_contact` | -1.0 | Penalize incorrect foot contact w.r.t. gait phase |
+| `foot_clearance` | -15.0 | Penalize insufficient swing foot clearance |
+| `foot_slip` | -0.5 | Penalize foot sliding on the ground |
+| `foot_balance` | -30.0 | Penalize CoP outside support polygon |
+| `straight_knee` | -30.0 | Penalize locked-straight knee pose |
+| `smoothness_joint` | -1e-6 | Penalize joint velocity jerk |
+| `smoothness_action` | -1e-3 | Penalize action change rate |
+| `joint_limits` | -1.0 | Penalize joint position near soft limits |
+| `joint_torque` | -1e-4 | Penalize torque magnitude (energy) |
+| `arm_pose` | -0.5 | Penalize arm deviation from carrying pose (always active) |
+| `arm_smoothness` | -1e-3 | Penalize arm action magnitude (always active) |
+| `boxgf` | 0.0 | Box moves in guidance direction — activated via `--box` |
+| `boxdf` | 0.0 | Box SDF penalty (box near/in obstacles) — activated via `--box` |
+| `headgf` | 0.0 | Head guidance — activated via `--overhead` |
+| `headdf` | 0.0 | Head SDF — activated via `--overhead` |
+| `handsgf` | 0.0 | Hands guidance — activated via `--lateral` |
+| `handsdf` | 0.0 | Hands SDF — activated via `--lateral` |
+| `feetgf` | 0.0 | Feet guidance — activated via `--ground` |
+| `feetdf` | 0.0 | Feet SDF — activated via `--ground` |
+| `kneesdf` | 0.0 | Knees SDF — activated via `--lateral` |
+| `shldsdf` | 0.0 | Shoulders SDF — activated via `--lateral` |
 
 ---
 
@@ -139,7 +148,7 @@ Use `mesh_catra` scene XML for visualization (set in `constants.task_to_xml`).
 
 ## Scene Preparation
 
-CaTra uses the same HumanoidPF scenes as CAT. The box PF fields (`boxgf`, `boxbf`, `boxdf`) are sampled from the same precomputed `sdf.npy / bf.npy / gf.npy` at the box center position.
+CaTra uses the same HumanoidPF scenes as CAT. The box PF fields (`boxgf`, `boxbf`, `boxdf`) are sampled from the same precomputed `sdf.npy / bf.npy / gf.npy` grids at the box center position — no extra precomputation needed.
 
 ```bash
 cd procedural_obstacle_generation && python main.py
@@ -154,12 +163,64 @@ To use a specific scene:
 
 ---
 
+## Design Notes
+
+### Action Scale and Motor Targets (PD Control)
+
+The policy does **not** output torques directly. Instead it outputs a **delta in joint-position space**, applied to the running motor target each step:
+
+```
+motor_target[t] = motor_target[t-1] + action * action_scale
+torque = Kp * (motor_target - current_qpos) + Kd * (0 - current_qvel)
+```
+
+`action_scale` limits how far the desired joint position can shift per policy step. The environment does **not** wait for joints to reach the target — each policy step is `ctrl_dt=0.02 s` and runs 10 physics substeps of `sim_dt=0.002 s` each, all applying PD torques toward the same fixed motor target.
+
+`action_scale=0.3` for CaTra vs `0.5` for G1Cat: arm joints have much lower torque limits (25 Nm vs 88–139 Nm for legs), so a smaller scale prevents large target shifts that the actuators cannot follow.
+
+### HumanoidPF Box Fields: `boxgf`, `boxbf`, `boxdf`
+
+These are the same three HumanoidPF fields used for body sites (head, feet, hands, …), evaluated at the **box center** instead of a body site:
+
+| Field | Meaning | Shape |
+|-------|---------|-------|
+| `boxgf` | **Guidance field** — 3D vector pointing toward the goal along an obstacle-free geodesic path | (3,) |
+| `boxbf` | **Boundary field** — 3D vector pointing away from the nearest obstacle surface (SDF gradient) | (3,) |
+| `boxdf` | **Distance field** — scalar SDF at the box center; positive = free space, negative = inside obstacle | (1,) |
+
+In the deployable `state` observation they are transformed into the navigation frame (same delayed/noisy treatment as body PF fields). In `privileged_state` they are kept in world frame and supplemented with noiseless `box_pos` and `box_vel`.
+
+### Box Holding: How `arm_pose` and Box PF Rewards Interact
+
+`arm_pose` does **not** directly reward the robot for holding the box. It penalizes deviation of arm joint angles from the carrying pose:
+
+```python
+err = sum((arm_angles - carry_pose_arm) ** 2)   # arm_pose minimizes this
+```
+
+This keeps the arms in the geometric configuration where contact *can* occur. The actual holding is **entirely emergent from physics contact forces** — if the arms are positioned correctly, friction between the cupped hand and the box prevents slipping.
+
+The incentive chain for learning to hold:
+
+1. `arm_pose` → keeps arms forward and bent (necessary for contact to exist)
+2. `boxdf` → penalizes the box entering obstacles (the box only stays up if held)
+3. `boxgf` → rewards the box moving toward the goal (only possible if carried)
+4. Episode termination when `boxdf < -threshold` → hard signal if box drops to the floor
+
+### Hand Geometry: Cupped Hand vs. Inspire Hand
+
+The base G1 MJCF has no finger geometry — only a single capsule collision stub at the wrist. CaTra replaces this with a three-geom cupped hand (palm box + fingers box + thumb capsule) to provide a contact surface for box holding.
+
+The Unitree G1 EDU is optionally equipped with an **Inspire RH56DFX dexterous hand** (~12 DOF per hand). Adding it for collision-only purposes — finger joints fixed in a pre-grip pose, no extra action DOFs — would give more accurate contact geometry and is architecturally straightforward. The current blocker is that the Inspire hand MJCF is not publicly distributed. If the MJCF becomes available, the finger joints can be locked via `<equality>` constraints and included purely for collision.
+
+---
+
 ## Architecture
 
 ### MJCF Changes
 
-- **[g1_mjx_feetonly_torque.xml](data/assets/unitree_g1/g1_mjx_feetonly_torque.xml)**: Hand collision replaced with multi-geom cupped hand (palm box + fingers box + thumb capsule) for more realistic contact area.
-- **[scene_mjx_feetonly_flat_terrain_catra.xml](data/assets/unitree_g1/scene_mjx_feetonly_flat_terrain_catra.xml)**: Adds `carried_box` body with freejoint. No weld constraints (Phase 3). Box initialized at palm midpoint each reset via FK.
+- **[g1_mjx_feetonly_torque.xml](data/assets/unitree_g1/g1_mjx_feetonly_torque.xml)**: Hand collision replaced with multi-geom cupped hand (palm box + fingers box + thumb capsule).
+- **[scene_mjx_feetonly_flat_terrain_catra.xml](data/assets/unitree_g1/scene_mjx_feetonly_flat_terrain_catra.xml)**: Adds `carried_box` body with freejoint. Box initialized at palm midpoint each reset via FK.
 - **[scene_mjx_feetonly_mesh_catra.xml](data/assets/unitree_g1/scene_mjx_feetonly_mesh_catra.xml)**: Mesh variant for visualization.
 
 ### Box Freejoint DOF Handling
@@ -170,30 +231,31 @@ qpos: [0:7] root | [7:36] robot joints | [36:43] box freejoint
 qvel: [0:6] root | [6:35] robot joints | [35:41] box vel
 ```
 
-`torque_step_catra` and `domain_randomize_catra` explicitly slice `[7:36]` / `[6:35]` to avoid shape mismatches inherited from `G1LocoEnv`.
+All parent-class methods that use `data.qpos[7:]` or `data.qvel[6:]` assume 29-element robot-joint slices and break with the extra 7 box DOFs. `torque_step_catra` and `domain_randomize_catra` use explicit `[7:36]` / `[6:35]` slices; `reset`, `step`, `_get_obs`, `_get_reward`, and `_get_termination` are fully overridden in `G1CaTraEnv` for the same reason.
 
-### Weld Curriculum
+### Box Reset via Forward Kinematics
 
-Currently implemented: **Phase 3 (contact-only)** directly.
+At each episode reset, the box is placed at the midpoint between the two palm sites:
+1. Initialize robot qpos in the carrying pose
+2. Run `mjx.forward()` to compute FK
+3. Read `site_xpos` for left and right palms
+4. Set box freejoint qpos to their midpoint (position) + identity quaternion
+5. Re-run `mjx.forward()` to settle
 
-MJX does not support `weld` or `connect` equality constraints when the model also contains `accelerometer` or `force` sensors (both present in the G1 robot XML). Phase 3 was adopted as the starting point since it avoids this limitation entirely and is the final training goal.
-
-| Phase | Weld | Behavior |
-|-------|------|----------|
-| 1 (skipped) | Rigid weld | Box locked to wrists — not MJX-compatible with G1 sensor setup |
-| 2 (skipped) | Soft weld | Box wobbles — same MJX incompatibility |
-| 3 (current) | No weld | Box held by contact forces only; reset places box at palm midpoint via FK |
+This gives the policy a consistent starting configuration where the box is already in the hands.
 
 ---
 
 ## Known Limitations and TODOs
 
-1. **Box drop in early training**: With no weld, the box falls immediately until the policy learns to press with both arms. The `arm_pose=-0.5` reward provides a natural signal, but early episodes will be short if `boxdf` termination fires. Consider disabling `boxdf` termination initially.
+1. **Box drop in early training**: The box falls immediately until the policy learns to press with both arms. Consider starting without `boxdf` termination (`--term_collision_threshold 0`) in the first training phase so episodes are long enough for the policy to discover arm–box contact.
 
-2. **Carrying pose geometry**: The FK-based init places the box at the palm midpoint, but the default carrying pose (`shoulder_pitch=1.5, elbow=1.5`) may not produce enough contact force to hold the box. Verify with `check_catra.py` and tune `DEFAULT_QPOS_CATRA` if needed.
+2. **Carrying pose tuning**: `DEFAULT_QPOS_CATRA` (`shoulder_pitch=1.5, elbow=1.5`) is an approximation. Verify visually with `check_catra.py` and adjust if the arms don't produce enough contact force to hold the box.
 
-3. **Box size randomization**: Currently box size is fixed. Randomizing `model.geom_size` per-environment in MJX requires modifying the randomization pipeline. Only mass is randomized for now.
+3. **Box size randomization**: Box size is fixed. Randomizing `model.geom_size` per-environment in MJX requires modifying the randomization pipeline. Only mass is randomized (0.5–3.0 kg) for now.
 
-4. **num_pri count**: If ONNX export fails with a shape error, verify that `num_pri=259` matches the actual privileged observation dimension (observed at 285 during testing). Training infers network sizes from actual data, so only export is affected.
+4. **num_pri count**: If ONNX export fails with a shape error, verify that `num_pri=259` matches the actual privileged observation dimension at runtime (training infers correct network sizes from data; only export is affected).
 
-5. **Action scale**: Arms have 25 Nm torque limits vs 88–139 Nm for legs. The global `action_scale=0.3` is conservative. A per-joint scale vector may give better performance.
+5. **Per-joint action scale**: The global `action_scale=0.3` is a conservative compromise. A per-joint scale vector (e.g., 0.5 for legs, 0.3 for waist, 0.2 for arms) would allow better tracking across the mixed torque limits without slowing down leg response.
+
+6. **Inspire hand**: The cupped hand is a simplified contact proxy. Adding the Inspire RH56DFX hand MJCF (fingers locked in pre-grip pose) would improve contact accuracy without adding action DOFs.
