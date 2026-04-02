@@ -248,14 +248,15 @@ def g1_catra_task_config() -> config_dict.ConfigDict:
                 # box-specific rewards (activate with --box flag)
                 boxgf=0.0,
                 boxdf=0.0,
-                # arm stability rewards (always active with negative scales)
-                arm_pose=-0.5,
-                arm_smoothness=-1e-3,
+                # box height reward (always active)
+                box_height=-2.0,
             ),
             base_height_target=0.75,
             foot_height_stance=0.0,
+            box_height_target=0.7,   # box below this height (m) incurs box_height penalty
         ),
         term_collision_threshold=0.04,
+        box_drop_threshold=0.3,      # box below this height (m) terminates the episode
         push_config=config_dict.create(
             enable=True,
             interval_range=[5.0, 10.0],
@@ -397,17 +398,6 @@ class G1CaTraEnv(G1CatEnv):
         self._box_site_id = self._mj_model.site(consts.BOX_SITE).id
         self._box_body_id = self._mj_model.body("carried_box").id
 
-        # Arm joint indices for the arm_pose reward (shoulder + elbow, no wrists)
-        arm_obs_names = [
-            "left_shoulder_pitch_joint", "left_shoulder_roll_joint",
-            "left_shoulder_yaw_joint", "left_elbow_joint",
-            "right_shoulder_pitch_joint", "right_shoulder_roll_joint",
-            "right_shoulder_yaw_joint", "right_elbow_joint",
-        ]
-        self._arm_actuator_ids = jp.array([self.mj_model.actuator(n).id for n in arm_obs_names])
-
-        # Target arm angles from carrying pose (for arm_pose reward)
-        self._carry_pose_arm = jp.array(consts.DEFAULT_QPOS_CATRA[7:][self._arm_actuator_ids])
 
     @property
     def action_size(self) -> int:
@@ -969,6 +959,8 @@ class G1CaTraEnv(G1CatEnv):
         contact_termination |= jp.any(info['shldsdf'] < -self._config.term_collision_threshold)
         # Box inside obstacle
         contact_termination |= jp.any(info['boxdf'] < -self._config.term_collision_threshold)
+        # Box dropped to the floor
+        contact_termination |= info['box_pos'][2] < self._config.box_drop_threshold
         contact_termination &= (info["step"] >= 50)
         return fall_termination | contact_termination | jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any()
 
@@ -1020,24 +1012,20 @@ class G1CaTraEnv(G1CatEnv):
             "boxgf": self._re_gf0(info["boxgf"], info["box_vel"].reshape(1, 3), info["boxdf"],
                                    (move_flag[None] < 0.5) | (info["box_pos"][..., 0] > 1.5), tau=0.5),
             "boxdf": self._re_sdf(info["boxdf"]),
-            # Arm stability (keep arms in carrying pose)
-            "arm_pose": self._cost_arm_pose(data.qpos[7:7 + NUM_ROBOT_JOINTS]),
-            "arm_smoothness": self._cost_arm_smoothness(action),
+            # Box height (keep box off the floor)
+            "box_height": self._reward_box_height(info["box_pos"]),
         }
         for k, v in reward_dict.items():
             reward_dict[k] = jp.where(jp.isnan(v), 0.0, v)
         return reward_dict
 
-    def _cost_arm_pose(self, robot_qpos: jax.Array) -> jax.Array:
-        """Penalize arm deviation from the carrying pose. robot_qpos is 29-dim."""
-        arm_angles = robot_qpos[self._arm_actuator_ids]
-        err = jp.sum(jp.square(arm_angles - self._carry_pose_arm))
-        return err
+    def _reward_box_height(self, box_pos: jax.Array) -> jax.Array:
+        """Penalize box being below the target carrying height.
 
-    def _cost_arm_smoothness(self, action: jax.Array) -> jax.Array:
-        """Penalize large arm action deltas (indices 15:23 in the 23-dim action)."""
-        arm_action = action[15:]  # 8 arm joints (last 8 of 23)
-        return jp.sum(jp.square(arm_action))
+        Returns 0 when box is at or above box_height_target, and a negative value
+        proportional to how far below the target the box is (capped at -1).
+        """
+        return jp.clip(box_pos[2] - self._config.reward_config.box_height_target, -1.0, 0.0)
 
 
 @cat_ppo.registry.register("G1CaTra", "command_to_reference_fn")

@@ -111,8 +111,7 @@ Default reward scales in `g1_catra_task_config()` (see [env_catra.py](cat_ppo/en
 | `smoothness_action` | -1e-3 | Penalize action change rate |
 | `joint_limits` | -1.0 | Penalize joint position near soft limits |
 | `joint_torque` | -1e-4 | Penalize torque magnitude (energy) |
-| `arm_pose` | -0.5 | Penalize arm deviation from carrying pose (always active) |
-| `arm_smoothness` | -1e-3 | Penalize arm action magnitude (always active) |
+| `box_height` | -2.0 | Penalize box below carrying height (always active; 0 above target, proportional penalty below) |
 | `boxgf` | 0.0 | Box moves in guidance direction — activated via `--box` |
 | `boxdf` | 0.0 | Box SDF penalty (box near/in obstacles) — activated via `--box` |
 | `headgf` | 0.0 | Head guidance — activated via `--overhead` |
@@ -190,22 +189,30 @@ These are the same three HumanoidPF fields used for body sites (head, feet, hand
 
 In the deployable `state` observation they are transformed into the navigation frame (same delayed/noisy treatment as body PF fields). In `privileged_state` they are kept in world frame and supplemented with noiseless `box_pos` and `box_vel`.
 
-### Box Holding: How `arm_pose` and Box PF Rewards Interact
+### Box Holding: `box_height` Reward and Drop Termination
 
-`arm_pose` does **not** directly reward the robot for holding the box. It penalizes deviation of arm joint angles from the carrying pose:
+The robot is free to hold the box in any arm configuration — there is no fixed carrying pose enforced as a reward. Instead, the incentive to hold comes from two complementary signals:
 
+**`box_height` reward** (always active, scale -2.0):
 ```python
-err = sum((arm_angles - carry_pose_arm) ** 2)   # arm_pose minimizes this
+reward = clip(box_pos[2] - box_height_target, -1.0, 0.0)
 ```
+- Returns `0` when the box is at or above `box_height_target` (default 0.7 m)
+- Returns a negative value proportional to how far below the target the box is, capped at -1
+- Encourages the robot to keep the box at waist height or above, regardless of arm pose
 
-This keeps the arms in the geometric configuration where contact *can* occur. The actual holding is **entirely emergent from physics contact forces** — if the arms are positioned correctly, friction between the cupped hand and the box prevents slipping.
+**Drop termination** (hard stop):
+```python
+terminate = box_pos[2] < box_drop_threshold   # default 0.3 m
+```
+- Ends the episode immediately if the box falls near floor level
+- Complementary to `box_height`: the reward gives a soft gradient, the termination gives a hard boundary
 
-The incentive chain for learning to hold:
-
-1. `arm_pose` → keeps arms forward and bent (necessary for contact to exist)
-2. `boxdf` → penalizes the box entering obstacles (the box only stays up if held)
-3. `boxgf` → rewards the box moving toward the goal (only possible if carried)
-4. Episode termination when `boxdf < -threshold` → hard signal if box drops to the floor
+**Full holding incentive chain:**
+1. `box_height` → soft gradient encouraging the box to stay at carrying height
+2. Episode termination at `box_drop_threshold` → hard signal if box reaches the floor
+3. `boxdf` → penalizes the box entering obstacles (activated via `--box`)
+4. `boxgf` → rewards the box moving toward the goal (activated via `--box`)
 
 ### Hand Geometry: Cupped Hand vs. Inspire Hand
 
@@ -248,9 +255,9 @@ This gives the policy a consistent starting configuration where the box is alrea
 
 ## Known Limitations and TODOs
 
-1. **Box drop in early training**: The box falls immediately until the policy learns to press with both arms. Consider starting without `boxdf` termination (`--term_collision_threshold 0`) in the first training phase so episodes are long enough for the policy to discover arm–box contact.
+1. **Box drop in early training**: The box falls immediately until the policy discovers arm–box contact. The `box_height` reward provides a gradient, but if `box_drop_threshold` termination fires too quickly, episodes will be too short to learn from. Consider raising `box_drop_threshold` to 0.0 (disable it) or lowering it temporarily during the first phase of training.
 
-2. **Carrying pose tuning**: `DEFAULT_QPOS_CATRA` (`shoulder_pitch=1.5, elbow=1.5`) is an approximation. Verify visually with `check_catra.py` and adjust if the arms don't produce enough contact force to hold the box.
+2. **Initial arm pose**: `DEFAULT_QPOS_CATRA` (`shoulder_pitch=1.5, elbow=1.5`) initializes the reset pose. The robot is free to deviate from this during rollout — the `box_height` reward only cares about where the box is, not how the arms get there. Verify the initial contact geometry with `check_catra.py`.
 
 3. **Box size randomization**: Box size is fixed. Randomizing `model.geom_size` per-environment in MJX requires modifying the randomization pipeline. Only mass is randomized (0.5–3.0 kg) for now.
 
