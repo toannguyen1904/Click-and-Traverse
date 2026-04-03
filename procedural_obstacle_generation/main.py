@@ -20,11 +20,11 @@ def generate_random_obstacle(difficulty, seed, n_rect_R, n_rect_F, n_rect_C):
     prefix = f"D{int(difficulty*10)}G{n_rect_F:01d}L{n_rect_R:01d}O{n_rect_C:01d}S{seed}/"
 
     print(prefix)
-    save = False
+    save = False    # set save to False
     if save:
         os.makedirs(prefix, exist_ok=True)
     obs_cfg = ObsCfg(difficulty=difficulty, seed=seed, n_rect_L=n_rect_L, n_rect_R=n_rect_R, n_rect_F=n_rect_F, n_rect_C=n_rect_C)
-    obs_mask, xv, yv, zv = generate_and_save(obs_cfg, prefix=prefix, save=save)
+    obs_mask, xv, yv, zv = generate_and_save(obs_cfg, prefix=prefix, save=save) # obs_mask: (Nx, Ny, Nz), xv: (Nx,), yv: (Ny,), zv: (Nz,)
     if obs_mask.any() == False:
         shutil.rmtree(prefix)
         return
@@ -46,12 +46,12 @@ def generate_random_obstacle(difficulty, seed, n_rect_R, n_rect_F, n_rect_C):
     cfg.Ly = obs_cfg.Ly
     cfg.Lz = obs_cfg.Lz
     
-    # SDF and gradient
-    sdf = make_sdf(obs_mask, cfg.voxel)
-    bf  = grad3(sdf, cfg.voxel)
+    # SDF and gradient (boundary field)
+    sdf = make_sdf(obs_mask, cfg.voxel) # shape (Nx, Ny, Nz)
+    bf  = grad3(sdf, cfg.voxel) # shape (Nx, Ny, Nz, 3)
 
     # HumanoidPF and gradient
-    X, Y, Z = np.meshgrid(xv, yv, zv, indexing='ij')
+    X, Y, Z = np.meshgrid(xv, yv, zv, indexing='ij') # X, Y, Z have the same shape (Nx, Ny, Nz). X contains the x-coordinates of all voxels, etc.
     T, gf = make_guidance_field_progressive(cfg, (X, Y, Z), obs_mask, cfg.goal_w, bf, sdf)
 
     np.save(out_dir / "sdf.npy", sdf)
@@ -64,7 +64,7 @@ def generate_random_obstacle(difficulty, seed, n_rect_R, n_rect_F, n_rect_C):
     # preview_matplotlib(pts)
 
     _FIG.mkdir(parents=True, exist_ok=True)
-    visualize_all(xv, yv, zv, sdf, T, gf, obs_mask, cfg.start_w, cfg.goal_w,
+    visualize_all(xv, yv, zv, sdf, T, gf, obs_mask, cfg.start_w, cfg.goal_w, bf=bf,
                   title_prefix=str(_FIG / prefix.rstrip("/")))
 
 # function fo generating typical obstacles
@@ -217,4 +217,4 @@ if __name__ == "__main__":
     # generate_typical_obstacle('hole')
     # generate_random_obstacle(0.8, 13, 1, 0, 0)
     # generate_random_obstacle(0.8, 4, 1, 0, 1)
-    generate_random_obstacle(0.9, 42, 9, 3, 3)  # generate a random obstacle scene with difficulty 0.2, seed 42, 9 left-wall blocks, 3 front-wall blocks, 3 overhead blocks
+    generate_random_obstacle(0.7, 42, 9, 4, 3)  # generate a random obstacle scene with difficulty 0.2, seed 42, 9 left-wall blocks, 3 front-wall blocks, 3 overhead blocks

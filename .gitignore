@@ -189,6 +189,7 @@ cython_debug/
 /data/assets/TypiObs/
 /output_logs/
 eval_videos/
+eval_videos_catra/
 /data/assets/New_RandObs/
 .env
 fig/
