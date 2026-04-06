@@ -34,7 +34,7 @@ def make_sdf(obs_mask: np.ndarray, voxel: float) -> np.ndarray:
     return sdf
 
 def grad3(scalar_field: np.ndarray, voxel: float):
-    # Returns (Nx, Ny, Nz, 3): 3D gradient vector at each voxel [df/dx, df/dy, df/dz].
+    # Returns (Nx, Ny, Nz, 3) boundary field: 3D gradient vector at each voxel [df/dx, df/dy, df/dz].
     # When applied to the SDF, gives the boundary field bf — outward normals at obstacle surfaces.
     dfx, dfy, dfz = np.gradient(scalar_field, voxel, voxel, voxel, edge_order=2)
     return np.stack([dfx, dfy, dfz], axis=-1).astype(np.float32)
@@ -67,7 +67,8 @@ def make_guidance_field_progressive(cfg, grids, obs_mask, goal_local, bf, sdf, r
     sdf      : np.ndarray, signed distance to obstacles (positive outside, negative inside). If None, constructed from obs_mask
     r_proj   : radius of influence for normal projection (m). If None, defaults to 2*voxel ~ 3*voxel
     returns:
-      T, gf  : HumanoidPF and gradient field
+      T: Geodesic distance field (to the goal)
+      gf: HumanoidPF and gradient field
     """
     voxel = cfg.voxel
     eps = 1e-9
@@ -156,7 +157,10 @@ def save_all(cfg: PFConfig, sdf, bf, gf, obs_mask, meta_extra=None):    # curren
     np.save(outdir / "meta.npy", meta)
     print(f"[OK] Saved to {outdir}")
 
-def visualize_all(xv, yv, zv, sdf, T, gf, obs_mask, start_l, goal_l, title_prefix=""):
+def visualize_all(xv, yv, zv, sdf, T, gf, obs_mask, start_l, goal_l, bf=None, title_prefix=""):
+    step = 3
+
+    # --- Top view (xy plane at z ≈ robot waist) ---
     kz = int(np.argmin(np.abs(zv - start_l[2])))
     plt.figure(figsize=(7,5))
     im = plt.imshow(sdf[:, :, kz].T, origin='lower',
@@ -166,18 +170,21 @@ def visualize_all(xv, yv, zv, sdf, T, gf, obs_mask, start_l, goal_l, title_prefi
     obs_xy = obs_mask[:, :, kz].T
     plt.contour(obs_xy, levels=[0.5], colors='k',
                 extent=[xv[0], xv[-1], yv[0], yv[-1]])
-    step = 3
     X2, Y2 = np.meshgrid(xv[::step], yv[::step], indexing='ij')
     U = gf[::step, ::step, kz, 0]; V = gf[::step, ::step, kz, 1]
-    plt.quiver(X2, Y2, U, V, pivot='mid', scale=30, color='w')
+    plt.quiver(X2, Y2, U, V, pivot='mid', scale=30, color='w', label='gf')
+    if bf is not None:
+        Ubf = bf[::step, ::step, kz, 0]; Vbf = bf[::step, ::step, kz, 1]
+        plt.quiver(X2, Y2, Ubf, Vbf, pivot='mid', scale=30, color='yellow', alpha=0.6, label='bf')
     plt.scatter([start_l[0]],[start_l[1]], c='w', s=50, edgecolors='k', label='start')
     plt.scatter([goal_l[0]],[goal_l[1]], c='r', s=60, edgecolors='k', marker='*', label='goal')
     plt.title(f"{title_prefix} Top view (z≈{zv[kz]:.2f} m)")
     plt.xlabel("x (m)"); plt.ylabel("y (m)")
-    plt.legend(); plt.tight_layout(); #plt.show()
+    plt.legend(); plt.tight_layout()
     plt.savefig(f"{title_prefix}_top.png", dpi=300)
     plt.close()
 
+    # --- Side view (xz plane at y ≈ robot centerline) ---
     ky = int(np.argmin(np.abs(yv - start_l[1])))
     plt.figure(figsize=(7,5))
     im = plt.imshow(sdf[:, ky, :].T, origin='lower',
@@ -189,16 +196,20 @@ def visualize_all(xv, yv, zv, sdf, T, gf, obs_mask, start_l, goal_l, title_prefi
                 extent=[xv[0], xv[-1], zv[0], zv[-1]])
     X2, Z2 = np.meshgrid(xv[::step], zv[::step], indexing='ij')
     U = gf[::step, ky, ::step, 0]; W = gf[::step, ky, ::step, 2]
-    plt.quiver(X2, Z2, U, W, pivot='mid', scale=30, color='w')
+    plt.quiver(X2, Z2, U, W, pivot='mid', scale=30, color='w', label='gf')
+    if bf is not None:
+        Ubf = bf[::step, ky, ::step, 0]; Wbf = bf[::step, ky, ::step, 2]
+        plt.quiver(X2, Z2, Ubf, Wbf, pivot='mid', scale=30, color='yellow', alpha=0.6, label='bf')
     plt.scatter([start_l[0]],[start_l[2]], c='w', s=50, edgecolors='k')
     plt.scatter([goal_l[0]],[goal_l[2]], c='r', s=60, edgecolors='k', marker='*')
     plt.title(f"{title_prefix} Side view (y≈{yv[ky]:.2f} m)")
     plt.xlabel("x (m)"); plt.ylabel("z (m)")
-    plt.tight_layout(); #plt.show()
+    plt.legend(); plt.tight_layout()
     plt.savefig(f"{title_prefix}_side.png", dpi=300)
     plt.close()
 
-    kx = int(np.argmin(np.abs(xv - 1.))) 
+    # --- Front view (yz plane at x ≈ mid-scene) ---
+    kx = int(np.argmin(np.abs(xv - 1.)))
     plt.figure(figsize=(7,5))
     im = plt.imshow(sdf[kx, :, :].T, origin='lower',
                     extent=[yv[0], yv[-1], zv[0], zv[-1]],
@@ -209,12 +220,15 @@ def visualize_all(xv, yv, zv, sdf, T, gf, obs_mask, start_l, goal_l, title_prefi
                 extent=[yv[0], yv[-1], zv[0], zv[-1]])
     Y2, Z2 = np.meshgrid(yv[::step], zv[::step], indexing='ij')
     V = gf[kx, ::step, ::step, 1]; W = gf[kx, ::step, ::step, 2]
-    plt.quiver(Y2, Z2, V, W, pivot='mid', scale=30, color='w')
+    plt.quiver(Y2, Z2, V, W, pivot='mid', scale=30, color='w', label='gf')
+    if bf is not None:
+        Vbf = bf[kx, ::step, ::step, 1]; Wbf = bf[kx, ::step, ::step, 2]
+        plt.quiver(Y2, Z2, Vbf, Wbf, pivot='mid', scale=30, color='yellow', alpha=0.6, label='bf')
     plt.scatter([start_l[1]],[start_l[2]], c='w', s=50, edgecolors='k')
     plt.scatter([goal_l[1]],[goal_l[2]], c='r', s=60, edgecolors='k', marker='*')
     plt.title(f"{title_prefix} Front view (x≈{xv[kx]:.2f} m)")
     plt.xlabel("y (m)"); plt.ylabel("z (m)")
-    plt.tight_layout(); #plt.show()
+    plt.legend(); plt.tight_layout()
     plt.savefig(f"{title_prefix}_front.png", dpi=300)
     plt.close()
 

@@ -8,9 +8,9 @@ import os
 @dataclass
 class Cfg:
     # --- Scene dimensions (metres) ---
-    Lx: float = 3.0   # length along X (robot travel direction)
-    Ly: float = 2.0   # width  along Y (lateral)
-    Lz: float = 1.5   # height along Z
+    Lx: float = 3.0   # length along X (robot travel direction), 3m
+    Ly: float = 2.0   # width  along Y (lateral), 2m
+    Lz: float = 1.5   # height along Z, 1.5m
 
     # --- Voxel resolution ---
     voxel: float = 0.04  # edge length of one voxel in metres (4 cm)
@@ -93,7 +93,8 @@ def _lerp(a, b, t):
 
 def make_axes(cfg: Cfg):
     """Convert scene dimensions and voxel size into world-space coordinate arrays xv, yv, zv.
-    Each value is the centre of its voxel (offset by 0.5 * voxel from the grid origin)."""
+    Each value is the centre of its voxel (offset by 0.5 * voxel from the grid origin).
+    Returning three 1D numpy arrays of shape (Nx,), (Ny,), (Nz,)"""
     Nx = int(round(cfg.Lx / cfg.voxel))
     Ny = int(round(cfg.Ly / cfg.voxel))
     Nz = int(round(cfg.Lz / cfg.voxel))
