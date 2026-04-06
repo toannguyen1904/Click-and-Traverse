@@ -398,6 +398,11 @@ class G1CaTraEnv(G1CatEnv):
         self._box_site_id = self._mj_model.site(consts.BOX_SITE).id
         self._box_body_id = self._mj_model.body("carried_box").id
 
+        # Override hand collision geom IDs: catra uses detailed palm/finger/thumb geoms
+        # instead of the single capsule geom in the base robot XML.
+        self._left_hand_geom_id = self._mj_model.geom("left_palm_col").id
+        self._right_hand_geom_id = self._mj_model.geom("right_palm_col").id
+
 
     @property
     def action_size(self) -> int:

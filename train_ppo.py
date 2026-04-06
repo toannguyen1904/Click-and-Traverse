@@ -47,7 +47,6 @@ class Args:
     ground: float = 0
     lateral: float = 0
     overhead: float = 0
-    box: float = 0
     term_collision_threshold: float = 0.04
     obs_path: str = 'data/assets/TypiObs/empty'
     def generate_exp_name(self):
@@ -131,9 +130,6 @@ def _apply_args_to_config(args: Args, policy_cfg, env_config, debug: bool):
     env_config.reward_config.scales.shldsdf = args.lateral  # scale: SDF penalty for shoulders vs obstacles
     env_config.term_collision_threshold = args.term_collision_threshold  # SDF below -threshold triggers collision termination
     env_config.pf_config.path = args.obs_path  # directory with sdf.npy, bf.npy, gf.npy for HumanoidPF
-    if args.box != 0 and hasattr(env_config.reward_config.scales, "boxgf"):
-        env_config.reward_config.scales.boxgf = args.box  # scale: box moves in guidance direction
-        env_config.reward_config.scales.boxdf = args.box  # scale: box stays away from obstacles
 
 def _prepare_training_params(cfg, ckpt_path: Path):
     # Convert config to a **kwargs dict for Brax PPO train(), injecting the custom env wrapper and network factory callable.
