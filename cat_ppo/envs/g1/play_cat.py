@@ -696,9 +696,6 @@ class PlayG1CatEnv(BaseEnv):
                     shldsdf.reshape(-1),
                 ]
             )
-        self.mj_data.mocap_pos[0] = self.mj_data.xpos[self.body_ids_left_leg[1]]
-        mujoco.mj_forward(self.mj_model, self.mj_data)
-
         return {
             "state": state,
             "privileged_state": None,
@@ -857,20 +854,33 @@ class PlayG1CaTraEnv(PlayG1CatEnv):
         # Box centre site for PF sampling.
         self._box_site_id = self.mj_model.site(consts.BOX_SITE).id
 
-    def reset(self):
+    def reset(self, surface_z: float = None):
         # Robot pose.
         self.mj_data.qpos[:7] = consts.DEFAULT_QPOS_CATRA[:7]
         self.mj_data.qpos[7:7 + _NUM_ROBOT] = self._default_qpos
-        # Give the box a rough placeholder position so FK can run.
         self.mj_data.qpos[_BOX_Q_START:_BOX_Q_START + 7] = [0.35, 0, 1.0, 1, 0, 0, 0]
         mujoco.mj_forward(self.mj_model, self.mj_data)
-        # Place box at palm midpoint (FK-based init, mirroring env_catra.py).
-        left_palm  = self.mj_data.site_xpos[self._hands_site_id[0]].copy()
-        right_palm = self.mj_data.site_xpos[self._hands_site_id[1]].copy()
-        box_pos = (left_palm + right_palm) / 2.0
-        self.mj_data.qpos[_BOX_Q_START:_BOX_Q_START + 3] = box_pos
+
+        # Place box 0.4 m in front of the robot along its forward direction.
+        w, x, y, z = self.mj_data.qpos[3:7]  # root quat wxyz
+        forward_xy = np.array([1 - 2*(y**2 + z**2), 2*(x*y + w*z)])
+        box_xy = self.mj_data.qpos[:2] + 0.4 * forward_xy
+
+        cfg = self._config
+        lo, hi = cfg.box_surface_height_range
+        if surface_z is None:
+            surface_z = np.random.uniform(lo, hi)
+
+        box_z = surface_z + 0.01 + 0.15   # platform half-z + box half-z
+        self.mj_data.qpos[_BOX_Q_START:_BOX_Q_START + 3] = [box_xy[0], box_xy[1], box_z]
         self.mj_data.qpos[_BOX_Q_START + 3] = 1.0
         self.mj_data.qpos[_BOX_Q_START + 4:_BOX_Q_START + 7] = 0.0
+
+        # Reposition support surface mocap body.
+        support_body_id = self.mj_model.body("box_support").id
+        mocap_id = self.mj_model.body_mocapid[support_body_id]
+        self.mj_data.mocap_pos[mocap_id] = [box_xy[0], box_xy[1], surface_z]
+
         mujoco.mj_forward(self.mj_model, self.mj_data)
         if not self.headless:
             self.viewer.sync()
@@ -1139,7 +1149,5 @@ class PlayG1CaTraEnv(PlayG1CatEnv):
                 shldsgf.reshape(-1), shldsbf.reshape(-1), shldsdf.reshape(-1),
                 boxgf_n.reshape(-1), boxbf_n.reshape(-1), boxdf_c.reshape(-1),
             ])
-        self.mj_data.mocap_pos[0] = self.mj_data.xpos[self.body_ids_left_leg[1]]
-        mujoco.mj_forward(self.mj_model, self.mj_data)
         return {"state": state, "privileged_state": None}
 

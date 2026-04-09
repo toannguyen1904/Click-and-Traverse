@@ -187,7 +187,7 @@ def g1_catra_task_config() -> config_dict.ConfigDict:
         sim_dt=0.002,
         episode_length=1000,
         action_repeat=1,
-        action_scale=0.3,  # smaller than 0.5 to be gentle on arms (25 Nm vs 88-139 Nm legs)
+        action_scale=0.5,
         history_len=15,
         num_obs=191,
         num_pri=259,
@@ -245,18 +245,13 @@ def g1_catra_task_config() -> config_dict.ConfigDict:
                 feetdf=0.0,
                 kneesdf=0.0,
                 shldsdf=0.0,
-                # box-specific rewards (activate with --box flag)
-                boxgf=0.0,
-                boxdf=0.0,
-                # box height reward (always active)
-                box_height=-2.0,
             ),
             base_height_target=0.75,
             foot_height_stance=0.0,
-            box_height_target=0.7,   # box below this height (m) incurs box_height penalty
         ),
         term_collision_threshold=0.04,
         box_drop_threshold=0.3,      # box below this height (m) terminates the episode
+        box_surface_height_range=[0.4, 0.8],  # support surface center z randomized each episode
         push_config=config_dict.create(
             enable=True,
             interval_range=[5.0, 10.0],
@@ -274,9 +269,6 @@ def g1_catra_task_config() -> config_dict.ConfigDict:
             path='data/assets/TypiObs/empty',
             dx=0.04,
             origin=np.array([-0.5, -1.0, 0.0], dtype=np.float32),
-        ),
-        box_config=config_dict.create(
-            mass_range=[0.5, 3.0],
         ),
     )
 
@@ -348,10 +340,9 @@ class G1CaTraEnv(G1CatEnv):
     Extends G1CatEnv with:
     - 23-dim action space (12 leg + 3 waist + 8 arm joints)
     - Box PF observations (boxgf, boxbf, boxdf sampled at box_center site)
-    - Box-specific rewards (boxgf alignment, boxdf SDF penalty)
-    - Arm pose stabilization reward
+    - Same rewards as G1CatEnv (no box-specific reward terms)
     - Box collision termination
-    - CaTra scene XML with box body + weld equality constraints
+    - CaTra scene XML with box body (freejoint) resting on a mocap support surface at random height
     """
 
     def __init__(
@@ -390,7 +381,7 @@ class G1CaTraEnv(G1CatEnv):
         self._default_qpos = jp.array(consts.DEFAULT_QPOS_CATRA[7:7 + NUM_ROBOT_JOINTS])
 
         # Extended init_q: robot (36-dim) + box freejoint (7-dim = pos + quat)
-        # Box starts at a reasonable position; weld constraints pull it to the correct pose.
+        # Box starts at a placeholder position; reset() places it on the support surface.
         box_default = np.array([0.35, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
         self._init_q = jp.array(np.concatenate([consts.DEFAULT_QPOS_CATRA, box_default]))
 
@@ -398,10 +389,10 @@ class G1CaTraEnv(G1CatEnv):
         self._box_site_id = self._mj_model.site(consts.BOX_SITE).id
         self._box_body_id = self._mj_model.body("carried_box").id
 
-        # Override hand collision geom IDs: catra uses detailed palm/finger/thumb geoms
-        # instead of the single capsule geom in the base robot XML.
-        self._left_hand_geom_id = self._mj_model.geom("left_palm_col").id
-        self._right_hand_geom_id = self._mj_model.geom("right_palm_col").id
+        # Support surface mocap body (repositioned in reset to random height under the box)
+        support_body_id = self._mj_model.body("box_support").id
+        self._box_support_mocap_id = int(self._mj_model.body_mocapid[support_body_id])
+
 
 
     @property
@@ -441,16 +432,33 @@ class G1CaTraEnv(G1CatEnv):
         # ctrl is 29-dim (robot actuators only)
         data = mjx_env.init(self.mjx_model, qpos=qpos, qvel=qvel, ctrl=qpos[7:7 + NUM_ROBOT_JOINTS])
 
-        # --- Phase 3: place box at palm midpoint using FK ---
-        # After init, FK is computed and site_xpos is available. Set box freejoint qpos
-        # to the midpoint between the two palms so the box starts in the hands.
-        left_palm_pos  = data.site_xpos[self._hands_site_id[0]]
-        right_palm_pos = data.site_xpos[self._hands_site_id[1]]
-        box_init_pos   = (left_palm_pos + right_palm_pos) / 2.0
-        new_qpos = data.qpos.at[BOX_QPOS_START:BOX_QPOS_START + 3].set(box_init_pos)
-        new_qpos = new_qpos.at[BOX_QPOS_START + 3].set(1.0)                          # quat w
-        new_qpos = new_qpos.at[BOX_QPOS_START + 4:BOX_QPOS_START + 7].set(0.0)      # quat xyz
+        # --- Place box on fixed support surface at random height ---
+        # Place 0.4 m in front of the robot along its forward direction.
+        w, x, y, z = qpos[3], qpos[4], qpos[5], qpos[6]  # root quat wxyz
+        forward_xy = jp.array([1 - 2*(y**2 + z**2), 2*(x*y + w*z)])
+        box_xy = qpos[:2] + 0.4 * forward_xy
+
+        rng, key = jax.random.split(rng)
+        surface_z = jax.random.uniform(
+            key,
+            minval=self._config.box_surface_height_range[0],
+            maxval=self._config.box_surface_height_range[1],
+        )
+        box_z = surface_z + 0.01 + 0.15   # platform half-z + box half-z
+
+        new_qpos = data.qpos.at[BOX_QPOS_START:BOX_QPOS_START + 3].set(
+            jp.array([box_xy[0], box_xy[1], box_z])
+        )
+        new_qpos = new_qpos.at[BOX_QPOS_START + 3].set(1.0)              # quat w
+        new_qpos = new_qpos.at[BOX_QPOS_START + 4:BOX_QPOS_START + 7].set(0.0)  # quat xyz
         data = data.replace(qpos=new_qpos)
+
+        # Reposition support surface under the box
+        new_mocap_pos = data.mocap_pos.at[self._box_support_mocap_id].set(
+            jp.array([box_xy[0], box_xy[1], surface_z])
+        )
+        data = data.replace(mocap_pos=new_mocap_pos)
+
         data = mjx.forward(self.mjx_model, data)
 
         # --- Sample HumanoidPF fields for all body parts ---
@@ -614,6 +622,8 @@ class G1CaTraEnv(G1CatEnv):
             # Box PF fields
             "boxgf": boxgf.copy(), "boxbf": boxbf.copy(), "boxdf": boxdf.copy(),
             "box_pos": box_pos.copy(), "box_vel": box_vel.copy(),
+            # Support surface height (fixed per episode)
+            "surface_z": surface_z,
         }
 
         metrics = {}
@@ -977,7 +987,7 @@ class G1CaTraEnv(G1CatEnv):
             done: jax.Array,
             feet_contact: jax.Array,
     ) -> dict[str, jax.Array]:
-        """Inherits all G1CatEnv rewards; adds boxgf, boxdf, arm_pose, arm_smoothness."""
+        """Same rewards as G1CatEnv; box-specific terms (boxgf, boxdf, box_height) are excluded."""
         move_flag = info["command"][0]
         cmd_vel = info["command"][1:].copy()
 
@@ -1013,24 +1023,11 @@ class G1CaTraEnv(G1CatEnv):
             "handsdf": self._re_sdf(info["handsdf"]),
             "kneesdf": self._re_sdf(info["kneesdf"]),
             "shldsdf": self._re_sdf(info["shldsdf"]),
-            # Box HumanoidPF (activate with --box flag)
-            "boxgf": self._re_gf0(info["boxgf"], info["box_vel"].reshape(1, 3), info["boxdf"],
-                                   (move_flag[None] < 0.5) | (info["box_pos"][..., 0] > 1.5), tau=0.5),
-            "boxdf": self._re_sdf(info["boxdf"]),
-            # Box height (keep box off the floor)
-            "box_height": self._reward_box_height(info["box_pos"]),
         }
         for k, v in reward_dict.items():
             reward_dict[k] = jp.where(jp.isnan(v), 0.0, v)
         return reward_dict
 
-    def _reward_box_height(self, box_pos: jax.Array) -> jax.Array:
-        """Penalize box being below the target carrying height.
-
-        Returns 0 when box is at or above box_height_target, and a negative value
-        proportional to how far below the target the box is (capped at -1).
-        """
-        return jp.clip(box_pos[2] - self._config.reward_config.box_height_target, -1.0, 0.0)
 
 
 @cat_ppo.registry.register("G1CaTra", "command_to_reference_fn")

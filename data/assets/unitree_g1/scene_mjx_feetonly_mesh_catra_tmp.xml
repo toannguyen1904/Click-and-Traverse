@@ -25,7 +25,7 @@
         <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="60 60" reflectance="0.01" specular="0.25" shininess="0.35" />
         <texture name="tex_brick_cube" type="2d" file="texture.png" />
         <material name="mat_brick_cube" texture="tex_brick_cube" reflectance="0.10" specular="0.20" shininess="0.30" />
-        <mesh name="scene_mesh" file="../TypiObs/bar1/obs.obj" />
+        <mesh name="scene_mesh" file="../RandObs/D8G1L3O1S49/obs.obj" />
     </asset>
 
     <worldbody>
@@ -38,15 +38,17 @@
         
         <body name="carried_box" pos="0.35 0 1.0">
             <freejoint name="box_joint" />
-            <geom name="box_geom" type="box" size="0.1 0.075 0.075" condim="4" friction="2.0 0.5 0.5" rgba="0.8 0.4 0.1 1" mass="1.5" />
+            <geom name="box_geom" type="box" size="0.15 0.2 0.15" condim="4" friction="2.0 0.5 0.5" rgba="0.2 0.4 0.9 1" mass="1.5" />
             <site name="box_center" pos="0 0 0" size="0.02" />
         </body>
-        <body name="debug_axis" pos="0 0 -1" mocap="true">
-            <geom type="cylinder" fromto="0 0 0 0.1 0 0" size="0.005" rgba="1 0 0 0.2" contype="2" conaffinity="0" group="2" />
-            <geom type="cylinder" fromto="0 0 0 0 0.1 0" size="0.005" rgba="0 1 0 0.2" contype="2" conaffinity="0" group="2" />
-            <geom type="cylinder" fromto="0 0 0 0 0 0.1" size="0.005" rgba="0 0 1 0.2" contype="2" conaffinity="0" group="2" />
+        
+        <body name="box_support" pos="0.35 0 0" mocap="true">
+            <geom name="box_support_col" type="box" size="0.25 0.25 0.01" contype="0" conaffinity="0" rgba="0.45 0.30 0.15 1.0" />
         </body>
     </worldbody>
 
+    <contact>
+        <pair name="box_on_support" geom1="box_geom" geom2="box_support_col" condim="4" friction="2.0 0.5 0.5" />
+    </contact>
 
 </mujoco>

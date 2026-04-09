@@ -195,17 +195,16 @@ CATRA_ACTION_JOINT_NAMES = [
 ]
 # num_act = 23
 
-# Carrying pose: arms pitched forward ~85°, elbows bent ~85°, hands at chest height in front.
-# TODO: tune exact values in MuJoCo viewer; the weld relpose in the XML must match.
+# Same resting pose as DEFAULT_QPOS — arms hang naturally, not in a carrying pose.
 # fmt: off
 DEFAULT_QPOS_CATRA = np.float32([
     0, 0, 0.8,       # root xyz
     1, 0, 0, 0,      # root quat (identity)
-    -0.1, 0, 0, 0.3, -0.2, 0,   # left leg (same as DEFAULT_QPOS)
-    -0.1, 0, 0, 0.3, -0.2, 0,   # right leg
-    0, 0, 0,         # waist (neutral)
-    1.5, 0.0, 0, 1.5, 0, 0, 0,  # left arm: shoulder_pitch=1.5, roll=0, yaw=0, elbow=1.5, wrists=0
-    1.5, 0.0, 0, 1.5, 0, 0, 0,  # right arm (symmetric)
+    -0.1, 0, 0, 0.3, -0.2, 0,    # left leg (same as DEFAULT_QPOS)
+    -0.1, 0, 0, 0.3, -0.2, 0,    # right leg
+    0, 0, 0,                      # waist (neutral)
+    0.2, 0.3, 0, 1.28, 0, 0, 0,  # left arm (same as DEFAULT_QPOS)
+    0.2, -0.3, 0, 1.28, 0, 0, 0, # right arm (same as DEFAULT_QPOS)
 ])
 # fmt: on
 
