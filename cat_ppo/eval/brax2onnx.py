@@ -206,7 +206,7 @@ def main(args: Args):
         restore_checkpoint_path=latest_ckpt,
         network_factory=network_factory,
         wrap_env_fn=wrapper.wrap_for_brax_training,
-        num_envs=1,
+        num_envs=jax.device_count(),  # must be divisible by device_count
     )
 
     make_inference_fn, params, _ = train_fn(environment=env)

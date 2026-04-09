@@ -1,0 +1,160 @@
+\section{Method}
+\label{sec:method}
+
+
+We study the problem of collision-free humanoid traversal in cluttered indoor scenes. Given a target position $\mathbf{g} \in \mathbb{R}^3$, and a set of indoor obstacles $\mathcal{O} = \{ O_i \}_{i=1}^{N}$, the humanoid needs to move to $\mathbf{g}$ without any collision with $\mathcal{O}$. To solve this problem, the humanoid needs to map its perception of surrounding obstacles to the corresponding traversal skills. Our method can be split into two parts. We first introduce how our \textbf{HumanoidPF} encodes humanoid–obstacle relationships to facilitate humanoid traversal learning in Section~\ref{sec:apf_humanoid}. We further introduce how to generalize our policy to diverse and challenging indoor scenes with our proposed hybrid scene generation method in Section~\ref{sec:generalize}. 
+For real-world deployment, we further instantiate our approach as a teleoperated loco-navigation system, which is presented in Section~\ref{sec:click_and_traverse}.
+
+\subsection{HumanoidPF for whole-body traversal learning}
+\label{sec:apf_humanoid}
+We substantially extend classical APF to support learning-based whole-body humanoid traversal. In APF, the target location $\mathbf{g}$ is modeled as an attractive pole and obstacles $\mathcal{O}$ as repulsive surfaces, forming a gradient field that indicates collision-free motion toward the goal. However, prior works directly apply APF in single-rigid-body model-based control, which is inadequate for the high-dimensional and tightly coupled planning and control demands of humanoid skill learning. We therefore propose HumanoidPF, a principled reformulation of APF tailored for humanoid, which encodes humanoid–obstacle relationships for informative perception and reward streamlining.
+
+\subsubsection{HumanoidPF construction}
+\label{sec:humanoidpf_construction}
+We begin by constructing the attractive field $U_{\text{att}}$:
+\begin{equation}
+U_{\text{att}}(\mathbf{x}) = \eta \, \| \mathbf{x} - \mathbf{g} \|_{\text{geo}},
+\end{equation}
+where the geodesic distance $\| \mathbf{x} - \mathbf{g} \|_{\text{geo}}$ represents the shortest 3D path from position $\mathbf{x}$ to the goal $\mathbf{g}$ without intersecting obstacles, and $\eta$ is a scaling factor. The geodesic distance inherently accounts for obstacle geometry, providing safer guidance than a simple Euclidean distance.
+
+Next, the repulsive field $U_{\text{rep}}$ prevents collisions and is defined as:
+\begin{equation}
+U_{\text{rep}}(\mathbf{x}) =
+\begin{cases}
+\frac{1}{2}\,\xi\,\left(\frac{1}{d(\mathbf{x})} - \frac{1}{d_0}\right)^2, & d(\mathbf{x}) \le d_0, \\[6pt]
+0, & d(\mathbf{x}) > d_0,
+\end{cases}
+\end{equation}
+where $d(\mathbf{x})$ is the signed distance, $\xi$ is a scaling factor, and $d_0$ defines the influence range of obstacles. 
+
+The final guidance field is the negative gradient of a combined potential,
+\begin{equation}
+\mathbf{F} = -\nabla U,\quad
+U(\mathbf{x}) = U_{\text{att}}(\mathbf{x}) + U_{\text{rep}}(\mathbf{x}),
+\label{eq:field_direction}
+\end{equation}
+which is then queried at the locations of different body parts, yielding field vectors $\mathbf{F}(\mathbf{x}_k)$ for each body part $\mathbf{p}_k$.
+
+
+
+While APF method typically models robots as a single rigid body, its direct application to multi-jointed humanoid robots could lead to conflicts between body parts. For instance, when the robot faces an obstacle directly ahead, it must decide whether to move left or right. The potential fields on the left and right sides of the body direct it toward opposite paths. In a symmetrical configuration, these vectors cancel each other out, leading to a multi-modal dilemma where the robot becomes trapped in a local minimum or exhibits oscillatory behavior. To address this challenge, we propose a priority-weighting scheme that prioritizes the influence of certain body parts over others according to their contribution to the task.
+
+
+
+\textbf{Priority-weighting.} Instead of treating all body parts equally, our priority-weighting scheme adjusts the influence of each body part based on its role in the overall motion.
+
+To establish coherent global guidance, we assign a higher priority to the root body part (e.g., pelvis) since it plays a central role in maintaining stability and direction:
+\begin{equation}
+w_0(\mathbf{p}_{\text{root}}) = 1,\quad 
+w_0(\mathbf{p}_{\text{others}}) = 0.5.
+\end{equation}
+
+Furthermore, some body parts are more critical in avoiding obstacles, particularly those closer to potential collisions. To account for this, we define a dynamic collision-urgency weight based on the signed distance $d(\mathbf{x}_k)$ and the Cartesian velocity $\mathbf{v}_k$ of body part $\mathbf{p}_k$, with a scaling factor $\lambda$:
+\begin{equation}
+w_1(\mathbf{p}_k) = \lambda \,
+\mathrm{max}\!\left( - \nabla d(\mathbf{x}_k) \cdot \mathbf{v}_k,\; 0.5 \right)\exp\!\big(-d(\mathbf{x}_k)\big).
+\label{eq:field_magnitude}
+\end{equation}
+
+The resulting HumanoidPF is defined as $
+\mathbf{F}_H = w_0\, w_1 \,\frac{\mathbf{F}}{\lVert \mathbf{F} \rVert}$. 
+This scheme attenuates conflicting influences and promotes coordinated whole-body control. In particular, minute asymmetries in the spatial configuration are selectively amplified, thus seamlessly resolving the multi-modal dilemma.
+
+
+\subsubsection{Traversal skill learning with HumanoidPF}
+
+\textbf{HumanoidPF for policy observation.}
+To better inform RL policies about humanoid-obstacle relationships, we leverage HumanoidPF to construct a compact, task-relevant visual observation. It is sampled at $K=13$ body parts,
+\begin{equation}
+OBS_{Field} = \{ \mathbf{F}_H(\mathbf{x}_k) \mid \mathbf{x}_k\}^K_{k = 1},
+\end{equation}
+where each $\mathbf{F}_H(\mathbf{x}_k)$ encodes the local directional guidance induced by obstacles and the target at body part $k$, indicating collision-free motion. Sampling these fields at key body parts specifies how the humanoid should steer its body through the environment, allowing the policy to reason about traversal decisions rather than implicit inference from raw visual data. We empirically validate this in Section~\ref{sec:apf_for_humanoid}.
+
+HumanoidPF for observation further mitigates the perceptual sim-to-real gap by representing the environment as a continuous, spatially aggregated field, which functions like a low-pass perceptual filter. Unlike raw sensor representations that retain fine-grained geometric details and are sensitive to small local perturbations, the field formulation suppresses isolated noise while preserving the dominant spatial gradients relevant to the traversal task. This ensures that minor geometric variations do not significantly affect control during real-world deployment, as is empirically validated in Section~\ref{sec:sim2real_transfer}
+
+
+
+\textbf{HumanoidPF for policy reward.}
+To streamline reward engineering, we employ HumanoidPF to induce anticipatory and dense guidance that generalizes across diverse environments. At each time step, HumanoidPF encodes a distribution of preferred motion directions, and the policy is optimized to produce actions that align with this distribution, thus fostering safe and dexterous collision-avoidance behaviors.
+
+The von Mises–Fisher (vMF) distribution is used to model directional preferences $\boldsymbol{\mu}(\mathbf{x}) \in \mathbb{R}^3$ on the unit sphere and allows the strength of this preference to be controlled by a single concentration parameter $\kappa(\mathbf{x}) \in \mathbb{R}$:
+\begin{equation}
+p(\hat{\mathbf{v}} \mid \boldsymbol{\mu}(\mathbf{x}), \kappa(\mathbf{x}))
+= C_d(\kappa)\exp\!\big(\kappa(\mathbf{x})\, \boldsymbol{\mu}(\mathbf{x})^\top \cdot \hat{\mathbf{v}}\big),
+\end{equation}
+where $\hat{\mathbf{v}}$ is the motion direction of a humanoid body part, $C_d(\kappa)$ is the normalization function.  
+
+$\boldsymbol{\mu}(\mathbf{x})$ and $\kappa(\mathbf{x})$ is directly derived from HumanoidPF:
+\begin{equation}
+\boldsymbol{\mu}(\mathbf{x}) = \frac{\mathbf{F}_H(\mathbf{x})}{\lVert \mathbf{F}_H(\mathbf{x}) \rVert}, \quad
+\kappa(\mathbf{x}) = \kappa_{\max} \lVert \mathbf{F}_H(\mathbf{x}) \rVert,
+\end{equation}
+where $\kappa_{\max}$ is a scaling factor. The body part with higher priority receives a field vector $\mathbf{F}_H(\mathbf{x})$ with larger magnitude; accordingly, $\kappa(\mathbf{x})$ increases to enforce stricter alignment with $\boldsymbol{\mu}(\mathbf{x})$ , and vice versa for lower-priority parts. This priority-aware concentration design promotes coordinated whole-body motion while improving collision-avoidance behavior.
+
+During policy training, let the motion direction of the $k$-th body part be $\hat{\mathbf{v}}_k = \mathbf{v}_k / \|\mathbf{v}_k\|$, the associated prior direction be $\boldsymbol{\mu}_k = \boldsymbol{\mu}(\mathbf{x}_k)$ and concentration parameter be $\kappa_k = \kappa(\mathbf{x}_k)$. 
+Assuming independence among joints, the whole-body motion prior and log-likelihood reward are expressed as:
+\begin{equation}
+p(\hat{\mathbf{v}}_{1:K} \mid \mathbf{x}_{1:K}, \mathbf{F}_H)
+= \prod_{k=1}^{K}
+C_d(\kappa_k)\,
+\exp\!\big(\kappa_k\,\boldsymbol{\mu}_k^\top \cdot \hat{\mathbf{v}}_k\big),
+\end{equation}
+
+\begin{equation}
+R_{Field}
+= \sum_{k=1}^{K}
+\Big[
+\log C_d(\kappa_k) + \kappa_k\,\boldsymbol{\mu}_k^\top \cdot \hat{\mathbf{v}}_k
+\Big].
+\end{equation}
+
+
+This reward formulation exhibits strong cross-scene generalization without requiring manual tuning, thereby enabling an automated training pipeline that scales effectively across diverse environments.
+
+
+\subsection{Scalable training in diverse and challenging scenes}
+\label{sec:generalize}
+For general practical use, the humanoid needs to handle diverse scenes within a single unified policy. It needs the policy trained with a sufficiently large and challenging indoor scene dataset to enable generalization in real-world cluttered scenes. Therefore, we propose a  hybrid scene generation method in Section~\ref{sec:hybrid}. It incorporates crops of realistic 3D indoor scenes for structural realism, and procedurally synthesized obstacles to enrich highly challenging clutter configurations. 
+In addition, even with HumanoidPF, directly learning a single policy across all scenes remains challenging due to the low sample efficiency of RL. We therefore adopt a specialist-to-generalist training strategy inspired by~\cite{ross2011reduction, zhang2025unleashing}, described in Section~\ref{sec:spe_to_gen}.
+
+
+
+\subsubsection{Hybrid scene generation}
+\label{sec:hybrid}
+We observe that highly challenging obstacle layouts constitute merely a long-tail subset in most existing datasets~\cite{fu20213d, deitke2022️, ramakrishnan2021habitat}, since typical indoor scenes feature orderly object arrangements and clearly delineated walkable regions. 
+Simply scaling up the dataset does not alleviate this problem. Therefore, we propose a novel hybrid scene generation scheme that enriches realistic 3D indoor datasets with procedurally synthesized "extreme" obstacles, where full-spatial constraints are jointly present.
+
+\textbf{Crops of realistic 3D indoor scenes.} For generalization to intricate and realistic indoor environments, we adopt the 3D-FRONT~\cite{fu20213d} dataset, containing structurally realistic scenes with large-scale high-quality furniture objects. We selectively crop and filter scene blocks for policy training.
+
+Specifically, we first project all furniture onto the ground and erode the resulting planar walkable regions with a radius of 0.1 m to account for clearance. Within the remaining walkable regions, we randomly sample a start location and crop a 5 m × 5 m block centered at this position. During training, the goal location will be randomly sampled on a circle with a radius of 2 m around the start.
+
+We initially train specialist policies on all such cropped scenes and subsequently identify scenes with low traversal success rates. Scenes that are empirically found to be non-traversable are manually filtered out.
+
+
+\textbf{Procedurally generated obstacles.} To supplement crops of 3D-FRONT with more challenging and cluttered environments, we procedurally generate obstacles that impose full-spatial (simultaneous ground, lateral, and overhead) constraints, deliberately targeting highly restrictive scenarios. Specifically, we place boxes with varying positions, dimensions, and orientations that may extend upward from the floor, descend from the ceiling, and be placed in close proximity to form narrow traversal passages.
+
+To break structural regularity and enhance geometric realism, we apply random $\mathrm{SO}(3)$ rotations and 2D Perlin noise to each box. The resulting artifacts, such as spiky surfaces or non-manifold regions, are mitigated via 3D morphological closing and opening at the voxel level before mesh conversion.
+
+To support curriculum learning during policy training, we use a layout-agnostic difficulty factor to control obstacle complexity, such as the number and size of boxes. As the difficulty increases, the policy progressively acquires robust traversal skills under increasingly challenging configurations.
+
+
+
+\subsubsection{Specialist-to-generalist training}
+\label{sec:spe_to_gen}
+We construct an automated and parallel specialist-to-generalist training pipeline. We first conduct large-scale training of specialist policies across diverse scenes via PPO~\cite{schulman2017proximal}. The reward derived from HumanoidPF is scene-general, enabling scalable training on 139 cropped 3D-FRONT scenes and 216 procedurally generated scenes. Each specialist is trained with 32,768 parallel environments and 5,000,000 episodes, with start and goal locations randomly sampled for each episode.
+
+Subsequently, a generalist policy is distilled using DAgger~\cite{ross2011reduction} from multiple specialists as teacher policies. Dedicated specialists provide expert actions conditioned on current obstacle, enabling the generalist to acquire strong generalization capability across varying scenarios.
+
+To learn robust and stable traversal skills, both specialist and generalist policies are trained with sensor noise and force perturbations to simulate realistic collision-avoidance conditions. In addition, a curriculum with progressively increasing scene difficulty is employed to gradually enhance traversal performance and explore the limits of the policy’s obstacle-avoidance capability.
+
+\subsection{Real-world deployment: Click-and-Traverse}
+\label{sec:click_and_traverse}
+For real-world deployment, we instantiate our method as a teleoperated loco-navigation system, termed Click-and-Traverse (CAT). The system integrates a LiDAR–inertial SLAM pipeline based on Fast-LIO2~\cite{xu2021fastlio2fastdirectlidarinertial} and OctoMap~\cite{hornung13auro}. It maintains an up-to-date environment mapping and field construction, both operating at a frequency of 10 Hz. The policy queries the HumanoidPF at different body parts via self-localization and forward-kinematics. 
+
+Users could specify a desired goal by simply clicking on a grid map, after which the humanoid autonomously navigates to the target while avoiding collisions. This interface removes the need for labor-intensive control modalities such as joysticks or motion capture, providing a lightweight and highly automated teleoperation solution.
+
+
+
+
+
+

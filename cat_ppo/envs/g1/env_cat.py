@@ -47,7 +47,7 @@ def g1_loco_task_config() -> config_dict.ConfigDict:
         action_scale=0.5,
         history_len=15,
         num_obs=162,
-        num_pri=224,
+        num_pri=250,
         num_act=12,
         restricted_joint_range=False,
         soft_joint_pos_limit_factor=0.95,
@@ -916,56 +916,56 @@ class G1CatEnv(G1LocoEnv):
         privileged_state = jp.hstack(
             [
                 # noiseless state
-                gyro_pelvis,  # 3
-                gvec_pelvis,  # 3
-                (joint_angles - self._default_qpos)[self.obs_joint_ids],  # 23
+                gyro_pelvis,  # (3,)
+                gvec_pelvis,  # (3,)
+                (joint_angles - self._default_qpos)[self.obs_joint_ids],  # (23,)
                 joint_vel[self.obs_joint_ids],  # 23
-                info["last_act"],  # num_actions
-                info["motor_targets"][self.action_joint_ids],  # num_actions
-                command,  # 4
-                info["foot_height"],  # 1
-                gait_phase,  # (num_foot * 2)
+                info["last_act"],  # num_actions, (12,)
+                info["motor_targets"][self.action_joint_ids],  # num_actions, (12,)
+                command,  # (4,)
+                info["foot_height"],  # 1, ()
+                gait_phase,  # (num_foot * 2), (4,)
                 # hint state
-                linvel_pelvis,  # 3
+                linvel_pelvis,  # (3,)
                 # pelvgf.reshape(-1),
-                headgf.reshape(-1),
-                headbf.reshape(-1),
-                headdf.reshape(-1),
-                pelvgf.reshape(-1),
-                pelvbf.reshape(-1),
-                pelvdf.reshape(-1),
-                torsgf.reshape(-1),
-                torsbf.reshape(-1),
-                torsdf.reshape(-1),
-                feetgf.reshape(-1),
-                feetbf.reshape(-1),
-                feetdf.reshape(-1),
-                handsgf.reshape(-1),
-                handsbf.reshape(-1),
-                handsdf.reshape(-1),
-                kneesgf.reshape(-1),
-                kneesbf.reshape(-1),
-                kneesdf.reshape(-1),
-                shldsgf.reshape(-1),
-                shldsbf.reshape(-1),
-                shldsdf.reshape(-1),
-                head_pos.reshape(-1),
-                head_vel.reshape(-1),
-                pelv_pos.reshape(-1),
-                tors_pos.reshape(-1),
-                feet_pos.reshape(-1),
-                feet_vel.reshape(-1),
-                hands_pos.reshape(-1),
-                hands_vel.reshape(-1),
-                knees_pos.reshape(-1),
-                shlds_pos.reshape(-1),
-                info["navi_torso_rpy"][:2],
-                info["gait_mask"],
-                feet_contact,  # num_foot
+                headgf.reshape(-1), # (3,)
+                headbf.reshape(-1), # (3,)
+                headdf.reshape(-1), # (1,)
+                pelvgf.reshape(-1), # (3,)
+                pelvbf.reshape(-1), # (3,)
+                pelvdf.reshape(-1), # (1,)
+                torsgf.reshape(-1), # (3,)
+                torsbf.reshape(-1), # (3,)
+                torsdf.reshape(-1), # (1,)
+                feetgf.reshape(-1), # (6,)
+                feetbf.reshape(-1), # (6,)
+                feetdf.reshape(-1), # (2,)
+                handsgf.reshape(-1), # (6,)
+                handsbf.reshape(-1), # (6,)
+                handsdf.reshape(-1), # (2,)
+                kneesgf.reshape(-1), # (6,)
+                kneesbf.reshape(-1), # (6,)
+                kneesdf.reshape(-1), # (2,)
+                shldsgf.reshape(-1), # (6,)
+                shldsbf.reshape(-1), # (6,)
+                shldsdf.reshape(-1), # (2,)
+                head_pos.reshape(-1), # (3,)
+                head_vel.reshape(-1), # (3,)
+                pelv_pos.reshape(-1), # (3,)
+                tors_pos.reshape(-1), # (3,)
+                feet_pos.reshape(-1), # (6,)
+                feet_vel.reshape(-1), # (6,)
+                hands_pos.reshape(-1), # (6,)
+                hands_vel.reshape(-1), # (6,)
+                knees_pos.reshape(-1), # (6,)
+                shlds_pos.reshape(-1), # (6,)
+                info["navi_torso_rpy"][:2], # (2,)
+                info["gait_mask"],  # (2,)
+                feet_contact,  # num_foot, (2,)
                 # domain randomization
-                info["kp_scale"],
-                info["kd_scale"],
-                info["rfi_lim_scale"],
+                info["kp_scale"], # 1, ()
+                info["kd_scale"], # 1, ()
+                info["rfi_lim_scale"], # (29,)
                 # info["delay_steps"],
             ]
         )
@@ -1057,22 +1057,23 @@ class G1CatEnv(G1LocoEnv):
                 shldsbf.reshape(-1),
                 shldsdf.reshape(-1),
             ]
-        )
+        )   # (77,)
+
         state = jp.hstack(
             [
                 # noiseless state
-                noisy_gyro_pelvis,  # 3
-                noisy_gvec_pelvis,  # 3
+                noisy_gyro_pelvis,  # (3,)
+                noisy_gvec_pelvis,  # (3,)
                 # joint state
-                (noisy_joint_angles - self._default_qpos)[self.obs_joint_ids],  # 23
-                noisy_joint_vel[self.obs_joint_ids],  # 23
-                info["last_act"],  # num_actions
-                info["motor_targets"][self.action_joint_ids],  # num_actions
-                command,  # 4
-                info["foot_height"],  # 1
-                gait_phase,  # (num_foot * 2)
-                pf,
-            ]
+                (noisy_joint_angles - self._default_qpos)[self.obs_joint_ids],  # (23,)
+                noisy_joint_vel[self.obs_joint_ids],  # (23,)
+                info["last_act"],  # num_actions, (12,)
+                info["motor_targets"][self.action_joint_ids],  # num_actions, (12,)
+                command,  # (4,)
+                info["foot_height"],  # 1, ()
+                gait_phase,  # (num_foot * 2), (4,)
+                pf, # (77,)
+            ]   # (162,)
         )
 
         # Nan to 0
