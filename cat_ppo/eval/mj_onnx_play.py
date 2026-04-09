@@ -7,6 +7,7 @@ os.environ["MUJOCO_GL"] = "egl"
 
 from dataclasses import dataclass
 
+import mujoco
 import numpy as np
 import onnxruntime as rt
 import tyro
@@ -22,6 +23,7 @@ class Args:
     onnx_path: str = None
     pri: bool = False
     obs_path: str = 'data/assets/TypiObs/empty'
+    yaw: float = 0.0  # initial robot yaw in degrees (0 = default forward direction)
 
 
 @dataclass
@@ -45,6 +47,10 @@ def play(args: Args):
     output_names = ["continuous_actions"]
     policy = rt.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
     state = env.reset()
+    if args.yaw != 0.0:
+        angle = np.deg2rad(args.yaw)
+        env.mj_data.qpos[3:7] = [np.cos(angle/2), 0, 0, np.sin(angle/2)]  # wxyz pure yaw quaternion
+        mujoco.mj_forward(env.mj_model, env.mj_data)
     _ctr = 0
     # from plot import ActionPlotter
     #
