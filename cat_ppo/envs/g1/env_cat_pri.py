@@ -701,78 +701,79 @@ class G1CatPriEnv(G1LocoEnv):
                 gait_phase,  # (num_foot * 2)
                 # hint state
                 linvel_pelvis,  # 3
-                info["rtf"],
-                headgf.reshape(-1),
-                headbf.reshape(-1),
-                headdf.reshape(-1),
-                feetgf.reshape(-1),
-                feetbf.reshape(-1),
-                feetdf.reshape(-1),
-                handsgf.reshape(-1),
-                handsbf.reshape(-1),
-                handsdf.reshape(-1),
-                kneesbf.reshape(-1),
-                kneesdf.reshape(-1),
-                shldsbf.reshape(-1),
-                shldsdf.reshape(-1),
-                head_pos.reshape(-1),
-                head_vel.reshape(-1),
-                feet_pos.reshape(-1),
-                feet_vel.reshape(-1),
-                hands_pos.reshape(-1),
-                hands_vel.reshape(-1),
-                info["navi_torso_rpy"][:2],
-                info["gait_mask"],
-                feet_contact,  # num_foot
+                info["rtf"], # (3,)
+                headgf.reshape(-1), # (3,)
+                headbf.reshape(-1), # (3,)
+                headdf.reshape(-1), # (1,)
+                feetgf.reshape(-1), # (6,)
+                feetbf.reshape(-1), # (6,)
+                feetdf.reshape(-1), # (2,)
+                handsgf.reshape(-1), # (6,)
+                handsbf.reshape(-1), # (6,)
+                handsdf.reshape(-1), # (2,)
+                kneesbf.reshape(-1), # (6,)
+                kneesdf.reshape(-1), # (2,)
+                shldsbf.reshape(-1), # (6,)
+                shldsdf.reshape(-1), # (2,)
+                head_pos.reshape(-1), # (3,)
+                head_vel.reshape(-1), # (3,)
+                feet_pos.reshape(-1), # (6,)
+                feet_vel.reshape(-1), # (6,)
+                hands_pos.reshape(-1), # (6,)
+                hands_vel.reshape(-1), # (6,)
+                info["navi_torso_rpy"][:2], # (2,)
+                info["gait_mask"], # (2,)
+                feet_contact,  # num_foot, (2,)
                 # domain randomization
-                info["kp_scale"],
-                info["kd_scale"],
-                info["rfi_lim_scale"],
+                info["kp_scale"], # 1, ()
+                info["kd_scale"], # 1, ()
+                info["rfi_lim_scale"], # (29,)
             ]
-        )
+        )   # (209,)
+        
         state = jp.hstack(
             [
                 # noiseless state
-                gyro_pelvis,  # 3
-                gvec_pelvis,  # 3
-                (joint_angles - self._default_qpos)[self.obs_joint_ids],  # 23
-                joint_vel[self.obs_joint_ids],  # 23
-                info["last_act"],  # num_actions
-                info["motor_targets"][self.action_joint_ids],  # num_actions
-                command,  # 4
-                info["foot_height"],  # 1
-                gait_phase,  # (num_foot * 2)
+                gyro_pelvis,  # (3,)
+                gvec_pelvis,  # (3,)
+                (joint_angles - self._default_qpos)[self.obs_joint_ids],  # (23,)
+                joint_vel[self.obs_joint_ids],  # (23,)
+                info["last_act"],  # num_actions, (12,)
+                info["motor_targets"][self.action_joint_ids],  # num_actions, (12,)
+                command,  # (4,)
+                info["foot_height"],  # 1, ()
+                gait_phase,  # (num_foot * 2), (4,)
                 # hint state
                 linvel_pelvis,  # 3
-                headgf.reshape(-1),
-                headbf.reshape(-1),
-                headdf.reshape(-1),
-                feetgf.reshape(-1),
-                feetbf.reshape(-1),
-                feetdf.reshape(-1),
-                handsgf.reshape(-1),
-                handsbf.reshape(-1),
-                handsdf.reshape(-1),
-                kneesbf.reshape(-1),
-                kneesdf.reshape(-1),
-                shldsbf.reshape(-1),
-                shldsdf.reshape(-1),
-                head_pos.reshape(-1),
-                head_vel.reshape(-1),
-                feet_pos.reshape(-1),
-                feet_vel.reshape(-1),
-                hands_pos.reshape(-1),
-                hands_vel.reshape(-1),
-                info["navi_torso_rpy"][:2],
-                info["gait_mask"],
-                feet_contact,  # num_foot
+                headgf.reshape(-1), # (3,)
+                headbf.reshape(-1), # (3,)
+                headdf.reshape(-1), # (1,)
+                feetgf.reshape(-1), # (6,)
+                feetbf.reshape(-1), # (6,)
+                feetdf.reshape(-1), # (2,)
+                handsgf.reshape(-1), # (6,)
+                handsbf.reshape(-1), # (6,)
+                handsdf.reshape(-1), # (2,)
+                kneesbf.reshape(-1), # (6,)
+                kneesdf.reshape(-1), # (2,)
+                shldsbf.reshape(-1), # (6,)
+                shldsdf.reshape(-1), # (2,)
+                head_pos.reshape(-1), # (3,)
+                head_vel.reshape(-1), # (3,)
+                feet_pos.reshape(-1), # (6,)
+                feet_vel.reshape(-1), # (6,)
+                hands_pos.reshape(-1), # (6,)
+                hands_vel.reshape(-1), # (6,)
+                info["navi_torso_rpy"][:2], # (2,)
+                info["gait_mask"], # (2,)
+                feet_contact,  # num_foot, (2,)
                 # domain randomization
                 # info["kp_scale"],
                 # info["kd_scale"],
                 # info["rfi_lim_scale"],
                 # info["delay_steps"],
             ]
-        )
+        )   # (175,)
 
         # Nan to 0
         state = jp.nan_to_num(state)

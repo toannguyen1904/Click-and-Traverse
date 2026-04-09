@@ -55,7 +55,7 @@ cd procedural_obstacle_generation && python main.py
 `G1Env` (base, MjxEnv wrapper) → `G1LocoEnv` (locomotion) → `G1CatEnv` / `G1CatPriEnv` (collision-aware traversal)
 
 - **G1LocoEnv**: joystick-guided walking, 12-dim action (PD joint targets), gait clock, domain randomization base
-- **G1CatEnv** (`G1Cat`): sim-to-real deployable specialist. 162-dim `state` (HumanoidPF fields only, no absolute positions), 224-dim `privileged_state` (critic). Domain randomization **enabled**. Terminates on SDF collision for all 7 body groups.
+- **G1CatEnv** (`G1Cat`): sim-to-real deployable specialist. 162-dim `state` (HumanoidPF fields only, no absolute positions), 250-dim `privileged_state` (critic). Domain randomization **enabled**. Terminates on SDF collision for all 7 body groups.
 - **G1CatPriEnv** (`G1CatPri`): teacher policy for DAgger distillation, NOT deployable. 175-dim `state` adds ground-truth `linvel`, absolute body positions, feet_contact. 209-dim `privileged_state`. Domain randomization **disabled**. Terminates on SDF collision for head/feet/hands only.
 
 ### Registered Tasks

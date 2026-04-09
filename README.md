@@ -269,6 +269,75 @@ Supported tasks:
 
 Refer to `train_batch.py` for args details.
 
+### Observation Spaces
+
+Both tasks use an **asymmetric actor-critic** design: the policy sees `state` (noisy, deployable) and the critic sees `privileged_state` (noiseless, ground-truth).
+
+#### G1Cat (162 / 250)
+
+**`state` (162-dim)** — policy input, deployable on real hardware:
+
+| Component | Dims | Notes |
+|---|---|---|
+| Gyro (pelvis) | 3 | Angular velocity from IMU (noisy) |
+| Gravity vector (pelvis) | 3 | Tilt direction from IMU (noisy) |
+| Joint angles | 23 | Relative to default pose (noisy); excludes 6 wrist joints |
+| Joint velocities | 23 | Noisy |
+| Last action | 12 | Previous policy output |
+| Motor targets | 12 | Previous PD joint targets |
+| Command | 4 | `[move_flag, vx, vy, yaw]` from HumanoidPF guidance field |
+| Foot height target | 1 | Sampled swing clearance for this episode |
+| Gait phase | 4 | `[cos_L, cos_R, sin_L, sin_R]` |
+| **HumanoidPF fields** | **77** | GF + BF + SDF for 7 body groups (see below) |
+
+**HumanoidPF `pf` block (77-dim):** 3 fields per body group (gf=guidance, bf=boundary, df=SDF distance), transformed to navigation frame:
+- Single-point bodies (head, pelvis, torso): gf(3) + bf(3) + df(1) = 7 each × 3 = 21
+- Paired bodies (feet, hands, knees, shoulders): gf(6) + bf(6) + df(2) = 14 each × 4 = 56
+
+**`privileged_state` (250-dim)** — critic input only. Mostly a noiseless version of `state`, but the PF fields differ:
+- **Proprioception** (first 85 dims): noiseless copy of `state`'s proprioception
+- **HumanoidPF fields**: same 7 body groups but in **world frame** (not nav frame) and **without odometry delay** (current values, not stale)
+
+| Component | Dims | Breakdown |
+|---|---|---|
+| Base proprioception (noiseless) | 85 | same structure as `state` base |
+| Pelvis linear velocity (local) | 3 | |
+| HumanoidPF fields — all 7 groups (**world frame, no delay**) | 77 | head(7)+pelv(7)+tors(7)+feet(14)+hands(14)+knees(14)+shlds(14) |
+| Body positions | 33 | head(3)+pelv(3)+tors(3)+feet(6)+hands(6)+knees(6)+shlds(6) |
+| Body velocities | 15 | head(3)+feet(6)+hands(6) |
+| Torso RPY (roll, pitch) + gait mask + feet contact | 6 | 2+2+2 |
+| Domain rand scales: kp(1) + kd(1) + rfi_lim(29) | 31 | rfi_lim is per-joint (29 joints) |
+| **Total** | **250** | |
+
+#### G1CatPri (175 / 209)
+
+Teacher policy for distillation. **Not deployable** (uses ground-truth info unavailable on hardware).
+
+**`state` (175-dim)** — G1CatPri's state is fully **noiseless** (no sensor noise applied) and contains more ground-truth info than G1Cat:
+
+| Component | Dims | Notes |
+|---|---|---|
+| Base proprioception (**noiseless**) | 85 | same structure, but no noise added |
+| Pelvis linear velocity (local) | 3 | Ground-truth, not available from IMU |
+| HumanoidPF fields — 5 groups (**world frame, no delay**) | 51 | head(7)+feet(14)+hands(14)+knees(8)+shlds(8); knees/shlds have no gf |
+| Body positions (head, feet, hands) | 15 | 3+6+6, absolute world-frame |
+| Body velocities (head, feet, hands) | 15 | 3+6+6 |
+| Torso RPY (roll, pitch) + gait mask + feet contact | 6 | 2+2+2 |
+| **Total** | **175** | |
+
+Key differences from G1Cat `state`: no noise, PF in world frame without delay (not nav frame), includes body positions/velocities and contact directly, no DR scales.
+
+**`privileged_state` (209-dim)** — noiseless `state` plus `rtf` and DR scales. Smaller than G1Cat's (250) because the actor already sees most privileged info.
+
+| Component | Dims | Breakdown |
+|---|---|---|
+| Same as `state` above | 175 | |
+| `rtf` (guidance field sampled at pelvis) | 3 | 3D vector toward goal; used by `compute_cmd_from_rtf` |
+| Domain rand scales: kp(1) + kd(1) + rfi_lim(29) | 31 | per-joint rfi_lim (29 joints) |
+| **Total** | **209** | |
+
+Difference from G1Cat `privileged_state` (250 → 209, net **-41**): +rtf(+3), PF 77→51(-26), body 48→30(-18).
+
 ### brax2onnx
 
 `train_batch.py` will automatically convert checkpoints to ONNX format. But if you customize the policy architecture, you may need to convert checkpoints to ONNX manually:
