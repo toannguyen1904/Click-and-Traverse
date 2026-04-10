@@ -28,7 +28,7 @@
           <texture name="tex_brick_cube" type="2d" file="texture.png" />
 
           <material name="mat_brick_cube" texture="tex_brick_cube" reflectance="0.10" specular="0.20" shininess="0.30" />
-        <mesh name="scene_mesh" file="../TypiObs/empty/obs.obj" />
+        <mesh name="scene_mesh" file="../TypiObs/Mceil1/obs.obj" />
     </asset>
 
     <worldbody>
@@ -44,5 +44,18 @@
             <geom type="cylinder" fromto="0 0 0 0 0 0.1" size="0.005" rgba="0 0 1 0.2" contype="2" conaffinity="0" group="2" />
         </body>
     </worldbody>
+
+    <contact>
+        
+        <pair geom1="left_shin" geom2="floor" condim="3" friction="0.5 0.5" />
+        <pair geom1="right_shin" geom2="floor" condim="3" friction="0.5 0.5" />
+        <pair geom1="left_thigh" geom2="floor" condim="3" friction="0.5 0.5" />
+        <pair geom1="right_thigh" geom2="floor" condim="3" friction="0.5 0.5" />
+        <pair geom1="left_hand_collision" geom2="floor" condim="3" friction="0.5 0.5" />
+        <pair geom1="right_hand_collision" geom2="floor" condim="3" friction="0.5 0.5" />
+        <pair geom1="pelvis_collision" geom2="floor" condim="3" friction="0.5 0.5" />
+        <pair geom1="torso_collision" geom2="floor" condim="3" friction="0.5 0.5" />
+        <pair geom1="head_collision" geom2="floor" condim="3" friction="0.5 0.5" />
+    </contact>
 
 </mujoco>

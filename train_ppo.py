@@ -38,17 +38,20 @@ WANDB_ENTITY = os.environ.get("WANDB_ENTITY")
 
 @dataclass
 class Args:
+    """
+    Args for training the policy.
+    """
     task: str
-    exp_name: str = "debug"
-    num_timesteps: int = 400_000_000
-    seed: int = 42
-    convert_onnx: bool = True
-    restore_name: str = "none"
-    ground: float = 0
-    lateral: float = 0
-    overhead: float = 0
-    term_collision_threshold: float = 0.04
-    obs_path: str = 'data/assets/TypiObs/empty'
+    exp_name: str = "debug"   # experiment name, used to identify the experiment in WandB and log directory
+    num_timesteps: int = 400_000_000    # total number of environment steps to use during training
+    seed: int = 42   # random seed for training
+    convert_onnx: bool = True   # convert the trained policy to ONNX format for deployment
+    restore_name: str = "none"   # name of the checkpoint to restore from, used to resume training
+    ground: float = 0    # reward scale for feet body group: GF guidance alignment + SDF penalty vs ground-level obstacles
+    lateral: float = 0   # reward scale for hands/knees/shoulders body group: GF guidance alignment + SDF penalty vs side obstacles
+    overhead: float = 0  # reward scale for head body group: GF guidance alignment + SDF penalty vs overhead obstacles
+    term_collision_threshold: float = 0.04  # SDF below -threshold triggers collision termination
+    obs_path: str = 'data/assets/TypiObs/empty'  # path to the obstacle grid files: sdf.npy, bf.npy, gf.npy.
     def generate_exp_name(self):
         # generate a unique experiment name based on the task, difficulty, and seed
         exp_name_parts = [self.exp_name]
@@ -202,8 +205,8 @@ def train(args: Args):
     """
     Main training function.
     """
-    env_class = cat_ppo.registry.get(args.task, "train_env_class")
-    task_cfg = cat_ppo.registry.get(args.task, "config")
+    env_class = cat_ppo.registry.get(args.task, "train_env_class")  # args.task can be "G1Cat" or "G1CatPri". This returns the class of the environment, e.g. G1CatEnv or G1CatPriEnv.
+    task_cfg = cat_ppo.registry.get(args.task, "config")  # ConfigDict with env_config, policy_config, eval_config for the given task.
     env_cfg = task_cfg.env_config
     policy_cfg = task_cfg.policy_config
     eval_config = task_cfg.eval_config
@@ -224,7 +227,7 @@ def train(args: Args):
     if not debug_mode:
         _init_wandb(args, exp_name, env_class, task_cfg, ckpt_path)
 
-    train_fn = functools.partial(ppo.train, **policy_params)    # prefill arguments in policy_params
+    train_fn = functools.partial(ppo.train, **policy_params)    # prefill arguments in policy_params. functols.partial(func, **kwargs) returns a new function with the arguments prefilled in the original function func.
     times = [time.monotonic()]
 
     env = env_class(task_type=env_cfg.task_type, config=env_cfg)

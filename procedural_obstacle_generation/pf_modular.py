@@ -68,7 +68,7 @@ def make_guidance_field_progressive(cfg, grids, obs_mask, goal_local, bf, sdf, r
     r_proj   : radius of influence for normal projection (m). If None, defaults to 2*voxel ~ 3*voxel
     returns:
       T: Geodesic distance field (to the goal)
-      gf: HumanoidPF and gradient field
+      gf: HumanoidPF guidance field
     """
     voxel = cfg.voxel
     eps = 1e-9

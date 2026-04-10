@@ -38,6 +38,7 @@ ENABLE_RANDOMIZE = False
 def g1_loco_task_config() -> config_dict.ConfigDict:
     from cat_ppo.envs.g1.randomize import domain_randomize
 
+    # env_config: ConfigDict with all the environment configuration.
     env_config = config_dict.create(
         task_type="flat_terrain",
         ctrl_dt=0.02,
@@ -104,7 +105,7 @@ def g1_loco_task_config() -> config_dict.ConfigDict:
                 shldsdf=0.0,
             ),
             base_height_target=0.75,
-            foot_height_stance=0.0,
+            foot_height_stance=0.0,  # target foot height during stance (on ground); added to tar_foot_height for swing target: stance(0.0) + swing(0.07) = 0.07m
         ),
         term_collision_threshold=0.04,
         push_config=config_dict.create(
@@ -127,6 +128,7 @@ def g1_loco_task_config() -> config_dict.ConfigDict:
         ),
     )
 
+    # policy_config: ConfigDict with all the policy configuration.
     policy_config = config_dict.create(
         num_timesteps=5_000_000_000,
         max_devices_per_host=8,
@@ -180,6 +182,7 @@ def g1_loco_task_config() -> config_dict.ConfigDict:
     )
 
     # vel: move_flag[0|1], x[m], y[m], yaw[rad]
+    # eval_config: ConfigDict with all the evaluation configuration.
     eval_config = config_dict.create(
         duration=50.0,
         command_waypoints=np.array(
@@ -189,6 +192,7 @@ def g1_loco_task_config() -> config_dict.ConfigDict:
         ),
     )
 
+    # config: ConfigDict with env_config, policy_config, eval_config for the given task.
     config = config_dict.create(
         env_config=env_config,
         policy_config=policy_config,
@@ -196,6 +200,7 @@ def g1_loco_task_config() -> config_dict.ConfigDict:
     )
     return config
 
+# This registers the config object for the task "G1CatPri" with the category "config".
 cat_ppo.registry.register("G1CatPri", "config")(g1_loco_task_config())
 
 
