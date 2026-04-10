@@ -16,6 +16,15 @@ _FIG    = _REPO_ROOT / "fig"
 
 # function fo generating random obstacles
 def generate_random_obstacle(difficulty, seed, n_rect_R, n_rect_F, n_rect_C):
+    # difficulty [0,1]: controls geometry of each block, NOT the count.
+    #   - higher → floor/ceiling blocks span wider laterally (harder to go around)
+    #   - higher → more frequent tight-gap segments in the passable corridor
+    #   - n_rect_* and difficulty are orthogonal: difficulty shapes each block, n_rect_* sets how many
+    # seed: numpy RNG seed (np.random.default_rng), fully deterministic — same seed → same scene
+    # n_rect_R / n_rect_L: number of right/left wall blocks (L is always set equal to R below)
+    # n_rect_F: number of floor blocks (low obstacles, max height 0.25m, robot must step over)
+    # n_rect_C: number of ceiling blocks (hanging from above min z=1.0m, robot must duck under)
+    # NOTE: pass -1 for any n_rect_* to auto-compute it from difficulty instead of specifying manually
     n_rect_L=n_rect_R
     prefix = f"D{int(difficulty*10)}G{n_rect_F:01d}L{n_rect_R:01d}O{n_rect_C:01d}S{seed}/"
 
@@ -101,10 +110,10 @@ def generate_typical_obstacle(scene_type):
     # T: geodesic distance to goal (Nx,Ny,Nz). gf: HumanoidPF vector field (Nx,Ny,Nz,3).
     T, gf = make_guidance_field_progressive(cfg, (X, Y, Z), obs_mask, cfg.goal_w, bf, sdf)
 
-    np.save(out_dir / "sdf.npy", sdf)
-    np.save(out_dir / "bf.npy",  bf)
-    np.save(out_dir / "gf.npy",  gf)
-    np.save(out_dir / "obs.npy", obs_mask.astype(np.uint8))
+    np.save(out_dir / "sdf.npy", sdf)   # shape (Nx, Ny, Nz)
+    np.save(out_dir / "bf.npy",  bf)   # shape (Nx, Ny, Nz, 3)
+    np.save(out_dir / "gf.npy",  gf)   # shape (Nx, Ny, Nz, 3)
+    np.save(out_dir / "obs.npy", obs_mask.astype(np.uint8))  # shape (Nx, Ny, Nz), dtype uint8
     # sur = extract_surface_voxels(obs_mask)
     # np.save(out_dir / "sur.npy", sur.astype(np.uint8))
     # ground_idx, ceil_idx = get_elevation(obs_mask)
@@ -158,10 +167,10 @@ def generate_pf(scene_type, pc_path):   # used in deployment to generate PF from
     T, gf = make_guidance_field_progressive(cfg, (X, Y, Z), obs_mask, cfg.goal_w, bf, sdf)
 
     # 保存
-    np.save(out_dir / "sdf.npy", sdf)
-    np.save(out_dir / "bf.npy",  bf)
-    np.save(out_dir / "gf.npy",  gf)
-    np.save(out_dir / "obs.npy", obs_mask.astype(np.uint8))
+    np.save(out_dir / "sdf.npy", sdf)   # shape (Nx, Ny, Nz)
+    np.save(out_dir / "bf.npy",  bf)   # shape (Nx, Ny, Nz, 3)
+    np.save(out_dir / "gf.npy",  gf)   # shape (Nx, Ny, Nz, 3)
+    np.save(out_dir / "obs.npy", obs_mask.astype(np.uint8))  # shape (Nx, Ny, Nz), dtype uint8
     # sur = extract_surface_voxels(obs_mask)
     # np.save(out_dir / "sur.npy", sur.astype(np.uint8))
     # 可视化
@@ -217,4 +226,4 @@ if __name__ == "__main__":
     # generate_typical_obstacle('hole')
     # generate_random_obstacle(0.8, 13, 1, 0, 0)
     # generate_random_obstacle(0.8, 4, 1, 0, 1)
-    generate_random_obstacle(0.7, 42, 9, 4, 3)  # generate a random obstacle scene with difficulty 0.2, seed 42, 9 left-wall blocks, 3 front-wall blocks, 3 overhead blocks
+    generate_random_obstacle(0.9, 42, 9, 5, 3)  # generate a random obstacle scene with difficulty 0.2, seed 42, 9 left-wall blocks, 3 front-wall blocks, 3 overhead blocks

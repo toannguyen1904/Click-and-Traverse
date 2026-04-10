@@ -95,7 +95,7 @@ def g1_loco_task_config() -> config_dict.ConfigDict:
                 # joint_nominal=-0.01,
             ),
             base_height_target=0.75,
-            foot_height_stance=0.0,
+            foot_height_stance=0.0,  # target foot height during stance (on ground); added to tar_foot_height for swing target: stance(0.0) + swing(0.07) = 0.07m
         ),
         push_config=config_dict.create(
             enable=True,
@@ -830,10 +830,19 @@ class G1LocoEnv(g1_base.G1Env):
         return reward_dict
 
     def _cost_joint_pos_limits(self, qpos: jax.Array) -> jax.Array:
-        # Penalize joints if they cross soft limits.
+        """
+        Penalize joints that exceed soft position limits (95% of hardware range).
+        Soft limits shrink the allowed range by factor soft_joint_pos_limit_factor=0.95,
+        leaving a 5% safety margin on each side before the hardware hard stop.
+
+        qpos:    (29,) — joint angles for all joints, passed as data.qpos[7:] (root 7-DoF skipped)
+        returns: scalar >= 0, linear in how far each joint exceeds its soft limit
+        """
+        # (29,) positive violation if below soft lower limit; 0 when within limits
         out_of_limits = -jp.clip(qpos - self._soft_lowers, None, 0.0)
+        # (29,) add positive violation if above soft upper limit; 0 when within limits
         out_of_limits += jp.clip(qpos - self._soft_uppers, 0.0, None)
-        return jp.sum(out_of_limits)
+        return jp.sum(out_of_limits)  # (scalar) sum all per-joint violations
 
     def _reward_tracking_lin_vel(self, cmd_vel: jax.Array, local_lin_vel: jax.Array) -> jax.Array:
         lin_vel_error = jp.sum(jp.square(cmd_vel[:2] - local_lin_vel[:2]))
@@ -880,33 +889,54 @@ class G1LocoEnv(g1_base.G1Env):
     def _cost_foot_contact(
             self, data: mjx.Data, feet_contact: jax.Array, gait_flag: jax.Array, move_flag: jax.Array
     ) -> jax.Array:
-        stance = feet_contact != 0
-        swing = feet_contact == 0
-        stance_des = jp.float32(gait_flag == 1)
-        swing_des = jp.float32(gait_flag == -1)
-        is_constrained = jp.float32(gait_flag != 0)
-        cost_stance = jp.sum(jp.abs(stance - stance_des) * is_constrained)
-        cost_swing = jp.sum(jp.abs(swing - swing_des) * is_constrained)
+        """
+        Penalize feet that are in the wrong contact state relative to the gait clock.
+        feet_contact: (2,) — 0 (in air) or 1 (touching floor) per foot [left, right]
+        gait_flag:    (2,) — gait mask per foot: +1 (should swing), -1 (should stance), 0 (transition, no constraint)
+        move_flag:    scalar — 0 when standing still (no penalty), 1 when walking
+        returns:      scalar >= 0, each foot contributes 0 (correct) or 1 (wrong), only outside transition zone
+        """
+        stance = feet_contact != 0          # (2,) bool: foot is on ground
+        swing = feet_contact == 0           # (2,) bool: foot is in air
+        stance_des = jp.float32(gait_flag == 1)   # (2,) desired: foot should be on ground
+        swing_des = jp.float32(gait_flag == -1)   # (2,) desired: foot should be in air
+        is_constrained = jp.float32(gait_flag != 0)  # (2,) 1 in active swing/stance zone, 0 in transition zone
+        cost_stance = jp.sum(jp.abs(stance - stance_des) * is_constrained)  # (scalar) penalize wrong stance
+        cost_swing = jp.sum(jp.abs(swing - swing_des) * is_constrained)     # (scalar) penalize wrong swing
         cost = cost_stance + cost_swing
-        cost *= move_flag
+        cost *= move_flag  # no penalty when standing still
         return cost
 
     def _cost_foot_clearance(
             self, data: mjx.Data, tar_foot_height: jax.Array, gait_flag: jax.Array, move_flag: jax.Array
     ) -> jax.Array:
-        foot_pos = data.site_xpos[self._feet_site_id]
-        foot_z = foot_pos[..., -1]
-        swing_des = jp.float32(gait_flag == -1)
-        foot_z_tar = self._config.reward_config.foot_height_stance + tar_foot_height
-        cost = jp.sum(swing_des * jp.square(foot_z - foot_z_tar))
-        cost *= move_flag
+        """
+        Penalize swinging feet that don't reach the target height (too low = dragging, too high = wasting energy).
+        data:            mjx.Data — full MuJoCo sim state (qpos, qvel, site_xpos, contacts, etc.), updated every physics substep
+        tar_foot_height: scalar — target swing clearance sampled per episode (fixed at 0.07m for G1Cat)
+        gait_flag:       (2,) — gait mask per foot: -1 = should be swinging
+        move_flag:       scalar — 0 when standing still (no penalty), 1 when walking
+        returns:         scalar >= 0
+        """
+        foot_pos = data.site_xpos[self._feet_site_id]  # (2, 3) world-space xyz positions of all named foot sites (from MuJoCo forward kinematics)
+        foot_z = foot_pos[..., -1]                     # (2,) height of each foot above ground
+        swing_des = jp.float32(gait_flag == -1)        # (2,) 1 if foot should be swinging, 0 otherwise
+        foot_z_tar = self._config.reward_config.foot_height_stance + tar_foot_height  # scalar target height (0.0 + 0.07 = 0.07m)
+        cost = jp.sum(swing_des * jp.square(foot_z - foot_z_tar))  # (scalar) squared height error, only for swinging feet
+        cost *= move_flag  # no penalty when standing still
         return cost
 
     def _cost_foot_slip(self, data: mjx.Data, gait_flag: jax.Array) -> jax.Array:
-        stance_des = jp.float32(gait_flag == 1)
-        feet_vel = data.sensordata[self._foot_linvel_sensor_adr]
-        feet_vel = jp.linalg.norm(feet_vel, axis=-1)
-        cost = jp.sum(jp.square(feet_vel) * stance_des)
+        """
+        Penalize feet sliding on the ground during stance — feet in stance should be stationary.
+        data:      mjx.Data — full MuJoCo sim state
+        gait_flag: (2,) — gait mask per foot: +1 = should be in stance
+        returns:   scalar >= 0
+        """
+        stance_des = jp.float32(gait_flag == 1)                          # (2,) 1 if foot should be on ground
+        feet_vel = data.sensordata[self._foot_linvel_sensor_adr]         # (2, 3) linear velocity of each foot in world frame, from MuJoCo velocity sensor
+        feet_vel = jp.linalg.norm(feet_vel, axis=-1)                     # (2,) speed magnitude of each foot
+        cost = jp.sum(jp.square(feet_vel) * stance_des)                  # (scalar) squared speed, only for stance feet
         return cost
 
     def _cost_foot_balance(
@@ -941,7 +971,14 @@ class G1LocoEnv(g1_base.G1Env):
         return foot_spread_penalty
 
     def _cost_torque(self, torques: jax.Array) -> jax.Array:
-        cost_energy = jp.sum(jp.square(torques))
+        """
+        Penalize high motor torques to encourage energy-efficient motion.
+        Uses squared torques so large spikes are penalized more than small ones.
+
+        torques: (29,) — actual actuator torque outputs from data.actuator_force (post-PD control, not raw policy action)
+        returns: scalar >= 0
+        """
+        cost_energy = jp.sum(jp.square(torques))  # (scalar) sum of squared torques over all 29 joints
         return cost_energy
 
     def _cost_smoothness_action(self, act: jax.Array, last_act: jax.Array, last_last_act: jax.Array) -> jax.Array:
@@ -951,9 +988,15 @@ class G1LocoEnv(g1_base.G1Env):
         return cost
 
     def _cost_smoothness_joint(self, data: mjx.Data, last_joint_vel):
-        qvel = data.qvel[6:][self.obs_joint_ids]
-        qacc = (last_joint_vel[self.obs_joint_ids] - qvel) / self.dt
-        cost = jp.sum(0.01 * jp.square(qvel) + jp.square(qacc))
+        """
+        Penalize jerky joint motion — high velocity and especially high acceleration.
+        data:           mjx.Data — full MuJoCo sim state
+        last_joint_vel: (N_joints,) — joint velocities from the previous control step, stored in info
+        returns:        scalar >= 0
+        """
+        qvel = data.qvel[6:][self.obs_joint_ids]                      # (23,) current joint velocities; [6:] skips root body 6-DoF velocities
+        qacc = (last_joint_vel[self.obs_joint_ids] - qvel) / self.dt  # (23,) finite-difference acceleration; self.dt = ctrl_dt = 0.02s
+        cost = jp.sum(0.01 * jp.square(qvel) + jp.square(qacc))      # (scalar) acc² dominates (weight 1.0 vs 0.01): mainly penalizes jerk, not speed
         return cost
 
     def _reward_body_rotation(self, data: mjx.Data, cmd_vel: jax.Array, navi2world_rot: jax.Array) -> jax.Array:

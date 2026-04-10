@@ -57,6 +57,9 @@ def register(task: str, category: str):
 
 
 def get(task: str, category: str, call: bool = False):
+    """
+    Get the object registered under the given task and category.
+    """
     _check_get_category(task, category)
 
     if category not in _REGISTRY[task]:
