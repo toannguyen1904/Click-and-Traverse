@@ -294,13 +294,15 @@ Both tasks use an **asymmetric actor-critic** design: the policy sees `state` (n
 - Single-point bodies (head, pelvis, torso): gf(3) + bf(3) + df(1) = 7 each × 3 = 21
 - Paired bodies (feet, hands, knees, shoulders): gf(6) + bf(6) + df(2) = 14 each × 4 = 56
 
-**`privileged_state` (250-dim)** — critic input only, noiseless superset of `state`:
+**`privileged_state` (250-dim)** — critic input only. Mostly a noiseless version of `state`, but the PF fields differ:
+- **Proprioception** (first 85 dims): noiseless copy of `state`'s proprioception
+- **HumanoidPF fields**: same 7 body groups but in **world frame** (not nav frame) and **without odometry delay** (current values, not stale)
 
 | Component | Dims | Breakdown |
 |---|---|---|
 | Base proprioception (noiseless) | 85 | same structure as `state` base |
 | Pelvis linear velocity (local) | 3 | |
-| HumanoidPF fields — all 7 groups (world frame) | 77 | head(7)+pelv(7)+tors(7)+feet(14)+hands(14)+knees(14)+shlds(14) |
+| HumanoidPF fields — all 7 groups (**world frame, no delay**) | 77 | head(7)+pelv(7)+tors(7)+feet(14)+hands(14)+knees(14)+shlds(14) |
 | Body positions | 33 | head(3)+pelv(3)+tors(3)+feet(6)+hands(6)+knees(6)+shlds(6) |
 | Body velocities | 15 | head(3)+feet(6)+hands(6) |
 | Torso RPY (roll, pitch) + gait mask + feet contact | 6 | 2+2+2 |
@@ -311,28 +313,27 @@ Both tasks use an **asymmetric actor-critic** design: the policy sees `state` (n
 
 Teacher policy for distillation. **Not deployable** (uses ground-truth info unavailable on hardware).
 
-**`state` (175-dim)** — G1Cat's `state` (162) plus privileged info:
+**`state` (175-dim)** — G1CatPri's state is fully **noiseless** (no sensor noise applied) and contains more ground-truth info than G1Cat:
 
-| Extra Component | Dims | Notes |
+| Component | Dims | Notes |
 |---|---|---|
+| Base proprioception (**noiseless**) | 85 | same structure, but no noise added |
 | Pelvis linear velocity (local) | 3 | Ground-truth, not available from IMU |
-| Body positions (head, feet, hands) | 15 | 3+6+6 |
+| HumanoidPF fields — 5 groups (**world frame, no delay**) | 51 | head(7)+feet(14)+hands(14)+knees(8)+shlds(8); knees/shlds have no gf |
+| Body positions (head, feet, hands) | 15 | 3+6+6, absolute world-frame |
 | Body velocities (head, feet, hands) | 15 | 3+6+6 |
 | Torso RPY (roll, pitch) + gait mask + feet contact | 6 | 2+2+2 |
+| **Total** | **175** | |
 
-Also differs: no sensor noise, no DR scales in state, PF limited to 3 body groups (head, feet, hands) with knees/shoulders using only bf+df (no gf).
+Key differences from G1Cat `state`: no noise, PF in world frame without delay (not nav frame), includes body positions/velocities and contact directly, no DR scales.
 
-**`privileged_state` (209-dim)** — same structure as G1CatPri `state` plus DR scales and `rtf`. Smaller than G1Cat's (250) because the actor already sees most privileged info, so the critic needs less on top.
+**`privileged_state` (209-dim)** — noiseless `state` plus `rtf` and DR scales. Smaller than G1Cat's (250) because the actor already sees most privileged info.
 
 | Component | Dims | Breakdown |
 |---|---|---|
-| Base proprioception (noiseless) | 85 | same as `state` base |
-| Pelvis linear velocity (local) | 3 | |
-| `rtf` (guidance field at pelvis) | 3 | 3D vector toward goal |
-| HumanoidPF fields — 5 groups (world frame) | 51 | head(7)+feet(14)+hands(14)+knees(8)+shlds(8); knees/shlds have no gf |
-| Body positions + velocities (head, feet, hands) | 30 | pos(3+6+6) + vel(3+6+6) |
-| Torso RPY (roll, pitch) + gait mask + feet contact | 6 | 2+2+2 |
-| Domain rand scales: kp(1) + kd(1) + rfi_lim(29) | 31 | same as G1Cat |
+| Same as `state` above | 175 | |
+| `rtf` (guidance field sampled at pelvis) | 3 | 3D vector toward goal; used by `compute_cmd_from_rtf` |
+| Domain rand scales: kp(1) + kd(1) + rfi_lim(29) | 31 | per-joint rfi_lim (29 joints) |
 | **Total** | **209** | |
 
 Difference from G1Cat `privileged_state` (250 → 209, net **-41**): +rtf(+3), PF 77→51(-26), body 48→30(-18).
