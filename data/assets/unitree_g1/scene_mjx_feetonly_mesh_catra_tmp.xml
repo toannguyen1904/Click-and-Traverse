@@ -25,7 +25,7 @@
         <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="60 60" reflectance="0.01" specular="0.25" shininess="0.35" />
         <texture name="tex_brick_cube" type="2d" file="texture.png" />
         <material name="mat_brick_cube" texture="tex_brick_cube" reflectance="0.10" specular="0.20" shininess="0.30" />
-        <mesh name="scene_mesh" file="../RandObs/D8G1L3O1S49/obs.obj" />
+        <mesh name="scene_mesh" file="../TypiObs/empty/obs.obj" />
     </asset>
 
     <worldbody>
