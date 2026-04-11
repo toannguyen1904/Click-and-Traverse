@@ -35,8 +35,9 @@ class PlayG1PickupEnv(BaseEnv):
         headless: bool = False,
         surface_z: Optional[float] = None,
     ):
-        xml_path = consts.CATRA_FLAT_TERRAIN_XML
-        self.mj_model = mujoco.MjModel.from_xml_path(str(xml_path))
+        xml_path = consts.CATRA_MESH_XML
+        tmp_xml = set_scene_for_xml(xml_path, config.pf_config.path)
+        self.mj_model = mujoco.MjModel.from_xml_path(tmp_xml)
         self.mj_data = mujoco.MjData(self.mj_model)
         self.mj_model.opt.timestep = sim_dt
         self.headless = headless
