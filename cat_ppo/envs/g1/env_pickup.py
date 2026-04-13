@@ -310,6 +310,23 @@ def g1_pickup_task_config() -> config_dict.ConfigDict:
 cat_ppo.registry.register("G1Pickup", "config")(g1_pickup_task_config())
 
 
+def g1_stand_task_config() -> config_dict.ConfigDict:
+    """Config for G1Stand: leg-only standing policy (12-DOF), no box.
+
+    Observation dimensions:
+      num_obs = 54   (state, deployable)
+      num_pri = 62   (privileged_state)
+    """
+    cfg = g1_pickup_task_config()
+    cfg.env_config.num_obs = 54
+    cfg.env_config.num_pri = 62
+    cfg.env_config.num_act = 12
+    return cfg
+
+
+cat_ppo.registry.register("G1Stand", "config")(g1_stand_task_config())
+
+
 # ---------------------------------------------------------------------------
 # Environment
 # ---------------------------------------------------------------------------
@@ -526,7 +543,8 @@ class G1PickupEnv(G1CaTraEnv):
 
         rewards = self._get_reward(data, action, state.info, done, feet_contact)
         rewards = {k: v * self._config.reward_config.scales[k] for k, v in rewards.items()}
-        reward = jp.clip(sum(rewards.values()) * self.dt, 0.0, 10000.0)
+        # reward = jp.clip(sum(rewards.values()) * self.dt, 0.0, 10000.0)
+        reward = sum(rewards.values()) * self.dt
 
         # Update info for next step
         state.info["last_left_hand_pos"] = left_hand_pos
@@ -724,3 +742,94 @@ class G1PickupEnv(G1CaTraEnv):
         for k, v in reward_dict.items():
             reward_dict[k] = jp.where(jp.isnan(v), 0.0, v)
         return reward_dict
+
+
+# ---------------------------------------------------------------------------
+# G1Stand: leg-only standing policy (inherits from G1PickupEnv)
+# ---------------------------------------------------------------------------
+
+# 12-DOF action space: all leg joints (same as consts.ACTION_JOINT_NAMES)
+STAND_ACTION_JOINT_NAMES = list(consts.ACTION_JOINT_NAMES)
+
+
+@cat_ppo.registry.register("G1Stand", "train_env_class")
+class G1StandEnv(G1PickupEnv):
+    """Leg-only standing policy (12-DOF). No box in obs; box rewards all have scale=0.
+
+    Inherits reset/step/rewards/termination from G1PickupEnv unchanged.
+    Only the action joints and observations differ.
+
+    State (54-dim):
+        gyro_pelvis(3), gvec_pelvis(3),
+        joint_angles[legs](12), joint_vel[legs](12),
+        last_action(12), motor_targets[legs](12)
+
+    Privileged (62-dim):
+        [same 54 noiseless]
+        + pelvis_pos(3), torso_pos(3), kp_scale(1), kd_scale(1)
+    """
+
+    def _post_init_pickup(self) -> None:
+        """Override to 12-DOF leg-only action space."""
+        self.action_joint_names = STAND_ACTION_JOINT_NAMES.copy()
+        self.action_joint_ids = jp.array([
+            self.mj_model.actuator(name).id for name in self.action_joint_names
+        ])
+        self._pelvis_body_id = self._mj_model.body("pelvis").id
+        self._box_geom_id = self._mj_model.geom(consts.BOX_GEOM).id
+        self._box_support_geom_id = self._mj_model.geom("box_support_col").id
+
+    @property
+    def action_size(self) -> int:
+        return len(self.action_joint_names)  # 12
+
+    def _get_obs(self, data: mjx.Data, info: dict[str, Any]) -> mjx_env.Observation:
+        """54-dim state (deployable, noisy) and 62-dim privileged_state (noiseless + extras).
+
+        State (54):
+            gyro_pelvis[+noise](3), gvec_pelvis[+noise](3),
+            joint_angles[legs, +noise](12), joint_vel[legs, +noise](12),
+            last_action(12), motor_targets[legs](12)
+
+        Privileged (62 = 54 noiseless + 8 extras):
+            [same 54 fields, noiseless]
+            + pelvis_pos(3), torso_pos(3), kp_scale(1), kd_scale(1)
+        """
+        gyro_pelvis = self.get_gyro(data, "pelvis")
+        gvec_pelvis = data.site_xmat[self._pelvis_imu_site_id].T @ jp.array([0., 0., -1.])
+        joint_angles = data.qpos[7:7 + NUM_ROBOT_JOINTS]
+        joint_vel = data.qvel[6:6 + NUM_ROBOT_JOINTS]
+
+        pelv_site_pos = data.site_xpos[self._pelvis_imu_site_id]
+        tors_site_pos = data.site_xpos[self._torso_imu_site_id]
+
+        privileged_state = jp.hstack([
+            gyro_pelvis, gvec_pelvis,
+            (joint_angles - self._default_qpos)[self.action_joint_ids],
+            joint_vel[self.action_joint_ids],
+            info["last_act"],
+            info["motor_targets"][self.action_joint_ids],
+            pelv_site_pos, tors_site_pos,
+            info["kp_scale"].reshape(1), info["kd_scale"].reshape(1),
+        ])
+
+        nl = self._config.noise_config.level
+        ns = self._config.noise_config.scales
+        info["rng"], k1, k2, k3, k4 = jax.random.split(info["rng"], 5)
+        noisy_gyro = gyro_pelvis + (2 * jax.random.uniform(k1, (3,)) - 1) * nl * ns.gyro
+        noisy_gvec = gvec_pelvis + (2 * jax.random.uniform(k2, (3,)) - 1) * nl * ns.gravity
+        noisy_ja = joint_angles + (2 * jax.random.uniform(k3, joint_angles.shape) - 1) * nl * ns.joint_pos
+        noisy_jv = joint_vel + (2 * jax.random.uniform(k4, joint_vel.shape) - 1) * nl * ns.joint_vel
+
+        state = jp.hstack([
+            noisy_gyro, noisy_gvec,
+            (noisy_ja - self._default_qpos)[self.action_joint_ids],
+            noisy_jv[self.action_joint_ids],
+            info["last_act"],
+            info["motor_targets"][self.action_joint_ids],
+        ])
+
+        return {
+            "state": jp.nan_to_num(state),
+            "privileged_state": jp.nan_to_num(privileged_state),
+        }
