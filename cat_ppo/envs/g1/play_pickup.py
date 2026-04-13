@@ -24,7 +24,7 @@ NUM_ROBOT_JOINTS = 29
 
 @cat_ppo.registry.register("G1Pickup", "play_env_class")
 class PlayG1PickupEnv(BaseEnv):
-    """CPU inference env for G1Pickup. 11-DOF action (waist + arms), compact obs."""
+    """CPU inference env for G1Pickup. 17-DOF action, compact obs."""
 
     def __init__(
         self,
@@ -69,6 +69,7 @@ class PlayG1PickupEnv(BaseEnv):
         self._pelvis_body_id = self.mj_model.body("pelvis").id
         self._box_body_id = self.mj_model.body("carried_box").id
         self._box_geom_id = self.mj_model.geom("box_geom").id
+        self._box_support_geom_id = self.mj_model.geom("box_support_col").id
         support_body_id = self.mj_model.body("box_support").id
         self._box_support_mocap_id = int(self.mj_model.body_mocapid[support_body_id])
 
@@ -97,13 +98,14 @@ class PlayG1PickupEnv(BaseEnv):
             surface_z = float(np.random.uniform(lo, hi))
 
         box_half_z = float(self.mj_model.geom_size[self._box_geom_id][2])
-        box_z = surface_z + 0.01 + box_half_z
+        support_half_z = float(self.mj_model.geom_size[self._box_support_geom_id][2])
+        box_z = surface_z + support_half_z + box_half_z
 
-        # Place box 0.4 m in front of robot (default yaw = 0, so forward = +x)
+        # Place box 3.0 m in front of robot (default yaw = 0, so forward = +x)
         root_qpos = qpos[:7]
         w, x, y, z = root_qpos[3], root_qpos[4], root_qpos[5], root_qpos[6]
         forward_xy = np.array([1 - 2 * (y ** 2 + z ** 2), 2 * (x * y + w * z)])
-        box_xy = root_qpos[:2] + 0.4 * forward_xy
+        box_xy = root_qpos[:2] + 3.0 * forward_xy
 
         # Set box position and identity orientation
         self.mj_data.qpos[BOX_QPOS_START:BOX_QPOS_START + 3] = [box_xy[0], box_xy[1], box_z]
@@ -130,13 +132,14 @@ class PlayG1PickupEnv(BaseEnv):
             "last_left_hand_pos": left_hand_pos,
             "last_right_hand_pos": right_hand_pos,
             "surface_z": float(surface_z),
+            "support_half_z": support_half_z,
             "box_size": box_size,
         }
         obs = self.get_obs(info)
         return State(info, obs)
 
     def step(self, state: State, action: np.ndarray) -> State:
-        """Apply PD control for one policy step; legs held at default."""
+        """Apply PD control for one policy step; uncontrolled joints stay at default."""
         lower_motor_targets = np.clip(
             state.info["motor_targets"][self.action_joint_ids] + action * self._config.action_scale,
             self._soft_lowers[self.action_joint_ids],
@@ -171,7 +174,7 @@ class PlayG1PickupEnv(BaseEnv):
         return State(state.info, obs)
 
     def get_obs(self, info: dict) -> dict:
-        """Build 61-dim deployable state with sensor noise (matches G1PickupEnv._get_obs)."""
+        """Build 85-dim deployable state with sensor noise (matches G1PickupEnv._get_obs)."""
         nl = self._config.noise_config.level
         ns = self._config.noise_config.scales
 

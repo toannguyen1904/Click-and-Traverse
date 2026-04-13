@@ -1,26 +1,28 @@
 """G1 Box Pickup environment: robot reaches and lifts a box from a support surface.
 
 Phase 1 of the CaTra curriculum:
-- Robot stands stationary (legs held at default, not actuated).
-- 11-DOF action space: waist (3) + arms (8).
+- Robot stands in place but can crouch using sagittal-plane leg joints.
+- 17-DOF action space: hip pitch/knee/ankle pitch (6) + waist (3) + arms (8).
 - Box placed 0.4 m in front of robot on a support surface at random height.
 - Reward guides the robot to reach the box, reduce table contact force, and lift.
 - Terminal states feed into the CaTra traversal policy.
 
 Observation dimensions:
-  num_obs = 61   (state, deployable with sensor noise)
-  num_pri = 99   (privileged_state, built from scratch with noiseless sensors)
+  num_obs = 85   (state, deployable with sensor noise)
+  num_pri = 123  (privileged_state, built from scratch with noiseless sensors)
 """
 
 from typing import Any, Dict, Optional, Union
 
 import jax
+import jaxlie
 import jax.numpy as jp
 import mujoco
 import numpy as np
 from ml_collections import config_dict
 from mujoco import mjx
 from mujoco.mjx._src import math
+from mujoco_playground._src.collision import geoms_colliding
 from mujoco_playground._src import mjx_env
 
 import cat_ppo
@@ -34,8 +36,14 @@ from cat_ppo.envs.g1.env_catra import (
     torque_step_catra,
 )
 
-# 11-DOF action space: waist (3) + arms (8). Legs are not actuated.
+# 17-DOF action space: sagittal-plane leg joints (6) + waist (3) + arms (8).
 PICKUP_ACTION_JOINT_NAMES = [
+    "left_hip_pitch_joint",
+    "left_knee_joint",
+    "left_ankle_pitch_joint",
+    "right_hip_pitch_joint",
+    "right_knee_joint",
+    "right_ankle_pitch_joint",
     "waist_yaw_joint",
     "waist_roll_joint",
     "waist_pitch_joint",
@@ -117,7 +125,7 @@ def _make_domain_randomize_pickup():
 
             # Box mass: override the globally-scaled value
             rng, key = jax.random.split(rng)
-            box_mass = jax.random.uniform(key, minval=0.5, maxval=3.0)
+            box_mass = jax.random.uniform(key, minval=1.0, maxval=2.0)
             body_mass = body_mass.at[_box_body_id].set(box_mass)
 
             return (pair_friction, dof_frictionloss, dof_armature, body_ipos, body_mass, qpos0, geom_size)
@@ -158,22 +166,22 @@ domain_randomize_pickup = _make_domain_randomize_pickup()
 # ---------------------------------------------------------------------------
 
 def g1_pickup_task_config() -> config_dict.ConfigDict:
-    """Config for G1Pickup: stationary manipulation, 11-DOF waist+arms.
+    """Config for G1Pickup: stationary manipulation with crouching support.
 
     Observation dimensions:
-      num_obs = 61  (state, deployable)
-      num_pri = 99  (privileged_state)
+      num_obs = 85   (state, deployable)
+      num_pri = 123  (privileged_state)
     """
     env_config = config_dict.create(
         task_type="flat_terrain_catra",
         ctrl_dt=0.02,
         sim_dt=0.002,
-        episode_length=500,
+        episode_length=200,
         action_repeat=1,
         action_scale=0.5,
-        num_obs=61,
-        num_pri=99,
-        num_act=11,
+        num_obs=85,
+        num_pri=123,
+        num_act=17,
         soft_joint_pos_limit_factor=0.95,
         # Required by G1LocoEnv._post_init() — unused by G1PickupEnv which overrides reset/step
         history_len=15,
@@ -219,20 +227,23 @@ def g1_pickup_task_config() -> config_dict.ConfigDict:
         ),
         reward_config=config_dict.create(
             scales=config_dict.create(
-                reach=1.0,
-                lift=5.0,
-                table_force=2.0,
-                hold_stable=0.5,
-                box_upright=1.0,
+                reach=0.0,  # 1.0 CHANGED
+                lift=0.0,   # 5.0 CHANGED
+                hold_stable=0.0,    # 0.1 CHANGED
+                box_upright=0.0,    # 1.0 CHANGED
                 upright=1.0,
-                energy=1e-4,
+                foot_contact=-0.5,
+                foot_slip=-0.1,
+                straight_knee=-5.0,
+                joint_torque=-1e-4,
+                smoothness_joint=-1e-6,
                 smoothness=1e-3,
                 joint_limits=1.0,
             ),
             base_height_target=0.75,
             foot_height_stance=0.0,
         ),
-        box_surface_height_range=[0.4, 0.8],
+        box_surface_height_range=[0.4, 0.6],
         pf_config=config_dict.create(
             path='data/assets/TypiObs/empty',
             dx=0.04,
@@ -247,7 +258,7 @@ def g1_pickup_task_config() -> config_dict.ConfigDict:
         madrona_backend=False,
         augment_pixels=False,
         num_envs=32768,
-        episode_length=500,
+        episode_length=200,
         action_repeat=1,
         wrap_env_fn=None,
         randomization_fn=domain_randomize_pickup,
@@ -308,7 +319,7 @@ class G1PickupEnv(G1CaTraEnv):
     """G1 humanoid reaching for and lifting a box from a support surface.
 
     Extends G1CaTraEnv with:
-    - 11-DOF action space (waist + arms only; legs held at default via PD)
+    - 17-DOF action space (sagittal-plane legs + waist + arms)
     - Compact pickup-specific observations (no HumanoidPF fields)
     - Pickup reward set: reach, lift, table_force, hold_stable, box_upright, upright
     - No gait clock, no push force, no command tracking
@@ -328,24 +339,25 @@ class G1PickupEnv(G1CaTraEnv):
         self._post_init_pickup()
 
     def _post_init_pickup(self) -> None:
-        """Override to 11-DOF action space (waist + arms) and cache pickup IDs."""
-        # 11-DOF action space: waist + arms only
+        """Override to 17-DOF action space and cache pickup IDs."""
+        # 17-DOF action space: sagittal-plane legs + waist + arms
         self.action_joint_names = PICKUP_ACTION_JOINT_NAMES.copy()
         self.action_joint_ids = jp.array([
             self.mj_model.actuator(name).id for name in self.action_joint_names
         ])
 
-        # Keep _default_qpos as 29-dim (all robot joints); legs receive their
-        # default values as PD targets every step, keeping them stationary.
+        # Keep _default_qpos as 29-dim (all robot joints); non-actuated joints
+        # still receive their default PD targets each step.
         # (Already set correctly by _post_init_catra.)
 
         # Body IDs for obs/reward
         self._pelvis_body_id = self._mj_model.body("pelvis").id
         self._box_geom_id = self._mj_model.geom(consts.BOX_GEOM).id
+        self._box_support_geom_id = self._mj_model.geom("box_support_col").id
 
     @property
     def action_size(self) -> int:
-        return len(self.action_joint_names)  # 11
+        return len(self.action_joint_names)  # 17
 
     def reset(self, rng: jax.Array) -> mjx_env.State:
         """Reset with 43-dim qpos; place box 0.4 m in front on support surface."""
@@ -375,10 +387,10 @@ class G1PickupEnv(G1CaTraEnv):
 
         data = mjx_env.init(self.mjx_model, qpos=qpos, qvel=qvel, ctrl=qpos[7:7 + NUM_ROBOT_JOINTS])
 
-        # --- Place box 0.4 m in front of robot on support surface ---
+        # --- Place box 3.0 m in front of robot on support surface ---
         w, x, y, z = qpos[3], qpos[4], qpos[5], qpos[6]
         forward_xy = jp.array([1 - 2 * (y ** 2 + z ** 2), 2 * (x * y + w * z)])
-        box_xy = qpos[:2] + 0.4 * forward_xy
+        box_xy = qpos[:2] + 3.0 * forward_xy
 
         # Random box yaw offset relative to robot forward (±10°)
         rng, key = jax.random.split(rng)
@@ -395,9 +407,10 @@ class G1PickupEnv(G1CaTraEnv):
             maxval=self._config.box_surface_height_range[1],
         )
 
-        # box half-z from current (DR'd) model
+        # Box/support half-z from current model.
         box_half_z = self.mjx_model.geom_size[self._box_geom_id][2]
-        box_z = surface_z + 0.01 + box_half_z  # platform half-z (0.01) + box half-z
+        support_half_z = self.mjx_model.geom_size[self._box_support_geom_id][2]
+        box_z = surface_z + support_half_z + box_half_z
 
         new_qpos = data.qpos.at[BOX_QPOS_START:BOX_QPOS_START + 3].set(
             jp.array([box_xy[0], box_xy[1], box_z])
@@ -441,12 +454,14 @@ class G1PickupEnv(G1CaTraEnv):
             "step": 0,
             "last_act": jp.zeros(self.action_size),
             "motor_targets": self._default_qpos.copy(),  # 29-dim; legs hold default
+            "last_joint_vel": np.zeros(NUM_ROBOT_JOINTS),
             "head_pos": head_pos.copy(),
             "last_left_hand_pos": left_hand_pos.copy(),
             "last_right_hand_pos": right_hand_pos.copy(),
             "kp_scale": kp_scale,
             "kd_scale": kd_scale,
             "surface_z": surface_z,
+            "support_half_z": support_half_z,
             "box_size": box_size,
             # Dummy fields required by pf_utils.py training wrapper (unused by pickup)
             "command": jp.zeros(4),
@@ -461,21 +476,24 @@ class G1PickupEnv(G1CaTraEnv):
         metrics = {}
         for k in self._config.reward_config.scales.keys():
             metrics[f"reward/{k}"] = jp.zeros(())
+        metrics["term/fall"] = jp.zeros(())
+        metrics["term/box_drop"] = jp.zeros(())
+        metrics["term/nan"] = jp.zeros(())
 
         obs = self._get_obs(data, info)
         reward, done = jp.zeros(2)
         return mjx_env.State(data, obs, reward, done, metrics, info)
 
     def step(self, state: mjx_env.State, action: jax.Array) -> mjx_env.State:
-        """Step with 11-DOF action; legs held at default via PD."""
-        # Update motor targets for controlled joints (waist + arms)
+        """Step with 17-DOF action; wrists and unused leg joints stay at default."""
+        # Update motor targets for controlled joints.
         lower_motor_targets = jp.clip(
             state.info["motor_targets"][self.action_joint_ids]
             + action * self._config.action_scale,
             self._soft_lowers[self.action_joint_ids],
             self._soft_uppers[self.action_joint_ids],
         )
-        motor_targets = self._default_qpos.copy()  # 29-dim: legs stay at default
+        motor_targets = self._default_qpos.copy()  # 29-dim: uncontrolled joints stay at default
         motor_targets = motor_targets.at[self.action_joint_ids].set(lower_motor_targets)
 
         # Physics step: torque_step_catra handles the extra box freejoint DOF
@@ -503,9 +521,10 @@ class G1PickupEnv(G1CaTraEnv):
         state.info["head_pos"] = head_pos
 
         obs = self._get_obs(data, state.info)
-        done = self._get_termination(data, state.info)
+        done, term_fall, term_box_drop, term_nan = self._get_termination(data, state.info)
+        feet_contact = jp.array([geoms_colliding(data, geom_id, self._floor_geom_id) for geom_id in self._feet_geom_id])
 
-        rewards = self._get_reward(data, action, state.info, done)
+        rewards = self._get_reward(data, action, state.info, done, feet_contact)
         rewards = {k: v * self._config.reward_config.scales[k] for k, v in rewards.items()}
         reward = jp.clip(sum(rewards.values()) * self.dt, 0.0, 10000.0)
 
@@ -513,6 +532,7 @@ class G1PickupEnv(G1CaTraEnv):
         state.info["last_left_hand_pos"] = left_hand_pos
         state.info["last_right_hand_pos"] = right_hand_pos
         state.info["last_act"] = action.copy()
+        state.info["last_joint_vel"] = data.qvel[6:6 + NUM_ROBOT_JOINTS].copy()
         state.info["step"] += 1
 
         timeout = state.info["step"] >= self._config.episode_length
@@ -521,22 +541,25 @@ class G1PickupEnv(G1CaTraEnv):
 
         for k, v in rewards.items():
             state.metrics[f"reward/{k}"] = v
+        state.metrics["term/fall"] = term_fall.astype(jp.float32)
+        state.metrics["term/box_drop"] = term_box_drop.astype(jp.float32)
+        state.metrics["term/nan"] = term_nan.astype(jp.float32)
 
         done = done.astype(reward.dtype)
         state = state.replace(data=data, obs=obs, reward=reward, done=done)
         return state
 
     def _get_obs(self, data: mjx.Data, info: dict[str, Any]) -> mjx_env.Observation:
-        """61-dim state (deployable, noisy) and 99-dim privileged_state (noiseless + extras).
+        """85-dim state (deployable, noisy) and 123-dim privileged_state (noiseless + extras).
 
-        State (61):
+        State (85):
             gyro_pelvis[+noise](3), gvec_pelvis[+noise](3),
-            joint_angles[+noise](11), joint_vel[+noise](11),
-            last_action(11), motor_targets(11),
+            joint_angles[+noise](17), joint_vel[+noise](17),
+            last_action(17), motor_targets(17),
             box_pos_local(3), box_quat_local(4), box_size(3), surface_z(1)
 
-        Privileged (99 = 61 noiseless + 38 extras):
-            [same 61 fields, noiseless]
+        Privileged (123 = 85 noiseless + 38 extras):
+            [same 85 fields, noiseless]
             + box_vel_local(3), box_angvel(3),
             + left_hand_pos(3), right_hand_pos(3), box_pos_world(3),
             + pelvis_pos(3), torso_pos(3), left_shld_pos(3), right_shld_pos(3), head_pos(3),
@@ -617,13 +640,14 @@ class G1PickupEnv(G1CaTraEnv):
             "privileged_state": jp.nan_to_num(privileged_state),
         }
 
-    def _get_termination(self, data: mjx.Data, info: dict[str, Any]) -> jax.Array:
-        """Terminate on robot fall, box drop, or NaN."""
+    def _get_termination(self, data: mjx.Data, info: dict[str, Any]):
+        """Terminate on robot fall, box drop, or NaN. Returns (done, fall, box_drop, nan_term)."""
         fall = self.get_gravity(data, "pelvis")[2] < 0.0
         fall |= info["head_pos"][2] < 0.5
         box_drop = data.xpos[self._box_body_id][2] < (info["surface_z"] - 0.1)
         nan_term = jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any()
-        return fall | box_drop | nan_term
+        # return fall | box_drop | nan_term
+        return fall | nan_term, fall, box_drop, nan_term
 
     def _get_reward(
             self,
@@ -631,25 +655,23 @@ class G1PickupEnv(G1CaTraEnv):
             action: jax.Array,
             info: dict[str, Any],
             done: jax.Array,
+            feet_contact: jax.Array,
     ) -> dict[str, jax.Array]:
-        """Pickup reward set: reach, lift, table_force, hold_stable, box_upright, upright, energy, smoothness, joint_limits."""
+        """Pickup reward set: reach, lift, hold_stable, box_upright, upright, foot stability, energy, smoothness, joint_limits."""
         box_pos = data.xpos[self._box_body_id]
         box_z = box_pos[2]
         box_half_z = info["box_size"][2]
+        box_half_y = info["box_size"][1]
 
         left_palm_pos = data.site_xpos[self._hands_site_id[0]]
         right_palm_pos = data.site_xpos[self._hands_site_id[1]]
 
-        # Reach: encourage hands to approach box center
-        reach = -(jp.linalg.norm(left_palm_pos - box_pos) + jp.linalg.norm(right_palm_pos - box_pos))
+        # Reach: encourage hands to approach the left/right box faces, not the center.
+        reach = -(jp.linalg.norm(left_palm_pos - box_pos) + jp.linalg.norm(right_palm_pos - box_pos)) + 2 * box_half_y
 
         # Lift: reward lifting above surface (0 when resting, 1.0 at +10cm)
-        lift_height = box_z - (info["surface_z"] + 0.01 + box_half_z)
+        lift_height = box_z - (info["surface_z"] + info["support_half_z"] + box_half_z)
         lift = jp.clip(lift_height, 0.0, 0.1) / 0.1
-
-        # Table force proxy: unclipped lift_height gives gradient even before liftoff
-        # negative when resting (hands not supporting), approaches 0 as hands bear weight
-        table_force = lift_height
 
         # Hold stable: penalize box tumbling
         box_angvel = data.qvel[BOX_QVEL_START + 3:BOX_QVEL_START + 6]
@@ -662,12 +684,24 @@ class G1PickupEnv(G1CaTraEnv):
         box_tilt_angle = jp.arccos(box_tilt_cos)
         box_upright = jp.exp(-box_tilt_angle ** 2)
 
-        # Robot upright: penalize roll/pitch via gravity vector in pelvis frame
-        gvec = data.site_xmat[self._pelvis_imu_site_id].T @ jp.array([0., 0., -1.])
-        upright = jp.exp(-jp.sum(gvec[:2] ** 2))
+        # Robot upright: penalize pelvis/torso roll and torso pitch at all times.
+        pelvis_rot = data.site_xmat[self._pelvis_imu_site_id].reshape(3, 3)
+        torso_rot = data.site_xmat[self._torso_imu_site_id].reshape(3, 3)
+        pelvis_rpy = jp.array(jaxlie.SO3.from_matrix(pelvis_rot).as_rpy_radians())
+        torso_rpy = jp.array(jaxlie.SO3.from_matrix(torso_rot).as_rpy_radians())
+        err_roll = jp.abs(pelvis_rpy[0]) + jp.abs(torso_rpy[0])
+        err_pitch = jp.abs(torso_rpy[1])
+        upright = jp.exp(-0.5 * (err_roll + err_pitch))
 
-        # Energy and smoothness
-        energy = -jp.sum(data.actuator_force ** 2)
+        # Pickup is a stationary task: both feet should stay planted on the floor.
+        stance_gait = jp.ones(2)
+        foot_contact_cost = self._cost_foot_contact(data, feet_contact, stance_gait, jp.array(1.0))
+        foot_slip_cost = self._cost_foot_slip(data, stance_gait)
+        straight_knee = self._cost_straight_knee(data.qpos[jp.array(self._knee_indices) + 7])
+
+        # Torque-effort and smoothness
+        joint_torque = self._cost_torque(data.actuator_force)
+        smoothness_joint = self._cost_smoothness_joint(data, info["last_joint_vel"])
         smoothness = -jp.sum((action - info["last_act"]) ** 2)
 
         # Joint limits (only robot joints; box freejoint has no meaningful range)
@@ -676,11 +710,14 @@ class G1PickupEnv(G1CaTraEnv):
         reward_dict = {
             "reach": reach,
             "lift": lift,
-            "table_force": table_force,
             "hold_stable": hold_stable,
             "box_upright": box_upright,
             "upright": upright,
-            "energy": energy,
+            "foot_contact": foot_contact_cost,
+            "foot_slip": foot_slip_cost,
+            "straight_knee": straight_knee,
+            "joint_torque": joint_torque,
+            "smoothness_joint": smoothness_joint,
             "smoothness": smoothness,
             "joint_limits": joint_limits,
         }
