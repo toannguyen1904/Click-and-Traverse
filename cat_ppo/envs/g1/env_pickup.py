@@ -238,7 +238,7 @@ def g1_pickup_task_config() -> config_dict.ConfigDict:
                 joint_torque=-1e-4,
                 smoothness_joint=-1e-6,
                 smoothness=1e-3,
-                joint_limits=1.0,
+                joint_limits=-1.0,
             ),
             base_height_target=0.75,
             foot_height_stance=0.0,
@@ -321,6 +321,8 @@ def g1_stand_task_config() -> config_dict.ConfigDict:
     cfg.env_config.num_obs = 54
     cfg.env_config.num_pri = 62
     cfg.env_config.num_act = 12
+    cfg.env_config.reward_config.scales.base_height = 1.0
+    cfg.env_config.reward_config.scales.foot_balance = -30.0
     return cfg
 
 
@@ -833,3 +835,49 @@ class G1StandEnv(G1PickupEnv):
             "state": jp.nan_to_num(state),
             "privileged_state": jp.nan_to_num(privileged_state),
         }
+
+    def _get_reward(
+            self,
+            data: mjx.Data,
+            action: jax.Array,
+            info: dict[str, Any],
+            done: jax.Array,
+            feet_contact: jax.Array,
+    ) -> dict[str, jax.Array]:
+        """Inherit all pickup rewards but replace `upright` with CAT's asymmetric formula.
+
+        Backward lean (torso_pitch < 0) is penalised twice — via the exponential and via
+        a linear subtraction — matching G1CatEnv._reward_orientation with idle_mask=1.
+        """
+        rewards = super()._get_reward(data, action, info, done, feet_contact)
+
+        pelvis_rot = data.site_xmat[self._pelvis_imu_site_id].reshape(3, 3)
+        torso_rot = data.site_xmat[self._torso_imu_site_id].reshape(3, 3)
+        pelvis_rpy = jp.array(jaxlie.SO3.from_matrix(pelvis_rot).as_rpy_radians())
+        torso_rpy = jp.array(jaxlie.SO3.from_matrix(torso_rot).as_rpy_radians())
+        err_roll = jp.abs(pelvis_rpy[0]) + jp.abs(torso_rpy[0])
+        err_pitch_back = jp.abs(jp.clip(torso_rpy[1], -jp.pi, 0.0))  # backward lean only
+        err_pitch_any = jp.abs(torso_rpy[1])                          # penalise all pitch (idle always)
+        upright = jp.exp(-0.5 * (err_roll + err_pitch_back + err_pitch_any)) - err_pitch_back
+        rewards["upright"] = jp.where(jp.isnan(upright), 0.0, upright)
+
+        # Base height: reward standing at target pelvis height (0.75m).
+        # move_flag=0: standing still always, so cap at 0.5 when above target (no bonus for extra height).
+        base_height = self._reward_base_height(data.qpos[2], jp.zeros(()))
+        rewards["base_height"] = jp.where(jp.isnan(base_height), 0.0, base_height)
+
+        # Foot balance: penalise pelvis COM drifting off-center between feet,
+        # and feet getting too close together (< 0.35 m) — both destabilise stance.
+        # Simplified from G1CatEnv._cost_foot_balance: no navigation frame, works in world XY.
+        pelvis_com_xy = data.subtree_com[self.body_id_pelvis][:2]
+        left_foot_xy = data.site_xpos[self._feet_site_id[0]][:2]
+        right_foot_xy = data.site_xpos[self._feet_site_id[1]][:2]
+        foot_center = left_foot_xy + right_foot_xy - 2 * pelvis_com_xy  # = (left-pelvis) + (right-pelvis)
+        centering_cost = jp.sum(jp.square(foot_center))
+        foot_pos = data.site_xpos[self._feet_site_id]
+        foot_dist = jp.linalg.norm(foot_pos[0] - foot_pos[1])
+        spread_penalty = jp.where(foot_dist < 0.35, (0.35 - foot_dist) * 10, 0.0)
+        foot_balance = centering_cost * (1 + spread_penalty)
+        rewards["foot_balance"] = jp.where(jp.isnan(foot_balance), 0.0, foot_balance)
+
+        return rewards
