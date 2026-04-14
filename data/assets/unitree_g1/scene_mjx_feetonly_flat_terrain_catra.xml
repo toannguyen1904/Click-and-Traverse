@@ -30,29 +30,31 @@
     </asset>
 
     <worldbody>
-        <geom name="floor" size="0 0 0.01" type="plane" material="groundplane"/>
-        <!-- Box body with freejoint; rests on box_support surface. Position set by env reset. -->
+        <geom name="floor" size="0 0 0.01" type="plane" material="groundplane" contype="5" conaffinity="5"/>
+        <!-- Box body with freejoint; rests on box_support surface. Position set by env reset.
+             contype=3 (bits 0+1): bit-0 -> robot contacts, bit-1 -> support contact. -->
         <body name="carried_box" pos="0.35 0 1.0">
             <freejoint name="box_joint"/>
             <geom name="box_geom" type="box" size="0.15 0.2 0.15"
-                  condim="4" friction="2.0 0.5 0.5"
+                  contype="3" conaffinity="3" condim="3" friction="2.0 0.5 0.5"
                   rgba="0.2 0.4 0.9 1" mass="1.5"/>
             <site name="box_center" pos="0 0 0" size="0.02"/>
         </body>
-        <!-- Fixed support surface: mocap body repositioned per-episode in env reset.
-             contype/conaffinity=0 so it only collides via the explicit pair below. -->
-        <body name="box_support" pos="0.35 0 0" mocap="true">
-            <geom name="box_support_col" type="box" size="0.25 0.25 0.01"
-                  contype="0" conaffinity="0"
-                  rgba="0.45 0.30 0.15 1.0"/>
+        <!-- Support surface: freejoint body (not mocap) so MJX contact detection works.
+             Repositioned via qpos in env reset; velocity zeroed each step to pin it.
+             mass=1000 makes it effectively immovable under box/robot contact forces.
+             contype=2/conaffinity=2 (bit-1 only): collides with box but not robot or floor. -->
+        <body name="box_support" pos="0.35 0 0.3">
+            <freejoint name="support_joint"/>
+            <geom name="box_support_col" type="box" size="0.2 0.25 0.3"
+                  contype="6" conaffinity="6" condim="3"
+                  mass="1000" rgba="0.45 0.30 0.15 1.0"/>
         </body>
     </worldbody>
 
     <contact>
-        <pair name="box_on_support" geom1="box_geom" geom2="box_support_col"
-              condim="4" friction="2.0 0.5 0.5"/>
-        <pair geom1="left_hand_collision"  geom2="box_geom" condim="4" friction="2.0 0.5 0.5"/>
-        <pair geom1="right_hand_collision" geom2="box_geom" condim="4" friction="2.0 0.5 0.5"/>
+        <pair geom1="left_hand_collision"  geom2="box_geom" condim="3" friction="2.0 0.5 0.5"/>
+        <pair geom1="right_hand_collision" geom2="box_geom" condim="3" friction="2.0 0.5 0.5"/>
     </contact>
 
 </mujoco>

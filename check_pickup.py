@@ -25,11 +25,10 @@ def main(args: Args):
     env = env_class(config=cfg.env_config)
     state = env.reset(surface_z=args.surface_z)
 
-    box_body_id = env.mj_model.body("carried_box").id
+    box_body_id     = env.mj_model.body("carried_box").id
     support_body_id = env.mj_model.body("box_support").id
-    mocap_id = env.mj_model.body_mocapid[support_body_id]
 
-    print(f"Surface z    : {env.mj_data.mocap_pos[mocap_id][2]:.3f} m")
+    print(f"Support z    : {env.mj_data.xpos[support_body_id][2]:.3f} m")
     print(f"Box z        : {env.mj_data.xpos[box_body_id][2]:.3f} m")
     print(f"Box position : {env.mj_data.xpos[box_body_id]}")
     print(f"Box size (half-extents): {env.mj_model.geom_size[env._box_geom_id]}")

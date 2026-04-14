@@ -2,7 +2,7 @@
 
 Phase 1 of the CaTra curriculum:
 - Robot stands in place but can crouch using sagittal-plane leg joints.
-- 17-DOF action space: hip pitch/knee/ankle pitch (6) + waist (3) + arms (8).
+- 23-DOF action space: all leg joints (12) + waist (3) + arms (8).
 - Box placed 0.4 m in front of robot on a support surface at random height.
 - Reward guides the robot to reach the box, reduce table contact force, and lift.
 - Terminal states feed into the CaTra traversal policy.
@@ -30,20 +30,27 @@ from cat_ppo.envs.g1 import constants as consts
 from cat_ppo.envs.g1.env_catra import (
     BOX_QPOS_START,
     BOX_QVEL_START,
+    SUPPORT_QPOS_START,
     NUM_ROBOT_JOINTS,
     G1CaTraEnv,
     domain_randomize_catra,
     torque_step_catra,
 )
 
-# 17-DOF action space: sagittal-plane leg joints (6) + waist (3) + arms (8).
+# 23-DOF action space: all leg joints (12) + waist (3) + arms (8).
 PICKUP_ACTION_JOINT_NAMES = [
     "left_hip_pitch_joint",
+    "left_hip_roll_joint",
+    "left_hip_yaw_joint",
     "left_knee_joint",
     "left_ankle_pitch_joint",
+    "left_ankle_roll_joint",
     "right_hip_pitch_joint",
+    "right_hip_roll_joint",
+    "right_hip_yaw_joint",
     "right_knee_joint",
     "right_ankle_pitch_joint",
+    "right_ankle_roll_joint",
     "waist_yaw_joint",
     "waist_roll_joint",
     "waist_pitch_joint",
@@ -112,13 +119,15 @@ def _make_domain_randomize_pickup():
                 + jax.random.uniform(key, shape=(NUM_ROBOT_JOINTS,), minval=-0.05, maxval=0.05)
             )
 
-            # Box size: sample per-env half-extents
+            # Box size: sample per-env half-extents for x, y, and z.
+            # reset() uses the nominal half_z (0.15 m, the XML max) to compute box_z, so
+            # DR'd boxes are always placed at or slightly above the pillar top — never embedded.
             rng, key = jax.random.split(rng)
-            box_half_x = jax.random.uniform(key, minval=0.10, maxval=0.20)
+            box_half_x = jax.random.uniform(key, minval=0.10, maxval=0.15)
             rng, key = jax.random.split(rng)
-            box_half_y = jax.random.uniform(key, minval=0.10, maxval=0.25)
+            box_half_y = jax.random.uniform(key, minval=0.10, maxval=0.20)
             rng, key = jax.random.split(rng)
-            box_half_z = jax.random.uniform(key, minval=0.10, maxval=0.20)
+            box_half_z = jax.random.uniform(key, minval=0.10, maxval=0.15)
             geom_size = model.geom_size.at[_box_geom_id].set(
                 jp.array([box_half_x, box_half_y, box_half_z])
             )
@@ -169,8 +178,8 @@ def g1_pickup_task_config() -> config_dict.ConfigDict:
     """Config for G1Pickup: stationary manipulation with crouching support.
 
     Observation dimensions:
-      num_obs = 85   (state, deployable)
-      num_pri = 123  (privileged_state)
+      num_obs = 108  (state, deployable)
+      num_pri = 147  (privileged_state)
     """
     env_config = config_dict.create(
         task_type="flat_terrain_catra",
@@ -179,9 +188,9 @@ def g1_pickup_task_config() -> config_dict.ConfigDict:
         episode_length=200,
         action_repeat=1,
         action_scale=0.5,
-        num_obs=85,
-        num_pri=123,
-        num_act=17,
+        num_obs=108,
+        num_pri=147,
+        num_act=23,
         soft_joint_pos_limit_factor=0.95,
         # Required by G1LocoEnv._post_init() — unused by G1PickupEnv which overrides reset/step
         history_len=15,
@@ -245,7 +254,7 @@ def g1_pickup_task_config() -> config_dict.ConfigDict:
             base_height_target=0.75,
             foot_height_stance=0.0,
         ),
-        box_surface_height_range=[0.4, 0.6],
+        box_surface_height_range=[0.3, 0.3],  # body centre=0.3m → pillar top at 0.6m
         pf_config=config_dict.create(
             path='data/assets/TypiObs/empty',
             dx=0.04,
@@ -338,7 +347,7 @@ class G1PickupEnv(G1CaTraEnv):
     """G1 humanoid reaching for and lifting a box from a support surface.
 
     Extends G1CaTraEnv with:
-    - 17-DOF action space (sagittal-plane legs + waist + arms)
+    - 23-DOF action space (all leg joints + waist + arms)
     - Compact pickup-specific observations (no HumanoidPF fields)
     - Pickup reward set: reach, lift, table_force, hold_stable, box_upright, upright
     - No gait clock, no push force, no command tracking
@@ -358,7 +367,7 @@ class G1PickupEnv(G1CaTraEnv):
         self._post_init_pickup()
 
     def _post_init_pickup(self) -> None:
-        """Override to 17-DOF action space and cache pickup IDs."""
+        """Override to 23-DOF action space and cache pickup IDs."""
         # 17-DOF action space: sagittal-plane legs + waist + arms
         self.action_joint_names = PICKUP_ACTION_JOINT_NAMES.copy()
         self.action_joint_ids = jp.array([
@@ -376,12 +385,12 @@ class G1PickupEnv(G1CaTraEnv):
 
     @property
     def action_size(self) -> int:
-        return len(self.action_joint_names)  # 17
+        return len(self.action_joint_names)  # 23
 
     def reset(self, rng: jax.Array) -> mjx_env.State:
-        """Reset with 43-dim qpos; place box 0.4 m in front on support surface."""
-        qpos = self._init_q.copy()  # (43,): robot default + box placeholder
-        qvel = jp.zeros(self.mjx_model.nv)  # (41,)
+        """Reset with 50-dim qpos; place box 3 m in front on support surface."""
+        qpos = self._init_q.copy()  # (50,): robot default + box + support placeholders
+        qvel = jp.zeros(self.mjx_model.nv)  # (47,)
 
         # Random root xy spawn (small offset)
         rng, key = jax.random.split(rng)
@@ -406,10 +415,10 @@ class G1PickupEnv(G1CaTraEnv):
 
         data = mjx_env.init(self.mjx_model, qpos=qpos, qvel=qvel, ctrl=qpos[7:7 + NUM_ROBOT_JOINTS])
 
-        # --- Place box 3.0 m in front of robot on support surface ---
+        # --- Place box 0.4 m in front of robot on support surface ---
         w, x, y, z = qpos[3], qpos[4], qpos[5], qpos[6]
         forward_xy = jp.array([1 - 2 * (y ** 2 + z ** 2), 2 * (x * y + w * z)])
-        box_xy = qpos[:2] + 3.0 * forward_xy
+        box_xy = qpos[:2] + 0.4 * forward_xy
 
         # Random box yaw offset relative to robot forward (±10°)
         rng, key = jax.random.split(rng)
@@ -437,11 +446,13 @@ class G1PickupEnv(G1CaTraEnv):
         new_qpos = new_qpos.at[BOX_QPOS_START + 3:BOX_QPOS_START + 7].set(box_quat)
         data = data.replace(qpos=new_qpos)
 
-        # Reposition support surface
-        new_mocap_pos = data.mocap_pos.at[self._box_support_mocap_id].set(
+        # Reposition support pillar via qpos (freejoint body, not mocap).
+        # Yaw matches box so the rectangular pillar faces the same direction.
+        new_qpos = data.qpos.at[SUPPORT_QPOS_START:SUPPORT_QPOS_START + 3].set(
             jp.array([box_xy[0], box_xy[1], surface_z])
         )
-        data = data.replace(mocap_pos=new_mocap_pos)
+        new_qpos = new_qpos.at[SUPPORT_QPOS_START + 3:SUPPORT_QPOS_START + 7].set(box_quat)
+        data = data.replace(qpos=new_qpos)
 
         data = mjx.forward(self.mjx_model, data)
 
@@ -465,8 +476,9 @@ class G1PickupEnv(G1CaTraEnv):
         right_hand_pos = data.site_xpos[self._hands_site_id[1]]
         head_pos = data.site_xpos[self._head_site_id]
 
-        # Box size from current (DR'd) model — stored in info so reward/obs can use it
+        # Box size and mass from current (DR'd) model — stored in info so reward/obs can use it
         box_size = self.mjx_model.geom_size[self._box_geom_id]  # (3,) half-extents
+        box_mass = self.mjx_model.body_mass[self._box_body_id]  # scalar
 
         info = {
             "rng": rng,
@@ -482,6 +494,7 @@ class G1PickupEnv(G1CaTraEnv):
             "surface_z": surface_z,
             "support_half_z": support_half_z,
             "box_size": box_size,
+            "box_mass": box_mass,
             # Dummy fields required by pf_utils.py training wrapper (unused by pickup)
             "command": jp.zeros(4),
             "last_command": jp.zeros(4),
@@ -572,14 +585,14 @@ class G1PickupEnv(G1CaTraEnv):
     def _get_obs(self, data: mjx.Data, info: dict[str, Any]) -> mjx_env.Observation:
         """85-dim state (deployable, noisy) and 123-dim privileged_state (noiseless + extras).
 
-        State (85):
+        State (108):
             gyro_pelvis[+noise](3), gvec_pelvis[+noise](3),
-            joint_angles[+noise](17), joint_vel[+noise](17),
-            last_action(17), motor_targets(17),
-            box_pos_local(3), box_quat_local(4), box_size(3), surface_z(1)
+            joint_angles[+noise](23), joint_vel[+noise](23),
+            last_action(23), motor_targets(23),
+            box_pos_local(3), box_quat_local(4), box_size(3)
 
-        Privileged (123 = 85 noiseless + 38 extras):
-            [same 85 fields, noiseless]
+        Privileged (147 = 108 noiseless + 39 extras):
+            [same 108 fields, noiseless]
             + box_vel_local(3), box_angvel(3),
             + left_hand_pos(3), right_hand_pos(3), box_pos_world(3),
             + pelvis_pos(3), torso_pos(3), left_shld_pos(3), right_shld_pos(3), head_pos(3),
@@ -603,7 +616,6 @@ class G1PickupEnv(G1CaTraEnv):
         box_quat_local = math.quat_mul(pelvis_xquat_conj, box_quat_world)
 
         box_size = info["box_size"]
-        surface_z = info["surface_z"]
 
         # --- Privileged extras ---
         box_vel_local = pelvis_rot.T @ data.qvel[BOX_QVEL_START:BOX_QVEL_START + 3]
@@ -626,7 +638,7 @@ class G1PickupEnv(G1CaTraEnv):
             info["last_act"],
             info["motor_targets"][self.action_joint_ids],
             box_pos_local, box_quat_local, box_size,
-            surface_z.reshape(1),
+            info["box_mass"].reshape(1),
             # Privileged-only extras
             box_vel_local, box_angvel,
             left_hand_pos, right_hand_pos, box_pos_world,
@@ -652,7 +664,6 @@ class G1PickupEnv(G1CaTraEnv):
             info["last_act"],
             info["motor_targets"][self.action_joint_ids],
             box_pos_local, box_quat_local, box_size,
-            surface_z.reshape(1),
         ])
 
         return {
@@ -666,8 +677,7 @@ class G1PickupEnv(G1CaTraEnv):
         fall |= info["head_pos"][2] < 0.5
         box_drop = data.xpos[self._box_body_id][2] < (info["surface_z"] - 0.1)
         nan_term = jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any()
-        # return fall | box_drop | nan_term
-        return fall | nan_term, fall, box_drop, nan_term
+        return fall | box_drop | nan_term, fall, box_drop, nan_term
 
     def _get_reward(
             self,

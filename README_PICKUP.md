@@ -12,25 +12,31 @@ This is **Phase 1** of a two-phase curriculum. The pickup policy produces divers
 |----------|-------|
 | Robot | Unitree G1 humanoid |
 | Task | Reach, grasp, and lift a box from a support surface |
-| Action space | 17 DOF (hip pitch/knee/ankle pitch × 2 + waist × 3 + arms × 8) |
-| Legs | Sagittal-plane joints actuated; leg roll/yaw joints stay at default pose |
+| Action space | 23 DOF (all leg joints × 2 + waist × 3 + arms × 8) |
+| Legs | All 12 leg joints actuated (hip pitch/roll/yaw, knee, ankle pitch/roll × 2) |
 | Episode length | 200 steps (4 s at 50 Hz) |
-| Box placement | 3.0 m in front of robot, on a support surface at random height |
-| Success criterion | Box lifted ≥ 10 cm above the support surface |
+| Box placement | 0.4 m in front of robot, on a support pillar (0.4 × 0.5 m top, 0.6 m tall) |
+| Success criterion | Box lifted ≥ 10 cm above the support pillar top |
 
 ---
 
 ## Action Space
 
-The robot controls **17 joints** via PD position targets (delta from current target):
+The robot controls **23 joints** via PD position targets (delta from current target):
 
 ```
 left_hip_pitch_joint
+left_hip_roll_joint
+left_hip_yaw_joint
 left_knee_joint
 left_ankle_pitch_joint
+left_ankle_roll_joint
 right_hip_pitch_joint
+right_hip_roll_joint
+right_hip_yaw_joint
 right_knee_joint
 right_ankle_pitch_joint
+right_ankle_roll_joint
 waist_yaw_joint
 waist_roll_joint
 waist_pitch_joint
@@ -44,13 +50,13 @@ right_shoulder_yaw_joint
 right_elbow_joint
 ```
 
-Leg roll/yaw joints and wrist joints are **not actuated** — the PD controller holds them at their default pose. The sagittal-plane leg joints are controllable so the robot can crouch while staying more upright. Action scale: `0.5`.
+Wrist joints are **not actuated** — the PD controller holds them at their default pose. Action scale: `0.5`.
 
 ---
 
 ## Observation Space
 
-### State (85-dim) — deployable on real robot
+### State (108-dim) — deployable on real robot
 
 All sensor readings include realistic noise to match real deployment conditions.
 
@@ -58,17 +64,16 @@ All sensor readings include realistic noise to match real deployment conditions.
 |-------|------|-------|
 | `gyro_pelvis` | 3 | Angular velocity from pelvis IMU `[+ noise]` |
 | `gvec_pelvis` | 3 | Gravity direction in pelvis frame `[+ noise]` |
-| `joint_angles` | 17 | Controlled joint positions (legs + waist + arms, relative to default) `[+ noise]` |
-| `joint_vel` | 17 | Controlled joint velocities `[+ noise]` |
-| `last_action` | 17 | Previous policy output |
-| `motor_targets` | 17 | Current PD targets for controlled joints |
+| `joint_angles` | 23 | Controlled joint positions (legs + waist + arms, relative to default) `[+ noise]` |
+| `joint_vel` | 23 | Controlled joint velocities `[+ noise]` |
+| `last_action` | 23 | Previous policy output |
+| `motor_targets` | 23 | Current PD targets for controlled joints |
 | `box_pos_local` | 3 | Box center position in pelvis frame |
 | `box_quat_local` | 4 | Box orientation in pelvis frame (wxyz) |
 | `box_size` | 3 | Box half-extents (l, w, h) — pre-determined at deployment |
-| `surface_z` | 1 | Support surface height — pre-determined at deployment |
-| **Total** | **85** | |
+| **Total** | **108** | |
 
-### Privileged State (123-dim) — critic only during training
+### Privileged State (147-dim) — critic only during training
 
 Built from scratch with **noiseless** sensor readings. The critic sees clean versions of all noisy state fields, plus additional privileged quantities not available at deployment.
 
@@ -76,14 +81,14 @@ Built from scratch with **noiseless** sensor readings. The critic sees clean ver
 |-------|------|-------|
 | `gyro_pelvis` | 3 | Noiseless |
 | `gvec_pelvis` | 3 | Noiseless |
-| `joint_angles` | 17 | Noiseless |
-| `joint_vel` | 17 | Noiseless |
-| `last_action` | 17 | Same as state |
-| `motor_targets` | 17 | Same as state |
+| `joint_angles` | 23 | Noiseless |
+| `joint_vel` | 23 | Noiseless |
+| `last_action` | 23 | Same as state |
+| `motor_targets` | 23 | Same as state |
 | `box_pos_local` | 3 | Same as state |
 | `box_quat_local` | 4 | Same as state |
 | `box_size` | 3 | Same as state |
-| `surface_z` | 1 | Same as state |
+| `box_mass` | 1 | Box mass (DR'd per environment, U[1, 2] kg) |
 | `box_vel_local` | 3 | Box linear velocity in pelvis frame |
 | `box_angvel` | 3 | Box angular velocity (world frame) |
 | `left_hand_pos` | 3 | Absolute left palm position |
@@ -98,7 +103,7 @@ Built from scratch with **noiseless** sensor readings. The critic sees clean ver
 | `right_hand_vel` | 3 | Right palm linear velocity |
 | `kp_scale` | 1 | PD gain DR scalar |
 | `kd_scale` | 1 | PD gain DR scalar |
-| **Total** | **123** | 85 state (noiseless) + 38 privileged-only |
+| **Total** | **147** | 108 state (noiseless) + 39 privileged-only |
 
 ---
 
@@ -142,7 +147,7 @@ All rewards are multiplied by `dt` and clipped to `[0, 10000]`.
 |-----------|-----------|
 | Robot fall (gravity vector) | `gvec_z < 0` |
 | Robot fall (head height) | `head_z < 0.5 m` |
-| Box dropped to floor (actually not terminating the episode but tracked) | `box_z < surface_z − 0.1 m` |
+| Box dropped to floor | `box_z < surface_z − 0.1 m` |
 | NaN in qpos or qvel | any |
 | Episode timeout | 200 steps (4 s) |
 
@@ -157,8 +162,10 @@ All rewards are multiplied by `dt` and clipped to `[0, 10000]`.
 | Robot spawn XY | `U[−1, 1]` m offset | Flat terrain |
 | Robot initial yaw | `U[−90°, 90°]` | Facing generally toward ±X |
 | Robot joint init | `U[0.5, 1.5] × default`, clipped to soft limits | Covers a range of initial arm poses |
+| Box XY position | 0.4 m in front of robot along its forward direction | Deterministic; robot XY/yaw spawn adds implicit variety |
 | Box yaw offset | `U[−10°, 10°]` | Relative to robot forward direction |
-| Support surface height | `U[0.4, 0.6]` m | Center z of the support platform |
+| Support pillar top height | Fixed at 0.6 m (body-center z = 0.3 m) | Pillar extends from floor; height randomization planned for curriculum later |
+| Support pillar yaw | Same as box yaw | Rectangular pillar (0.4 × 0.5 m) faces same direction as box |
 
 ### Per-environment (domain randomization via `domain_randomize_pickup`)
 
@@ -170,9 +177,9 @@ All rewards are multiplied by `dt` and clipped to `[0, 10000]`.
 | All body masses | `U[0.9, 1.1] × nominal` | Global scale |
 | Torso mass perturbation | `U[−1, 1]` kg additive | Additional torso mass noise |
 | qpos0 perturbation | `U[−0.05, 0.05]` per joint | Shifts nominal pose |
-| Box half-size x | `U[0.10, 0.20]` m | Per-environment |
-| Box half-size y | `U[0.10, 0.25]` m | Per-environment |
-| Box half-size z | `U[0.10, 0.20]` m | Per-environment |
+| Box half-size x | `U[0.10, 0.15]` m | Per-environment |
+| Box half-size y | `U[0.10, 0.20]` m | Per-environment |
+| Box half-size z | `U[0.10, 0.15]` m | Per-environment; reset uses nominal 0.15 m for placement (box starts at or above pillar top) |
 | Box mass | `U[1.0, 2.0]` kg | Per-environment |
 | KP scale | `U[0.75, 1.25]` | PD gain randomization |
 | KD scale | `U[0.75, 1.25]` | PD gain randomization |
@@ -193,12 +200,18 @@ MjxEnv (mujoco_playground)
                       └─ G1PickupEnv   ← this task
 ```
 
-`G1PickupEnv` overrides `reset`, `step`, `_get_obs`, `_get_reward`, and `_get_termination`. It reuses the CaTra scene XML (box freejoint + mocap support surface) but disables gait clock, push forces, and command tracking. The training scene includes explicit `<pair>` contacts for `left_hand_collision ↔ box_geom` and `right_hand_collision ↔ box_geom` so hands physically interact with the box during training.
+`G1PickupEnv` overrides `reset`, `step`, `_get_obs`, `_get_reward`, and `_get_termination`. It reuses the CaTra scene XML (box freejoint + support pillar freejoint) but disables gait clock, push forces, and command tracking. The training scene uses `condim=3` contacts: `left_hand_collision ↔ box_geom` and `right_hand_collision ↔ box_geom` explicit pairs so hands physically interact with the box, and box↔pillar contact via `contype/conaffinity` bit masking so MJX broadphase handles it correctly (explicit pairs with mocap bodies are not processed by MJX).
 
 ### Key Implementation Details
 
-- **Partial leg control**: Hip pitch, knee, and ankle pitch are included in `action_joint_ids` so the robot can crouch. The remaining leg joints and wrists still receive `_default_qpos` targets each step.
-- **Box freejoint**: Adding the box freejoint extends qpos from 36 → 43 and qvel from 35 → 41. `torque_step_catra` slices only `[7:36]` / `[6:35]` to avoid shape mismatch.
+- **Full leg control**: All 12 leg joints are included in `action_joint_ids`. Wrist joints still receive `_default_qpos` targets each step.
+- **qpos/qvel layout**: Two freejoints extend the state beyond the 36-dim robot qpos:
+  ```
+  qpos: [0:7] root | [7:36] robot joints (29) | [36:43] box freejoint | [43:50] support freejoint
+  qvel: [0:6] root | [6:35] robot joints (29) | [35:41] box vel       | [41:47] support vel
+  ```
+  `torque_step_catra` slices only `[7:36]` / `[6:35]` so the extra DOFs don't interfere.
+- **Support pillar**: The support body has a freejoint (not mocap) so MJX contact detection works. Its position and yaw are set in `reset()` via `qpos[43:50]`; yaw matches the box so the rectangular face (0.4 × 0.5 m, half-extents 0.2 × 0.25) is aligned with the box sides. With `mass=1000 kg` it is effectively immovable. Contact bit scheme: pillar `contype=6/conaffinity=6` (bits 1+2), box `contype=3/conaffinity=3` (bits 0+1), floor `contype=5/conaffinity=5` (bits 0+2) — pillar sits on floor (bit 2) and supports the box (bit 1) without colliding with the robot (bit 0 only).
 - **Box size in DR**: `domain_randomize_pickup` modifies `model.geom_size[box_geom_id]` per-environment via JAX vmap, so each parallel environment sees a different box.
 - **Noisy vs noiseless obs**: State uses per-step noise injection on gyro, gravity, joint_angles, joint_vel. Privileged state is built independently with raw sensor values.
 
@@ -209,8 +222,10 @@ MjxEnv (mujoco_playground)
 | [cat_ppo/envs/g1/env_pickup.py](cat_ppo/envs/g1/env_pickup.py) | Main environment, config, DR function |
 | [cat_ppo/envs/g1/play_pickup.py](cat_ppo/envs/g1/play_pickup.py) | CPU inference env for ONNX playback |
 | [train_ppo_pickup.py](train_ppo_pickup.py) | Training entry point |
-| [check_pickup.py](check_pickup.py) | Episode visualization script |
-| [data/assets/unitree_g1/scene_mjx_feetonly_flat_terrain_catra.xml](data/assets/unitree_g1/scene_mjx_feetonly_flat_terrain_catra.xml) | Scene XML (shared with CaTra) |
+| [check_pickup.py](check_pickup.py) | CPU-based visualization (static initial state via play env) |
+| [check_pickup_mjx.py](check_pickup_mjx.py) | MJX-based live physics visualization (zero-action rollout) |
+| [data/assets/unitree_g1/scene_mjx_feetonly_flat_terrain_catra.xml](data/assets/unitree_g1/scene_mjx_feetonly_flat_terrain_catra.xml) | Scene XML used by MJX training env |
+| [data/assets/unitree_g1/scene_mjx_feetonly_mesh_catra.xml](data/assets/unitree_g1/scene_mjx_feetonly_mesh_catra.xml) | Scene XML used by CPU play/eval env |
 
 ---
 
@@ -226,8 +241,13 @@ python -m cat_ppo.utils.mj_playground_init
 ### Visualize an Episode
 
 ```bash
-python check_pickup.py                    # random surface height
-python check_pickup.py --surface_z 0.6   # fixed surface height at 0.6 m
+# CPU-based (static initial pose, no physics stepping):
+python check_pickup.py
+
+# MJX-based (live physics, zero-action rollout):
+python check_pickup_mjx.py
+python check_pickup_mjx.py --task G1Stand
+python check_pickup_mjx.py --seed 5
 ```
 
 ### Train

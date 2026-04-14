@@ -44,11 +44,12 @@ import jaxlie
 # Number of robot joints (excluding root freejoint and box freejoint)
 NUM_ROBOT_JOINTS = 29
 
-# Box freejoint qpos adds 7 elements after the robot joints.
-# qpos layout: [0:7] root freejoint, [7:36] robot joints, [36:43] box freejoint
-# qvel layout: [0:6] root vel, [6:35] robot joints vel, [35:41] box vel
-BOX_QPOS_START = 7 + NUM_ROBOT_JOINTS   # 36
-BOX_QVEL_START = 6 + NUM_ROBOT_JOINTS   # 35
+# qpos layout: [0:7] root, [7:36] robot joints, [36:43] box freejoint, [43:50] support freejoint
+# qvel layout: [0:6] root, [6:35] robot joints,  [35:41] box vel,       [41:47] support vel
+BOX_QPOS_START     = 7 + NUM_ROBOT_JOINTS   # 36
+BOX_QVEL_START     = 6 + NUM_ROBOT_JOINTS   # 35
+SUPPORT_QPOS_START = BOX_QPOS_START + 7     # 43
+SUPPORT_QVEL_START = BOX_QVEL_START + 6     # 41
 
 
 def torque_step_catra(
@@ -380,18 +381,15 @@ class G1CaTraEnv(G1CatEnv):
         # Carrying pose: DEFAULT_QPOS_CATRA[7:36] = robot joints (29-dim)
         self._default_qpos = jp.array(consts.DEFAULT_QPOS_CATRA[7:7 + NUM_ROBOT_JOINTS])
 
-        # Extended init_q: robot (36-dim) + box freejoint (7-dim = pos + quat)
-        # Box starts at a placeholder position; reset() places it on the support surface.
-        box_default = np.array([0.35, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-        self._init_q = jp.array(np.concatenate([consts.DEFAULT_QPOS_CATRA, box_default]))
+        # Extended init_q: robot (36) + box freejoint (7) + support freejoint (7) = 50-dim
+        # Both box and support start at placeholders; reset() places them correctly.
+        box_default     = np.array([0.35, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        support_default = np.array([0.35, 0.0, 0.5, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        self._init_q = jp.array(np.concatenate([consts.DEFAULT_QPOS_CATRA, box_default, support_default]))
 
         # Box identifiers
         self._box_site_id = self._mj_model.site(consts.BOX_SITE).id
         self._box_body_id = self._mj_model.body("carried_box").id
-
-        # Support surface mocap body (repositioned in reset to random height under the box)
-        support_body_id = self._mj_model.body("box_support").id
-        self._box_support_mocap_id = int(self._mj_model.body_mocapid[support_body_id])
 
 
 
@@ -400,9 +398,9 @@ class G1CaTraEnv(G1CatEnv):
         return len(self.action_joint_names)  # 23
 
     def reset(self, rng: jax.Array) -> mjx_env.State:
-        """Reset with 43-dim qpos (robot 36 + box 7) and initialize box PF fields."""
-        qpos = self._init_q.copy()                              # (43,)
-        qvel = jp.zeros(self.mjx_model.nv)                      # (41,) = 6+29+6
+        """Reset with 50-dim qpos (robot 36 + box 7 + support 7) and initialize box PF fields."""
+        qpos = self._init_q.copy()                              # (50,)
+        qvel = jp.zeros(self.mjx_model.nv)                      # (47,) = 6+29+6+6
 
         # Random spawn xy
         rng, key = jax.random.split(rng)
@@ -444,7 +442,8 @@ class G1CaTraEnv(G1CatEnv):
             minval=self._config.box_surface_height_range[0],
             maxval=self._config.box_surface_height_range[1],
         )
-        box_z = surface_z + 0.01 + 0.15   # platform half-z + box half-z
+        support_half_z = self.mjx_model.geom_size[self._mj_model.geom("box_support_col").id][2]
+        box_z = surface_z + support_half_z + 0.15   # support_half_z + nominal box half-z
 
         new_qpos = data.qpos.at[BOX_QPOS_START:BOX_QPOS_START + 3].set(
             jp.array([box_xy[0], box_xy[1], box_z])
@@ -453,11 +452,13 @@ class G1CaTraEnv(G1CatEnv):
         new_qpos = new_qpos.at[BOX_QPOS_START + 4:BOX_QPOS_START + 7].set(0.0)  # quat xyz
         data = data.replace(qpos=new_qpos)
 
-        # Reposition support surface under the box
-        new_mocap_pos = data.mocap_pos.at[self._box_support_mocap_id].set(
+        # Reposition support surface under the box via qpos (freejoint, not mocap)
+        new_qpos = data.qpos.at[SUPPORT_QPOS_START:SUPPORT_QPOS_START + 3].set(
             jp.array([box_xy[0], box_xy[1], surface_z])
         )
-        data = data.replace(mocap_pos=new_mocap_pos)
+        new_qpos = new_qpos.at[SUPPORT_QPOS_START + 3].set(1.0)            # quat w
+        new_qpos = new_qpos.at[SUPPORT_QPOS_START + 4:SUPPORT_QPOS_START + 7].set(0.0)
+        data = data.replace(qpos=new_qpos)
 
         data = mjx.forward(self.mjx_model, data)
 

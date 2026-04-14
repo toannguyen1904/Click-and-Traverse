@@ -14,6 +14,7 @@ from scipy.spatial.transform import Rotation as R
 import cat_ppo
 from cat_ppo.envs.g1 import constants as consts
 from cat_ppo.envs.g1.env_pickup import PICKUP_ACTION_JOINT_NAMES, STAND_ACTION_JOINT_NAMES
+from cat_ppo.envs.g1.env_catra import SUPPORT_QPOS_START
 from cat_ppo.envs.g1.play_cat import BaseEnv, State, set_scene_for_xml
 
 # qpos layout: [0:7] root | [7:36] robot | [36:43] box freejoint
@@ -24,7 +25,7 @@ NUM_ROBOT_JOINTS = 29
 
 @cat_ppo.registry.register("G1Pickup", "play_env_class")
 class PlayG1PickupEnv(BaseEnv):
-    """CPU inference env for G1Pickup. 17-DOF action, compact obs."""
+    """CPU inference env for G1Pickup. 23-DOF action, compact obs."""
 
     def __init__(
         self,
@@ -70,8 +71,6 @@ class PlayG1PickupEnv(BaseEnv):
         self._box_body_id = self.mj_model.body("carried_box").id
         self._box_geom_id = self.mj_model.geom("box_geom").id
         self._box_support_geom_id = self.mj_model.geom("box_support_col").id
-        support_body_id = self.mj_model.body("box_support").id
-        self._box_support_mocap_id = int(self.mj_model.body_mocapid[support_body_id])
 
         lowers, uppers = self.mj_model.jnt_range[1:1 + NUM_ROBOT_JOINTS].T
         c = (lowers + uppers) / 2
@@ -101,19 +100,22 @@ class PlayG1PickupEnv(BaseEnv):
         support_half_z = float(self.mj_model.geom_size[self._box_support_geom_id][2])
         box_z = surface_z + support_half_z + box_half_z
 
-        # Place box 3.0 m in front of robot (default yaw = 0, so forward = +x)
+        # Place box 0.4 m in front of robot
         root_qpos = qpos[:7]
         w, x, y, z = root_qpos[3], root_qpos[4], root_qpos[5], root_qpos[6]
         forward_xy = np.array([1 - 2 * (y ** 2 + z ** 2), 2 * (x * y + w * z)])
-        box_xy = root_qpos[:2] + 3.0 * forward_xy
+        box_xy = root_qpos[:2] + 0.4 * forward_xy
 
-        # Set box position and identity orientation
+        # Box yaw = identity (no offset) for play env; pillar matches
+        box_quat = np.array([1.0, 0.0, 0.0, 0.0])
+
+        # Set box position and orientation
         self.mj_data.qpos[BOX_QPOS_START:BOX_QPOS_START + 3] = [box_xy[0], box_xy[1], box_z]
-        self.mj_data.qpos[BOX_QPOS_START + 3] = 1.0
-        self.mj_data.qpos[BOX_QPOS_START + 4:BOX_QPOS_START + 7] = 0.0
+        self.mj_data.qpos[BOX_QPOS_START + 3:BOX_QPOS_START + 7] = box_quat
 
-        # Position support surface
-        self.mj_data.mocap_pos[self._box_support_mocap_id] = [box_xy[0], box_xy[1], surface_z]
+        # Position support pillar via qpos; yaw matches box
+        self.mj_data.qpos[SUPPORT_QPOS_START:SUPPORT_QPOS_START + 3] = [box_xy[0], box_xy[1], surface_z]
+        self.mj_data.qpos[SUPPORT_QPOS_START + 3:SUPPORT_QPOS_START + 7] = box_quat
 
         mujoco.mj_forward(self.mj_model, self.mj_data)
         if not self.headless:
@@ -174,7 +176,7 @@ class PlayG1PickupEnv(BaseEnv):
         return State(state.info, obs)
 
     def get_obs(self, info: dict) -> dict:
-        """Build 85-dim deployable state with sensor noise (matches G1PickupEnv._get_obs)."""
+        """Build 108-dim deployable state with sensor noise (matches G1PickupEnv._get_obs)."""
         nl = self._config.noise_config.level
         ns = self._config.noise_config.scales
 
@@ -202,7 +204,6 @@ class PlayG1PickupEnv(BaseEnv):
         box_quat_local = _quat_mul(pelvis_conj, box_xquat_world)
 
         box_size = info["box_size"]
-        surface_z = info["surface_z"]
 
         ids = self.action_joint_ids
         state = np.concatenate([
@@ -212,7 +213,6 @@ class PlayG1PickupEnv(BaseEnv):
             info["last_act"],
             info["motor_targets"][ids],
             box_pos_local, box_quat_local, box_size,
-            [surface_z],
         ])
         return {"state": np.nan_to_num(state)}
 
@@ -240,8 +240,6 @@ class PlayG1StandEnv(PlayG1PickupEnv):
         self._head_site_id = self.mj_model.site("head").id
         self._box_geom_id = self.mj_model.geom("box_geom").id
         self._box_support_geom_id = self.mj_model.geom("box_support_col").id
-        support_body_id = self.mj_model.body("box_support").id
-        self._box_support_mocap_id = int(self.mj_model.body_mocapid[support_body_id])
 
         lowers, uppers = self.mj_model.jnt_range[1:1 + NUM_ROBOT_JOINTS].T
         c = (lowers + uppers) / 2
@@ -266,11 +264,12 @@ class PlayG1StandEnv(PlayG1PickupEnv):
         root_qpos = qpos[:7]
         w, x, y, z = root_qpos[3], root_qpos[4], root_qpos[5], root_qpos[6]
         forward_xy = np.array([1 - 2 * (y ** 2 + z ** 2), 2 * (x * y + w * z)])
-        box_xy = root_qpos[:2] + 3.0 * forward_xy
+        box_xy = root_qpos[:2] + 0.4 * forward_xy
+        box_quat = np.array([1.0, 0.0, 0.0, 0.0])
         self.mj_data.qpos[BOX_QPOS_START:BOX_QPOS_START + 3] = [box_xy[0], box_xy[1], box_z]
-        self.mj_data.qpos[BOX_QPOS_START + 3] = 1.0
-        self.mj_data.qpos[BOX_QPOS_START + 4:BOX_QPOS_START + 7] = 0.0
-        self.mj_data.mocap_pos[self._box_support_mocap_id] = [box_xy[0], box_xy[1], surface_z]
+        self.mj_data.qpos[BOX_QPOS_START + 3:BOX_QPOS_START + 7] = box_quat
+        self.mj_data.qpos[SUPPORT_QPOS_START:SUPPORT_QPOS_START + 3] = [box_xy[0], box_xy[1], surface_z]
+        self.mj_data.qpos[SUPPORT_QPOS_START + 3:SUPPORT_QPOS_START + 7] = box_quat
 
         mujoco.mj_forward(self.mj_model, self.mj_data)
         if not self.headless:

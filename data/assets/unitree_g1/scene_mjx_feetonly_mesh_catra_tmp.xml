@@ -35,24 +35,24 @@
         <body name="scene" pos="-0.5 -1.0 0">
             <geom type="mesh" mesh="scene_mesh" rgba="0.7 0.7 0.7 1" contype="1" conaffinity="1" material="mat_brick_cube" />
         </body>
-        <geom name="floor" size="0 0 0.01" type="plane" material="groundplane" />
+        <geom name="floor" size="0 0 0.01" type="plane" material="groundplane" contype="5" conaffinity="5" />
         
         <body name="carried_box" pos="0.35 0 1.0">
             <freejoint name="box_joint" />
-            <geom name="box_geom" type="box" size="0.15 0.2 0.15" condim="4" friction="2.0 0.5 0.5" rgba="0.2 0.4 0.9 1" mass="1.5" />
+            <geom name="box_geom" type="box" size="0.15 0.2 0.15" contype="3" conaffinity="3" condim="3" friction="2.0 0.5 0.5" rgba="0.2 0.4 0.9 1" mass="1.5" />
             <site name="box_center" pos="0 0 0" size="0.02" />
         </body>
         
-        <body name="box_support" pos="0.35 0 0" mocap="true">
-            <geom name="box_support_col" type="box" size="0.25 0.25 0.01" contype="0" conaffinity="0" rgba="0.45 0.30 0.15 1.0" />
+        <body name="box_support" pos="0.35 0 0.3">
+            <freejoint name="support_joint" />
+            <geom name="box_support_col" type="box" size="0.2 0.25 0.3" contype="6" conaffinity="6" condim="3" mass="1000" rgba="0.45 0.30 0.15 1.0" />
         </body>
     </worldbody>
 
     <contact>
-        <pair name="box_on_support" geom1="box_geom" geom2="box_support_col" condim="4" friction="2.0 0.5 0.5" />
         
-        <pair geom1="left_hand_collision" geom2="box_geom" condim="4" friction="0.5 0.5 0.5" />
-        <pair geom1="right_hand_collision" geom2="box_geom" condim="4" friction="0.5 0.5 0.5" />
+        <pair geom1="left_hand_collision" geom2="box_geom" condim="3" friction="0.5 0.5 0.5" />
+        <pair geom1="right_hand_collision" geom2="box_geom" condim="3" friction="0.5 0.5 0.5" />
         <pair geom1="torso_collision" geom2="box_geom" condim="3" friction="0.5 0.5" />
         <pair geom1="pelvis_collision" geom2="box_geom" condim="3" friction="0.5 0.5" />
         
