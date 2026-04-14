@@ -104,7 +104,7 @@ Built from scratch with **noiseless** sensor readings. The critic sees clean ver
 
 ## Reward Design
 
-All rewards are multiplied by `dt` and clipped to `[0, 10000]`. Box-rerlated rewards'scales are actually set to 0 to test the standing policy.
+All rewards are multiplied by `dt` and clipped to `[0, 10000]`.
 
 | Term | Formula | Scale | Purpose |
 |------|---------|-------|---------|
@@ -112,20 +112,24 @@ All rewards are multiplied by `dt` and clipped to `[0, 10000]`. Box-rerlated rew
 | `lift` | `clip(box_z − surface_z − support_half_z − half_z, 0, 0.1) / 0.1` | 5.0 | Reward liftoff; saturates at +10 cm |
 | `hold_stable` | `−‖box_angvel‖` | 0.1 | Penalize box tumbling |
 | `box_upright` | `exp(−θ²)` where θ = box tilt angle | 1.0 | Keep box vertical; ensures good handoff state for traversal phase |
-| `upright` | `exp(−0.5(|roll_pelvis| + |roll_torso| + |pitch_torso|))` | 1.0 | Keep pelvis/torso upright throughout the whole pickup |
+| `upright` | `exp(−0.5(‖roll‖ + \|pitch_back\| + \|pitch\|)) − \|pitch_back\|` | 1.0 | Asymmetric: backward lean is double-penalised; matches CAT orientation reward |
+| `base_height` | target pelvis height 0.75 m; capped when above target | 1.0 | Encourage upright stance height while reaching |
 | `foot_contact` | stance contact mismatch cost | -0.5 | Encourage both feet to stay in contact with the floor |
 | `foot_slip` | stance foot speed squared | -0.1 | Discourage shuffling/sliding while crouching and lifting |
+| `foot_balance` | `‖(left_foot + right_foot − 2·pelvis_com)_xy‖² · (1 + spread_penalty)` | -30.0 | Penalise pelvis COM off-center and feet closer than 0.35 m |
 | `straight_knee` | `sum(max(0, 0.1 − knee_angle))` | -5.0 | Discourage fully locked knees; allow a slight crouch |
 | `joint_torque` | `sum(actuator_force²)` | -1e-4 | Penalize high motor torque, matching CAT |
 | `smoothness_joint` | `sum(0.01·qvel² + qacc²)` | -1e-6 | Discourage jerky joint motion across control steps |
 | `smoothness` | `−‖action − last_action‖²` | 1e-3 | Smooth action transitions |
-| `joint_limits` | Soft joint limit penalty | 1.0 | Avoid joint limit violations |
+| `joint_limits` | Soft joint limit penalty | -1.0 | Penalize joint limit violations |
 
 **Notes:**
 - `reach` targets the box surface rather than its center — offset by `2·half_y` so the reward reaches 0 when both palms are touching the left/right sides of the box.
 - `hold_stable` scale is 0.1 (reduced from 0.5) since contact forces naturally cause small box rotations even at rest.
 - `box_upright`: θ is computed from box quaternion as `arccos(1 − 2(qx² + qy²))`, the angle between the box z-axis and world z-axis.
-- `upright` is adapted from CAT's orientation reward and now penalizes pelvis roll, torso roll, and torso pitch at all times.
+- `upright` uses CAT's asymmetric formula: `‖roll‖ = |roll_pelvis| + |roll_torso|`; `pitch_back = clip(torso_pitch, −π, 0)` (backward lean only); backward lean enters the exponential twice and also subtracts linearly, making the robot significantly more reluctant to fall backward.
+- `base_height` calls `_reward_base_height(qpos[2], move_flag=0)`: rewards reaching the 0.75 m pelvis target; output is capped at 0.5 when above target (no bonus for extra height).
+- `foot_balance` works in world XY without a navigation frame: `foot_center = (left_foot + right_foot − 2·pelvis_com)` measures COM centering; `spread_penalty = max(0, (0.35 − foot_dist) · 10)` penalises feet closer than 0.35 m.
 - `foot_contact` and `foot_slip` treat pickup as an always-stance task: both feet are expected to remain planted on the floor throughout the episode.
 - `straight_knee` is borrowed from CAT and penalizes knee angles below `0.1 rad`, encouraging a slightly bent, compliant stance instead of locked knees.
 - `smoothness_joint` is borrowed from CAT and penalizes joint velocity and finite-difference acceleration using the previous control step's joint velocities.
