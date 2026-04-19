@@ -23,6 +23,7 @@ def main(args: Args):
     cfg = cat_ppo.registry.get("G1Pickup", "config")
 
     env = env_class(config=cfg.env_config)
+    # env.mj_model.geom("box_geom").rgba[3] = 0.0  # make box invisible for debugging
     state = env.reset(surface_z=args.surface_z)
 
     box_body_id     = env.mj_model.body("carried_box").id

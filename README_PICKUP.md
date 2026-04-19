@@ -15,7 +15,7 @@ This is **Phase 1** of a two-phase curriculum. The pickup policy produces divers
 | Action space | 23 DOF (all leg joints × 2 + waist × 3 + arms × 8) |
 | Legs | All 12 leg joints actuated (hip pitch/roll/yaw, knee, ankle pitch/roll × 2) |
 | Episode length | 200 steps (4 s at 50 Hz) |
-| Box placement | 0.4 m in front of robot, on a support pillar (0.4 × 0.5 m top, 0.6 m tall) |
+| Box placement | 0.3 m in front of robot, on a support pillar (0.4 × 0.5 m top, 0.6 m tall) |
 | Success criterion | Box lifted ≥ 10 cm above the support pillar top |
 
 ---
@@ -113,11 +113,19 @@ All rewards are multiplied by `dt` and clipped to `[0, 10000]`.
 
 | Term | Formula | Scale | Purpose |
 |------|---------|-------|---------|
-| `reach` | `−‖left_palm − box‖ − ‖right_palm − box‖ + 2·half_y` | 1.0 | Pull hands toward left/right box faces; zero when palms touch them |
-| `lift` | `clip(box_z − surface_z − support_half_z − half_z, 0, 0.1) / 0.1` | 5.0 | Reward liftoff; saturates at +10 cm |
-| `hold_stable` | `−‖box_angvel‖` | 0.1 | Penalize box tumbling |
-| `box_upright` | `exp(−θ²)` where θ = box tilt angle | 1.0 | Keep box vertical; ensures good handoff state for traversal phase |
-| `upright` | `exp(−0.5(‖roll‖ + \|pitch_back\| + \|pitch\|)) − \|pitch_back\|` | 1.0 | Asymmetric: backward lean is double-penalised; matches CAT orientation reward |
+| `reach` | `−‖left_palm − left_face‖ − ‖right_palm − right_face‖` | 1.5 | Pull each hand to its own box face; zero when both palms touch their respective sides |
+| `lift` | `clip(h, 0, 0.10) / 0.10 − clip(h − 0.10, 0, ∞)` where `h = box_z − surface_z − support_half_z − half_z` | 2.0 | Ramps to 1.0 at +10 cm; penalizes lifting beyond 10 cm |
+| `hand_contact` | `0.5 · (left_touching_box + right_touching_box)` | 2.0 | 0.5 per hand in contact with box; 1.0 for bilateral grasp |
+| `box_pillar_contact` | `1` if box touching pillar, else `0` | -1.5 | Penalize box remaining on pillar; encourages liftoff |
+| `grasp_symmetry` | `(Δheight)² + (Δdepth)²` along box local Z/X axes | -2.0 | Penalize height and front-back asymmetry between the two palms |
+| `palm_orient` | `0.5 · (clip(left_normal · left_desired, 0, 1) + clip(right_normal · right_desired, 0, 1))` | 2.0 | Reward palm normals (site local +Y for left, -Y for right — mirrored frames) pointing toward their respective box face; 1.0 when both palms face squarely inward |
+| `hands_level` | `(left_z - right_z)^2 / (‖left_palm - right_palm‖^2 + 1e-6)` | -1.0 | Penalize the line connecting the two palms tilting out of the world XY plane; 0 when both hands are at the same height, 1 when the hand-to-hand vector is vertical |
+| `hold_stable` | `−‖box_linvel‖ − ‖box_angvel‖` | 0.1 | Penalize box translation and tumbling |
+| `box_yaw_stable` | `wrap(yaw_now − yaw_init)²`, gated on both hands touching box | -2.0 | Penalize box yaw deviation from its initial orientation during active bilateral grasp |
+| `box_centering` | `(dot(box_pos − torso_pos, torso_right))²` | -2.0 | Penalize box being laterally offset from the torso's forward axis |
+| `box_vertical` | `‖box_xy − box_xy_init‖²`, gated on both hands touching box | -0.5 | Penalize XY drift from pillar center during active bilateral grasp; box should rise straight up |
+| `box_upright` | `exp(−θ²)` where θ = box tilt angle, gated on `lift_height > 0` | 1.0 | Keep box vertical once lifted; zero while resting on pillar to avoid free reward |
+| `upright` | `exp(−0.5(‖roll‖ + \|pitch_back\| + \|pitch\|)) − \|pitch_back\|` | 3.0 | Asymmetric: backward lean is double-penalised; matches CAT orientation reward |
 | `base_height` | target pelvis height 0.75 m; capped when above target | 1.0 | Encourage upright stance height while reaching |
 | `foot_contact` | stance contact mismatch cost | -0.5 | Encourage both feet to stay in contact with the floor |
 | `foot_slip` | stance foot speed squared | -0.1 | Discourage shuffling/sliding while crouching and lifting |
@@ -129,11 +137,12 @@ All rewards are multiplied by `dt` and clipped to `[0, 10000]`.
 | `joint_limits` | Soft joint limit penalty | -1.0 | Penalize joint limit violations |
 
 **Notes:**
-- `reach` targets the box surface rather than its center — offset by `2·half_y` so the reward reaches 0 when both palms are touching the left/right sides of the box.
+- `reach` targets each hand to its respective face: `left_face = box_pos + box_left_axis·half_y`, `right_face = box_pos − box_left_axis·half_y`, where `box_left_axis = rotate([0,1,0], box_quat)` is the box local +Y in world frame — which points to the robot's **left** in this setup. This prevents the crossed-hands failure mode.
 - `hold_stable` scale is 0.1 (reduced from 0.5) since contact forces naturally cause small box rotations even at rest.
 - `box_upright`: θ is computed from box quaternion as `arccos(1 − 2(qx² + qy²))`, the angle between the box z-axis and world z-axis.
 - `upright` uses CAT's asymmetric formula: `‖roll‖ = |roll_pelvis| + |roll_torso|`; `pitch_back = clip(torso_pitch, −π, 0)` (backward lean only); backward lean enters the exponential twice and also subtracts linearly, making the robot significantly more reluctant to fall backward.
 - `base_height` calls `_reward_base_height(qpos[2], move_flag=0)`: rewards reaching the 0.75 m pelvis target; output is capped at 0.5 when above target (no bonus for extra height).
+- `hands_level` is a normalized, scale-invariant tilt penalty on the hand-to-hand vector: it depends only on orientation in the world frame, not on how far apart the hands are.
 - `foot_balance` works in world XY without a navigation frame: `foot_center = (left_foot + right_foot − 2·pelvis_com)` measures COM centering; `spread_penalty = max(0, (0.35 − foot_dist) · 10)` penalises feet closer than 0.35 m.
 - `foot_contact` and `foot_slip` treat pickup as an always-stance task: both feet are expected to remain planted on the floor throughout the episode.
 - `straight_knee` is borrowed from CAT and penalizes knee angles below `0.1 rad`, encouraging a slightly bent, compliant stance instead of locked knees.
@@ -162,7 +171,7 @@ All rewards are multiplied by `dt` and clipped to `[0, 10000]`.
 | Robot spawn XY | `U[−1, 1]` m offset | Flat terrain |
 | Robot initial yaw | `U[−90°, 90°]` | Facing generally toward ±X |
 | Robot joint init | `U[0.5, 1.5] × default`, clipped to soft limits | Covers a range of initial arm poses |
-| Box XY position | 0.4 m in front of robot along its forward direction | Deterministic; robot XY/yaw spawn adds implicit variety |
+| Box XY position | 0.3 m in front of robot along its forward direction | Deterministic; robot XY/yaw spawn adds implicit variety |
 | Box yaw offset | `U[−10°, 10°]` | Relative to robot forward direction |
 | Support pillar top height | Fixed at 0.6 m (body-center z = 0.3 m) | Pillar extends from floor; height randomization planned for curriculum later |
 | Support pillar yaw | Same as box yaw | Rectangular pillar (0.4 × 0.5 m) faces same direction as box |
@@ -205,6 +214,7 @@ MjxEnv (mujoco_playground)
 ### Key Implementation Details
 
 - **Full leg control**: All 12 leg joints are included in `action_joint_ids`. Wrist joints still receive `_default_qpos` targets each step.
+- **Wrist mass lumping**: `left/right_wrist_yaw_link` inertial mass is set to 0.8 kg (vs. 0.254 kg without hand). The rubber hand meshes are visual-only (no separate body/inertial), so the ~0.54 kg hand mass is lumped into the wrist link to keep contact dynamics physically grounded.
 - **qpos/qvel layout**: Two freejoints extend the state beyond the 36-dim robot qpos:
   ```
   qpos: [0:7] root | [7:36] robot joints (29) | [36:43] box freejoint | [43:50] support freejoint

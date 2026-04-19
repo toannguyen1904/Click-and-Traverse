@@ -53,8 +53,14 @@
     </worldbody>
 
     <contact>
-        <pair geom1="left_hand_collision"  geom2="box_geom" condim="3" friction="2.0 0.5 0.5"/>
-        <pair geom1="right_hand_collision" geom2="box_geom" condim="3" friction="2.0 0.5 0.5"/>
+        <pair geom1="left_hand_collision"           geom2="box_geom" condim="3" friction="2.0 0.5 0.5"/>
+        <pair geom1="right_hand_collision"          geom2="box_geom" condim="3" friction="2.0 0.5 0.5"/>
+        <pair geom1="left_wrist_collision"          geom2="box_geom" condim="3" friction="1.0 0.5 0.5"/>
+        <pair geom1="right_wrist_collision"         geom2="box_geom" condim="3" friction="1.0 0.5 0.5"/>
+        <pair geom1="left_elbow_collision"          geom2="box_geom" condim="3" friction="0.5 0.5 0.5"/>
+        <pair geom1="right_elbow_collision"         geom2="box_geom" condim="3" friction="0.5 0.5 0.5"/>
+        <pair geom1="left_shoulder_yaw_collision"   geom2="box_geom" condim="3" friction="0.5 0.5 0.5"/>
+        <pair geom1="right_shoulder_yaw_collision"  geom2="box_geom" condim="3" friction="0.5 0.5 0.5"/>
     </contact>
 
 </mujoco>

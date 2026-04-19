@@ -100,11 +100,11 @@ class PlayG1PickupEnv(BaseEnv):
         support_half_z = float(self.mj_model.geom_size[self._box_support_geom_id][2])
         box_z = surface_z + support_half_z + box_half_z
 
-        # Place box 0.4 m in front of robot
+        # Place box 0.3 m in front of robot
         root_qpos = qpos[:7]
         w, x, y, z = root_qpos[3], root_qpos[4], root_qpos[5], root_qpos[6]
         forward_xy = np.array([1 - 2 * (y ** 2 + z ** 2), 2 * (x * y + w * z)])
-        box_xy = root_qpos[:2] + 0.4 * forward_xy
+        box_xy = root_qpos[:2] + 0.3 * forward_xy
 
         # Box yaw = identity (no offset) for play env; pillar matches
         box_quat = np.array([1.0, 0.0, 0.0, 0.0])
@@ -136,7 +136,9 @@ class PlayG1PickupEnv(BaseEnv):
             "surface_z": float(surface_z),
             "support_half_z": support_half_z,
             "box_size": box_size,
+            "box_z_init": float(box_z),
         }
+
         obs = self.get_obs(info)
         return State(info, obs)
 
@@ -264,7 +266,7 @@ class PlayG1StandEnv(PlayG1PickupEnv):
         root_qpos = qpos[:7]
         w, x, y, z = root_qpos[3], root_qpos[4], root_qpos[5], root_qpos[6]
         forward_xy = np.array([1 - 2 * (y ** 2 + z ** 2), 2 * (x * y + w * z)])
-        box_xy = root_qpos[:2] + 0.4 * forward_xy
+        box_xy = root_qpos[:2] + 0.3 * forward_xy
         box_quat = np.array([1.0, 0.0, 0.0, 0.0])
         self.mj_data.qpos[BOX_QPOS_START:BOX_QPOS_START + 3] = [box_xy[0], box_xy[1], box_z]
         self.mj_data.qpos[BOX_QPOS_START + 3:BOX_QPOS_START + 7] = box_quat

@@ -3,7 +3,7 @@
 Phase 1 of the CaTra curriculum:
 - Robot stands in place but can crouch using sagittal-plane leg joints.
 - 23-DOF action space: all leg joints (12) + waist (3) + arms (8).
-- Box placed 0.4 m in front of robot on a support surface at random height.
+- Box placed 0.3 m in front of robot on a support surface at random height.
 - Reward guides the robot to reach the box, reduce table contact force, and lift.
 - Terminal states feed into the CaTra traversal policy.
 
@@ -123,18 +123,18 @@ def _make_domain_randomize_pickup():
             # reset() uses the nominal half_z (0.15 m, the XML max) to compute box_z, so
             # DR'd boxes are always placed at or slightly above the pillar top — never embedded.
             rng, key = jax.random.split(rng)
-            box_half_x = jax.random.uniform(key, minval=0.10, maxval=0.15)
+            box_half_x = jax.random.uniform(key, minval=0.15, maxval=0.15)
             rng, key = jax.random.split(rng)
-            box_half_y = jax.random.uniform(key, minval=0.10, maxval=0.20)
+            box_half_y = jax.random.uniform(key, minval=0.20, maxval=0.20)
             rng, key = jax.random.split(rng)
-            box_half_z = jax.random.uniform(key, minval=0.10, maxval=0.15)
+            box_half_z = jax.random.uniform(key, minval=0.15, maxval=0.15)
             geom_size = model.geom_size.at[_box_geom_id].set(
                 jp.array([box_half_x, box_half_y, box_half_z])
             )
 
             # Box mass: override the globally-scaled value
             rng, key = jax.random.split(rng)
-            box_mass = jax.random.uniform(key, minval=1.0, maxval=2.0)
+            box_mass = jax.random.uniform(key, minval=1.5, maxval=1.5)
             body_mass = body_mass.at[_box_body_id].set(box_mass)
 
             return (pair_friction, dof_frictionloss, dof_armature, body_ipos, body_mass, qpos0, geom_size)
@@ -236,11 +236,19 @@ def g1_pickup_task_config() -> config_dict.ConfigDict:
         ),
         reward_config=config_dict.create(
             scales=config_dict.create(
-                reach=0.0,  # 1.0 CHANGED
-                lift=0.0,   # 5.0 CHANGED
-                hold_stable=0.0,    # 0.1 CHANGED
-                box_upright=0.0,    # 1.0 CHANGED
-                upright=1.0,
+                reach=1.5,
+                lift=2.0,
+                hand_contact=2.0,
+                box_pillar_contact=-1.5,
+                grasp_symmetry=-2.0,
+                palm_orient=2.0,
+                hands_level=-1.0,
+                hold_stable=0.0,
+                box_yaw_stable=0.0, # -2.0
+                box_centering=0.0,  # -2.0
+                box_vertical=-0.5,   # -5.0
+                box_upright=0.0,
+                upright=3.0,    # 1.0 in CAT
                 foot_contact=-0.5,
                 foot_slip=-0.1,
                 straight_knee=-5.0,
@@ -382,6 +390,10 @@ class G1PickupEnv(G1CaTraEnv):
         self._pelvis_body_id = self._mj_model.body("pelvis").id
         self._box_geom_id = self._mj_model.geom(consts.BOX_GEOM).id
         self._box_support_geom_id = self._mj_model.geom("box_support_col").id
+        self._hand_geom_ids = np.array([
+            self._mj_model.geom("left_hand_collision").id,
+            self._mj_model.geom("right_hand_collision").id,
+        ])
 
     @property
     def action_size(self) -> int:
@@ -415,10 +427,10 @@ class G1PickupEnv(G1CaTraEnv):
 
         data = mjx_env.init(self.mjx_model, qpos=qpos, qvel=qvel, ctrl=qpos[7:7 + NUM_ROBOT_JOINTS])
 
-        # --- Place box 0.4 m in front of robot on support surface ---
+        # --- Place box 0.3 m in front of robot on support surface ---
         w, x, y, z = qpos[3], qpos[4], qpos[5], qpos[6]
         forward_xy = jp.array([1 - 2 * (y ** 2 + z ** 2), 2 * (x * y + w * z)])
-        box_xy = qpos[:2] + 0.4 * forward_xy
+        box_xy = qpos[:2] + 0.3 * forward_xy
 
         # Random box yaw offset relative to robot forward (±10°)
         rng, key = jax.random.split(rng)
@@ -495,6 +507,9 @@ class G1PickupEnv(G1CaTraEnv):
             "support_half_z": support_half_z,
             "box_size": box_size,
             "box_mass": box_mass,
+            "box_xy_init": box_xy,   # pillar center XY at reset; box should rise straight up
+            "box_yaw_init": box_yaw, # box yaw at reset; yaw should stay stable during grasp
+            "box_z_init": box_z,     # box z at reset; used for drop termination threshold
             # Dummy fields required by pf_utils.py training wrapper (unused by pickup)
             "command": jp.zeros(4),
             "last_command": jp.zeros(4),
@@ -517,7 +532,7 @@ class G1PickupEnv(G1CaTraEnv):
         return mjx_env.State(data, obs, reward, done, metrics, info)
 
     def step(self, state: mjx_env.State, action: jax.Array) -> mjx_env.State:
-        """Step with 17-DOF action; wrists and unused leg joints stay at default."""
+        """Step with 23-DOF action; wrist joints stay at default."""
         # Update motor targets for controlled joints.
         lower_motor_targets = jp.clip(
             state.info["motor_targets"][self.action_joint_ids]
@@ -583,7 +598,7 @@ class G1PickupEnv(G1CaTraEnv):
         return state
 
     def _get_obs(self, data: mjx.Data, info: dict[str, Any]) -> mjx_env.Observation:
-        """85-dim state (deployable, noisy) and 123-dim privileged_state (noiseless + extras).
+        """108-dim state (deployable, noisy) and 147-dim privileged_state (noiseless + extras).
 
         State (108):
             gyro_pelvis[+noise](3), gvec_pelvis[+noise](3),
@@ -675,7 +690,7 @@ class G1PickupEnv(G1CaTraEnv):
         """Terminate on robot fall, box drop, or NaN. Returns (done, fall, box_drop, nan_term)."""
         fall = self.get_gravity(data, "pelvis")[2] < 0.0
         fall |= info["head_pos"][2] < 0.5
-        box_drop = data.xpos[self._box_body_id][2] < (info["surface_z"] - 0.1)
+        box_drop = data.xpos[self._box_body_id][2] < (info["box_z_init"] - 0.1)
         nan_term = jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any()
         return fall | box_drop | nan_term, fall, box_drop, nan_term
 
@@ -696,27 +711,98 @@ class G1PickupEnv(G1CaTraEnv):
         left_palm_pos = data.site_xpos[self._hands_site_id[0]]
         right_palm_pos = data.site_xpos[self._hands_site_id[1]]
 
-        # Reach: encourage hands to approach the left/right box faces, not the center.
-        reach = -(jp.linalg.norm(left_palm_pos - box_pos) + jp.linalg.norm(right_palm_pos - box_pos)) + 2 * box_half_y
-
-        # Lift: reward lifting above surface (0 when resting, 1.0 at +10cm)
-        lift_height = box_z - (info["surface_z"] + info["support_half_z"] + box_half_z)
-        lift = jp.clip(lift_height, 0.0, 0.1) / 0.1
-
-        # Hold stable: penalize box tumbling
-        box_angvel = data.qvel[BOX_QVEL_START + 3:BOX_QVEL_START + 6]
-        hold_stable = -jp.linalg.norm(box_angvel)
-
-        # Box upright: keep box z-axis aligned with world z (important for CaTra handoff)
+        # Reach: guide each hand to its respective box face (left hand → left face, right → right face).
+        # The box local +Y axis maps to the right face in world frame; -Y maps to the left face.
         box_quat = data.xquat[self._box_body_id]  # wxyz
+        box_left_axis = math.rotate(jp.array([0., 1., 0.]), box_quat)  # world-frame +Y of box = robot's left
+        left_target = box_pos + box_left_axis * box_half_y   # left face center
+        right_target = box_pos - box_left_axis * box_half_y  # right face center
+        reach = -(jp.linalg.norm(left_palm_pos - left_target) + jp.linalg.norm(right_palm_pos - right_target))
+
+        # Hand contact: reward when both hands are touching the box (0, 0.5, or 1.0).
+        left_contact = geoms_colliding(data, self._hand_geom_ids[0], self._box_geom_id)
+        right_contact = geoms_colliding(data, self._hand_geom_ids[1], self._box_geom_id)
+        hand_contact = 0.5 * (left_contact.astype(jp.float32) + right_contact.astype(jp.float32))
+
+        # Box-pillar contact: penalize box remaining on the pillar — encourages liftoff.
+        box_pillar_contact = geoms_colliding(data, self._box_geom_id, self._box_support_geom_id).astype(jp.float32)
+
+        # Grasp symmetry: penalize asymmetric hand placement along the box's local Z (height)
+        # and X (front-back depth) axes. Both palms should be at the same height and depth.
+        box_up_axis = math.rotate(jp.array([0., 0., 1.]), box_quat)    # box local Z in world
+        box_fwd_axis = math.rotate(jp.array([1., 0., 0.]), box_quat)   # box local X in world
+        left_rel = left_palm_pos - box_pos
+        right_rel = right_palm_pos - box_pos
+        height_diff = jp.dot(left_rel - right_rel, box_up_axis)
+        depth_diff = jp.dot(left_rel - right_rel, box_fwd_axis)
+        grasp_symmetry = height_diff ** 2 + depth_diff ** 2
+
+        # Palm orientation: reward palm normals aligned with the inward normals of the
+        # left/right box faces. The target direction is a property of the box pose only
+        # (independent of current palm position), so the optimum is well-defined and
+        # non-degenerate even when the palm is exactly at the target.
+        # Site-frame convention: left_palm inward = -local_Y, right_palm inward = +local_Y.
+        left_xmat = data.site_xmat[self._hands_site_id[0]].reshape(3, 3)
+        right_xmat = data.site_xmat[self._hands_site_id[1]].reshape(3, 3)
+        left_palm_normal = -left_xmat[:, 1]
+        right_palm_normal = right_xmat[:, 1]
+        # box_left_axis is the world-frame +Y of the box (unit length). Left face inward
+        # normal = -box_left_axis; right face inward normal = +box_left_axis.
+        left_dot = jp.dot(left_palm_normal, -box_left_axis)
+        right_dot = jp.dot(right_palm_normal, box_left_axis)
+        # Map dot in [-1, 1] -> reward in [0, 1] so there is always gradient, even when
+        # the palm starts facing outward.
+        palm_orient = 0.5 * (0.5 * (1.0 + left_dot) + 0.5 * (1.0 + right_dot))
+
+        # Hands level: encourage the line between the two palms to lie in the horizontal
+        # plane (angle between (left - right) and world +Z is ±90°). Uses the normalized
+        # squared z-component = sin^2(angle from XY). Range [0, 1]: 0 when hands are at
+        # the same height, 1 when one palm is directly above the other. Use with a
+        # negative scale to penalize non-horizontal placement.
+        hands_vec = left_palm_pos - right_palm_pos
+        hands_level = hands_vec[2] ** 2 / (jp.dot(hands_vec, hands_vec) + 1e-6)
+
+        # Lift: reward up to +10 cm above surface, penalize lifting higher than 10 cm.
+        lift_height = box_z - (info["surface_z"] + info["support_half_z"] + box_half_z)
+        lift = jp.clip(lift_height, 0.0, 0.10) / 0.10 - jp.clip(lift_height - 0.10, 0.0, None)
+
+        # Box vertical: penalize XY drift from pillar center — box should rise straight up.
+        # Gated on both hands touching the box so it only activates during an active grasp.
+        both_hands = left_contact & right_contact
+        box_xy_drift = jp.linalg.norm(box_pos[:2] - info["box_xy_init"])
+        box_vertical = jp.where(both_hands, box_xy_drift ** 2, 0.0)
+
+        # Hold stable: penalize box tumbling and translation
+        box_linvel = data.qvel[BOX_QVEL_START:BOX_QVEL_START + 3]
+        box_angvel = data.qvel[BOX_QVEL_START + 3:BOX_QVEL_START + 6]
+        hold_stable = -(jp.linalg.norm(box_linvel) + jp.linalg.norm(box_angvel))
+
+        # Box yaw stable: penalize yaw deviation from initial box yaw, gated on both hands touching.
+        # Extracts current box yaw from quaternion via atan2 and compares to reset yaw.
+        qw, qz = box_quat[0], box_quat[3]
+        box_yaw_now = 2.0 * jp.arctan2(qz, qw)
+        yaw_diff = box_yaw_now - info["box_yaw_init"]
+        # Wrap to [-pi, pi]
+        yaw_diff = (yaw_diff + jp.pi) % (2 * jp.pi) - jp.pi
+        box_yaw_stable = jp.where(both_hands, yaw_diff ** 2, 0.0)
+
+        # Box upright: keep box z-axis aligned with world z (important for CaTra handoff).
+        # Only active once the box is off the surface — avoids free reward while resting on pillar.
         qx, qy = box_quat[1], box_quat[2]
         box_tilt_cos = jp.clip(1.0 - 2.0 * (qx ** 2 + qy ** 2), -1.0, 1.0)
         box_tilt_angle = jp.arccos(box_tilt_cos)
-        box_upright = jp.exp(-box_tilt_angle ** 2)
+        box_upright = jp.where(lift_height > 0.0, jp.exp(-box_tilt_angle ** 2), 0.0)
 
-        # Robot upright: CAT asymmetric formula — backward lean is double-penalised.
+        # Box centering: penalize box being laterally offset from the torso's forward axis.
+        # Uses torso right axis (column 1 of torso_rot) to measure left-right skew.
         pelvis_rot = data.site_xmat[self._pelvis_imu_site_id].reshape(3, 3)
         torso_rot = data.site_xmat[self._torso_imu_site_id].reshape(3, 3)
+        torso_pos = data.site_xpos[self._torso_imu_site_id]
+        torso_right = torso_rot[:, 1]  # torso local Y = right direction in world frame
+        lateral_offset = jp.dot(box_pos - torso_pos, torso_right)
+        box_centering = lateral_offset ** 2
+
+        # Robot upright: CAT asymmetric formula — backward lean is double-penalised.
         pelvis_rpy = jp.array(jaxlie.SO3.from_matrix(pelvis_rot).as_rpy_radians())
         torso_rpy = jp.array(jaxlie.SO3.from_matrix(torso_rot).as_rpy_radians())
         err_roll = jp.abs(pelvis_rpy[0]) + jp.abs(torso_rpy[0])
@@ -756,7 +842,15 @@ class G1PickupEnv(G1CaTraEnv):
         reward_dict = {
             "reach": reach,
             "lift": lift,
+            "hand_contact": hand_contact,
+            "box_pillar_contact": box_pillar_contact,
+            "grasp_symmetry": grasp_symmetry,
+            "palm_orient": palm_orient,
+            "hands_level": hands_level,
             "hold_stable": hold_stable,
+            "box_yaw_stable": box_yaw_stable,
+            "box_centering": box_centering,
+            "box_vertical": box_vertical,
             "box_upright": box_upright,
             "upright": upright,
             "foot_contact": foot_contact_cost,

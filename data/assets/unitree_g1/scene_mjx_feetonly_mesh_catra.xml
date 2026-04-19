@@ -72,16 +72,20 @@
             <freejoint name="support_joint"/>
             <geom name="box_support_col" type="box" size="0.2 0.25 0.3"
                   contype="6" conaffinity="6" condim="3"
-                  mass="1000" rgba="0.45 0.30 0.15 1.0"/>
+                  mass="1000" rgba="0.45 0.30 0.15 0.3"/>
         </body>
     </worldbody>
 
     <contact>
         <!-- Robot-box contacts -->
-        <pair geom1="left_hand_collision"  geom2="box_geom"   condim="3" friction="0.5 0.5 0.5"/>
-        <pair geom1="right_hand_collision" geom2="box_geom"   condim="3" friction="0.5 0.5 0.5"/>
-        <pair geom1="torso_collision"      geom2="box_geom"   condim="3" friction="0.5 0.5"/>
-        <pair geom1="pelvis_collision"     geom2="box_geom"   condim="3" friction="0.5 0.5"/>
+        <pair geom1="left_hand_collision"           geom2="box_geom" condim="3" friction="2.0 0.5 0.5"/>
+        <pair geom1="right_hand_collision"          geom2="box_geom" condim="3" friction="2.0 0.5 0.5"/>
+        <pair geom1="left_wrist_collision"          geom2="box_geom" condim="3" friction="1.0 0.5 0.5"/>
+        <pair geom1="right_wrist_collision"         geom2="box_geom" condim="3" friction="1.0 0.5 0.5"/>
+        <pair geom1="left_elbow_collision"          geom2="box_geom" condim="3" friction="0.5 0.5 0.5"/>
+        <pair geom1="right_elbow_collision"         geom2="box_geom" condim="3" friction="0.5 0.5 0.5"/>
+        <pair geom1="left_shoulder_yaw_collision"   geom2="box_geom" condim="3" friction="0.5 0.5 0.5"/>
+        <pair geom1="right_shoulder_yaw_collision"  geom2="box_geom" condim="3" friction="0.5 0.5 0.5"/>
         <!-- Floor contacts for body parts that have no default floor collision -->
         <pair geom1="left_shin"            geom2="floor"      condim="3" friction="0.5 0.5"/>
         <pair geom1="right_shin"           geom2="floor"      condim="3" friction="0.5 0.5"/>
