@@ -123,18 +123,18 @@ def _make_domain_randomize_pickup():
             # reset() uses the nominal half_z (0.15 m, the XML max) to compute box_z, so
             # DR'd boxes are always placed at or slightly above the pillar top — never embedded.
             rng, key = jax.random.split(rng)
-            box_half_x = jax.random.uniform(key, minval=0.15, maxval=0.15)
+            box_half_x = jax.random.uniform(key, minval=0.10, maxval=0.15)
             rng, key = jax.random.split(rng)
-            box_half_y = jax.random.uniform(key, minval=0.20, maxval=0.20)
+            box_half_y = jax.random.uniform(key, minval=0.10, maxval=0.20)
             rng, key = jax.random.split(rng)
-            box_half_z = jax.random.uniform(key, minval=0.15, maxval=0.15)
+            box_half_z = jax.random.uniform(key, minval=0.10, maxval=0.15)
             geom_size = model.geom_size.at[_box_geom_id].set(
                 jp.array([box_half_x, box_half_y, box_half_z])
             )
 
             # Box mass: override the globally-scaled value
             rng, key = jax.random.split(rng)
-            box_mass = jax.random.uniform(key, minval=1.5, maxval=1.5)
+            box_mass = jax.random.uniform(key, minval=1.0, maxval=2.0)
             body_mass = body_mass.at[_box_body_id].set(box_mass)
 
             return (pair_friction, dof_frictionloss, dof_armature, body_ipos, body_mass, qpos0, geom_size)
