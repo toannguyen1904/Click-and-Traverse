@@ -12,19 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""CaTra (Carry and Traverse) environment: G1 humanoid navigates while carrying a box."""
+"""Two-stage CaTra environment: stage 1 pickup (steps 0 -> stage1_steps-1) + stage 2 carry & traverse (steps stage1_steps -> stage1_steps+999)."""
 
 from typing import Any, Dict, Optional, Union
 
 import jax
 import jax.numpy as jp
+import jaxlie
+import mujoco
+import numpy as np
+from ml_collections import config_dict
 from mujoco import mjx
 from mujoco.mjx._src import math
-from ml_collections import config_dict
 from mujoco_playground._src import collision
 from mujoco_playground._src import mjx_env
 from mujoco_playground._src.collision import geoms_colliding
-import numpy as np
 
 import cat_ppo
 from cat_ppo.envs.g1.env_cat import (
@@ -41,7 +43,7 @@ from cat_ppo.envs.g1 import constants as consts
 
 import jaxlie
 
-# Number of robot joints (excluding root freejoint and box freejoint)
+# Number of robot joints (excluding root freejoint and box/support freejoints)
 NUM_ROBOT_JOINTS = 29
 
 # qpos layout: [0:7] root, [7:36] robot joints, [36:43] box freejoint, [43:50] support freejoint
@@ -70,7 +72,6 @@ def torque_step_catra(
         rng, data = carry
         rng, rng_rfi = jax.random.split(rng, 2)
 
-        # Only use robot joint slice to avoid shape mismatch with box freejoint DOF
         pos_err = qpos_des - data.qpos[7:7 + NUM_ROBOT_JOINTS]
         vel_err = -data.qvel[6:6 + NUM_ROBOT_JOINTS]
         torque = (kp_scale * kps) * pos_err + (kd_scale * kds) * vel_err
@@ -87,111 +88,124 @@ def torque_step_catra(
     return jax.lax.scan(single_step, (rng, data), (), n_substeps)[0]
 
 
-def domain_randomize_catra(model: mjx.Model, rng: jax.Array):
-    """Domain randomization for CaTra: handles 43-dim qpos (robot 36 + box 7)."""
-    FLOOR_GEOM_ID = 0
+def _make_domain_randomize_catra():
+    """Factory: loads model once to get box IDs, returns the DR function."""
+    _mj = mujoco.MjModel.from_xml_path(str(consts.CATRA_FLAT_TERRAIN_XML))
+    _box_geom_id = _mj.geom("box_geom").id
+    _box_body_id = _mj.body("carried_box").id
+    del _mj
+
     TORSO_BODY_ID = 16
 
-    @jax.vmap
-    def rand_dynamics(rng):
-        pair_friction = model.pair_friction
+    def domain_randomize_catra(model: mjx.Model, rng: jax.Array):
+        """Robot DR (frictionloss/armature/CoM/mass/qpos0) + box size/mass DR + RFI enabled."""
 
-        rng, key = jax.random.split(rng)
-        frictionloss = model.dof_frictionloss[6:6 + NUM_ROBOT_JOINTS] * jax.random.uniform(
-            key, shape=(NUM_ROBOT_JOINTS,), minval=0.9, maxval=1.1
-        )
-        dof_frictionloss = model.dof_frictionloss.at[6:6 + NUM_ROBOT_JOINTS].set(frictionloss)
+        @jax.vmap
+        def rand_dynamics(rng):
+            pair_friction = model.pair_friction
 
-        rng, key = jax.random.split(rng)
-        armature = model.dof_armature[6:6 + NUM_ROBOT_JOINTS] * jax.random.uniform(
-            key, shape=(NUM_ROBOT_JOINTS,), minval=1.0, maxval=1.05
-        )
-        dof_armature = model.dof_armature.at[6:6 + NUM_ROBOT_JOINTS].set(armature)
+            rng, key = jax.random.split(rng)
+            frictionloss = model.dof_frictionloss[6:6 + NUM_ROBOT_JOINTS] * jax.random.uniform(
+                key, shape=(NUM_ROBOT_JOINTS,), minval=0.9, maxval=1.1
+            )
+            dof_frictionloss = model.dof_frictionloss.at[6:6 + NUM_ROBOT_JOINTS].set(frictionloss)
 
-        rng, key = jax.random.split(rng)
-        dpos = jax.random.uniform(key, (3,), minval=-0.1, maxval=0.1)
-        body_ipos = model.body_ipos.at[TORSO_BODY_ID].set(
-            model.body_ipos[TORSO_BODY_ID] + dpos
-        )
+            rng, key = jax.random.split(rng)
+            armature = model.dof_armature[6:6 + NUM_ROBOT_JOINTS] * jax.random.uniform(
+                key, shape=(NUM_ROBOT_JOINTS,), minval=1.0, maxval=1.05
+            )
+            dof_armature = model.dof_armature.at[6:6 + NUM_ROBOT_JOINTS].set(armature)
 
-        rng, key = jax.random.split(rng)
-        dmass = jax.random.uniform(key, shape=(model.nbody,), minval=0.9, maxval=1.1)
-        body_mass = model.body_mass.at[:].set(model.body_mass * dmass)
+            rng, key = jax.random.split(rng)
+            dpos = jax.random.uniform(key, (3,), minval=-0.1, maxval=0.1)
+            body_ipos = model.body_ipos.at[TORSO_BODY_ID].set(
+                model.body_ipos[TORSO_BODY_ID] + dpos
+            )
 
-        rng, key = jax.random.split(rng)
-        dmass = jax.random.uniform(key, minval=-1.0, maxval=1.0)
-        body_mass = body_mass.at[TORSO_BODY_ID].set(body_mass[TORSO_BODY_ID] + dmass)
+            rng, key = jax.random.split(rng)
+            dmass = jax.random.uniform(key, shape=(model.nbody,), minval=0.9, maxval=1.1)
+            body_mass = model.body_mass.at[:].set(model.body_mass * dmass)
 
-        rng, key = jax.random.split(rng)
-        qpos0 = model.qpos0
-        # Only perturb robot joints [7:36], not box freejoint [36:43]
-        qpos0 = qpos0.at[7:7 + NUM_ROBOT_JOINTS].set(
-            qpos0[7:7 + NUM_ROBOT_JOINTS]
-            + jax.random.uniform(key, shape=(NUM_ROBOT_JOINTS,), minval=-0.05, maxval=0.05)
-        )
+            rng, key = jax.random.split(rng)
+            dmass_torso = jax.random.uniform(key, minval=-1.0, maxval=1.0)
+            body_mass = body_mass.at[TORSO_BODY_ID].set(body_mass[TORSO_BODY_ID] + dmass_torso)
 
-        return (
-            pair_friction,
-            dof_frictionloss,
-            dof_armature,
-            body_ipos,
-            body_mass,
-            qpos0,
-        )
+            rng, key = jax.random.split(rng)
+            qpos0 = model.qpos0
+            qpos0 = qpos0.at[7:7 + NUM_ROBOT_JOINTS].set(
+                qpos0[7:7 + NUM_ROBOT_JOINTS]
+                + jax.random.uniform(key, shape=(NUM_ROBOT_JOINTS,), minval=-0.05, maxval=0.05)
+            )
 
-    (
-        pair_friction,
-        frictionloss,
-        armature,
-        body_ipos,
-        body_mass,
-        qpos0,
-    ) = rand_dynamics(rng)
+            rng, key = jax.random.split(rng)
+            box_half_x = jax.random.uniform(key, minval=0.15, maxval=0.15)
+            rng, key = jax.random.split(rng)
+            box_half_y = jax.random.uniform(key, minval=0.20, maxval=0.20)
+            rng, key = jax.random.split(rng)
+            box_half_z = jax.random.uniform(key, minval=0.15, maxval=0.15)
+            geom_size = model.geom_size.at[_box_geom_id].set(
+                jp.array([box_half_x, box_half_y, box_half_z])
+            )
 
-    in_axes = jax.tree_util.tree_map(lambda x: None, model)
-    in_axes = in_axes.tree_replace(
-        {
+            rng, key = jax.random.split(rng)
+            box_mass = jax.random.uniform(key, minval=1.0, maxval=3.0)
+            body_mass = body_mass.at[_box_body_id].set(box_mass)
+
+            return (pair_friction, dof_frictionloss, dof_armature, body_ipos, body_mass, qpos0, geom_size)
+
+        (pair_friction, frictionloss, armature, body_ipos, body_mass, qpos0, geom_size) = rand_dynamics(rng)
+
+        in_axes = jax.tree_util.tree_map(lambda x: None, model)
+        in_axes = in_axes.tree_replace({
             "pair_friction": 0,
             "dof_frictionloss": 0,
             "dof_armature": 0,
             "body_ipos": 0,
             "body_mass": 0,
             "qpos0": 0,
-        }
-    )
+            "geom_size": 0,
+        })
 
-    model = model.tree_replace(
-        {
+        model = model.tree_replace({
             "pair_friction": pair_friction,
             "dof_frictionloss": frictionloss,
             "dof_armature": armature,
             "body_ipos": body_ipos,
             "body_mass": body_mass,
             "qpos0": qpos0,
-        }
-    )
+            "geom_size": geom_size,
+        })
 
-    return model, in_axes
+        return model, in_axes
+
+    return domain_randomize_catra
+
+
+domain_randomize_catra = _make_domain_randomize_catra()
 
 
 def g1_catra_task_config() -> config_dict.ConfigDict:
-    """Config for CaTra: carries from g1_loco_task_config but with 23-dim action + box rewards.
+    """Config for two-stage G1CaTra.
+
+    Episode: 1100 steps (22 s @ 50 Hz).
+      Stage 1 (steps   0 –> stage1_steps-1): zero command, pickup rewards (22 terms).
+      Stage 2 (steps stage1_steps -> stage1_steps+999): PF-derived command, navigation + carry rewards.
 
     Observation dimensions:
-      num_obs = 191 = 162 (base) + 11 (last_act 12→23) + 11 (motor_targets 12→23) + 7 (box PF)
-      num_pri = 259 = 224 (base) + 11 + 11 + 7 + 6 (box_pos + box_vel)
-    NOTE: verify these after the first training run if ONNX export fails.
+      num_obs = 195  (state, deployable, noisy)
+      num_pri = 289  (privileged_state, noiseless + extras)
     """
     env_config = config_dict.create(
         task_type="flat_terrain_catra",
         ctrl_dt=0.02,
         sim_dt=0.002,
-        episode_length=1000,
+        episode_length=1100,
+        stage1_steps=100,
         action_repeat=1,
         action_scale=0.5,
         history_len=15,
-        num_obs=191,
-        num_pri=259,
+        num_obs=195,
+        num_pri=289,
         num_act=23,
         restricted_joint_range=False,
         soft_joint_pos_limit_factor=0.95,
@@ -221,38 +235,82 @@ def g1_catra_task_config() -> config_dict.ConfigDict:
         ),
         reward_config=config_dict.create(
             scales=config_dict.create(
-                # behavior rewards (inherited from G1CatEnv)
+                # --- Always active (both stages) ---
+                joint_torque=-1e-4,
+                smoothness_joint=-1e-6,
+                joint_limits=-1.0,
+                # --- Stage 1 only: Pickup rewards ---
+                # reach=1.5,
+                # lift=2.0,
+                # hand_contact=2.0,
+                # box_pillar_contact=-1.5,
+                # grasp_symmetry=-2.0,
+                # palm_orient=2.0,
+                # hands_level=-1.0,
+                # box_vertical=-0.5,
+                # CHANGED
+                reach=0.0,
+                lift=0.0,
+                hand_contact=0.0,
+                box_pillar_contact=0.0,
+                grasp_symmetry=0.0,
+                palm_orient=0.0,
+                hands_level=0.0,
+                box_vertical=0.0,
+
+                hold_stable=0.0,
+                box_yaw_stable=0.0,
+                box_centering=0.0,
+                box_upright=0.0,
+                upright=3.0,
+                foot_contact=-0.5,
+                foot_slip=-0.1,
+                straight_knee=-5.0,
+                smoothness=1e-3,
+                base_height=1.0,
+                foot_balance=-30.0,
+                # --- Stage 2 only: navigation rewards (CAT scales) ---
                 tracking_orientation=2.0,
                 tracking_root_field=1.0,
                 body_motion=-0.5,
                 body_rotation=1.0,
-                foot_contact=-1.0,
+                foot_contact_trav=-1.0,
                 foot_clearance=-15.0,
-                foot_slip=-0.5,
-                foot_balance=-30,
-                foot_far=-0,
-                straight_knee=-30,
-                # energy rewards
-                smoothness_joint=-1e-6,
+                foot_slip_trav=-0.5,
+                foot_balance_trav=-30.0,
+                foot_far=0.0,
+                straight_knee_trav=-30.0,
                 smoothness_action=-1e-3,
-                joint_limits=-1.0,
-                joint_torque=-1e-4,
-                # body HumanoidPF fields
-                headgf=0.0,
-                handsgf=0.0,
-                feetgf=0.0,
-                headdf=0.0,
-                handsdf=0.0,
-                feetdf=0.0,
-                kneesdf=0.0,
-                shldsdf=0.0,
+                forward_progress=5.0,
+                headgf=0.0,    # overwritten by --overhead in train_ppo.py
+                handsgf=0.0,   # overwritten by --lateral
+                feetgf=0.0,    # overwritten by --ground
+                headdf=0.0,    # overwritten by --overhead
+                handsdf=0.0,   # overwritten by --lateral
+                feetdf=0.0,    # overwritten by --ground
+                kneesdf=0.0,   # overwritten by --lateral
+                shldsdf=0.0,   # overwritten by --lateral
+                # --- Stage 2 only: carry maintenance (same scales as Pickup) ---
+                # reach_carry=0.75,
+                # lift_carry=1.0,
+                # hand_contact_carry=1.0,
+                # grasp_symmetry_carry=-1.0,
+                # palm_orient_carry=1.0,
+                # hands_level_carry=-0.5,
+                # CHANGED
+                reach_carry=0.0,
+                lift_carry=0.0,
+                hand_contact_carry=0.0,
+                grasp_symmetry_carry=0.0,
+                palm_orient_carry=0.0,
+                hands_level_carry=0.0,
             ),
             base_height_target=0.75,
             foot_height_stance=0.0,
         ),
         term_collision_threshold=0.04,
-        box_drop_threshold=0.3,      # box below this height (m) terminates the episode
-        box_surface_height_range=[0.4, 0.8],  # support surface center z randomized each episode
+        box_drop_threshold=0.3,
+        box_surface_height_range=[0.3, 0.3],   # fixed: support body centre at 0.3 m
         push_config=config_dict.create(
             enable=True,
             interval_range=[5.0, 10.0],
@@ -280,7 +338,7 @@ def g1_catra_task_config() -> config_dict.ConfigDict:
         madrona_backend=False,
         augment_pixels=False,
         num_envs=32768,
-        episode_length=1000,
+        episode_length=1100,
         action_repeat=1,
         wrap_env_fn=None,
         randomization_fn=domain_randomize_catra,
@@ -323,12 +381,11 @@ def g1_catra_task_config() -> config_dict.ConfigDict:
         command_waypoints=np.array([[0, 0.0, 0.0, 0.0]]),
     )
 
-    config = config_dict.create(
+    return config_dict.create(
         env_config=env_config,
         policy_config=policy_config,
         eval_config=eval_config,
     )
-    return config
 
 
 cat_ppo.registry.register("G1CaTra", "config")(g1_catra_task_config())
@@ -336,14 +393,15 @@ cat_ppo.registry.register("G1CaTra", "config")(g1_catra_task_config())
 
 @cat_ppo.registry.register("G1CaTra", "train_env_class")
 class G1CaTraEnv(G1CatEnv):
-    """G1 humanoid carrying a box while navigating obstacles.
+    """Two-stage G1 humanoid: stage 1 pickup, stage 2 carry & traverse.
 
-    Extends G1CatEnv with:
-    - 23-dim action space (12 leg + 3 waist + 8 arm joints)
-    - Box PF observations (boxgf, boxbf, boxdf sampled at box_center site)
-    - Same rewards as G1CatEnv (no box-specific reward terms)
-    - Box collision termination
-    - CaTra scene XML with box body (freejoint) resting on a mocap support surface at random height
+    Stage 1 (steps 0 -> stage1_steps-1): robot stands, uses Pickup rewards (22 terms).
+    Stage 2 (steps stage1_steps -> stage1_steps+999): robot walks with box, uses CAT navigation rewards
+    + 6 carry-maintenance terms.
+
+    Action space: 23 DOF (12 leg + 3 waist + 8 arm joints).
+    State:       195-dim (deployable, noisy).
+    Priv state:  289-dim (noiseless + extras, critic only).
     """
 
     def __init__(
@@ -352,8 +410,6 @@ class G1CaTraEnv(G1CatEnv):
             config: config_dict.ConfigDict = None,
             config_overrides: Optional[Dict[str, Union[str, Any, list[Any]]]] = None,
     ) -> None:
-        # G1CatEnv.__init__ calls G1LocoEnv.__init__ which calls _post_init.
-        # We then override what we need in _post_init_catra.
         super().__init__(
             task_type=task_type,
             config=config,
@@ -362,15 +418,12 @@ class G1CaTraEnv(G1CatEnv):
         self._post_init_catra()
 
     def _post_init_catra(self) -> None:
-        """Override action joints, default qpos, and init_q for CaTra."""
-        # 23-dim action space: legs + waist + arms
+        """Set up 23-DOF action space, soft limits, init_q, and cached IDs for pickup rewards."""
         self.action_joint_names = consts.CATRA_ACTION_JOINT_NAMES.copy()
         self.action_joint_ids = jp.array([
             self.mj_model.actuator(name).id for name in self.action_joint_names
         ])
 
-        # Fix soft limits: jnt_range[1:] now includes the box freejoint at the end.
-        # We only want the 29 robot joint limits; the box freejoint has no meaningful range.
         lowers, uppers = self.mj_model.jnt_range[1:1 + NUM_ROBOT_JOINTS].T
         c = (lowers + uppers) / 2
         r = uppers - lowers
@@ -378,44 +431,42 @@ class G1CaTraEnv(G1CatEnv):
         self._soft_lowers = c - 0.5 * r * factor
         self._soft_uppers = c + 0.5 * r * factor
 
-        # Carrying pose: DEFAULT_QPOS_CATRA[7:36] = robot joints (29-dim)
         self._default_qpos = jp.array(consts.DEFAULT_QPOS_CATRA[7:7 + NUM_ROBOT_JOINTS])
 
-        # Extended init_q: robot (36) + box freejoint (7) + support freejoint (7) = 50-dim
-        # Both box and support start at placeholders; reset() places them correctly.
         box_default     = np.array([0.35, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
         support_default = np.array([0.35, 0.0, 0.5, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
         self._init_q = jp.array(np.concatenate([consts.DEFAULT_QPOS_CATRA, box_default, support_default]))
 
-        # Box identifiers
-        self._box_site_id = self._mj_model.site(consts.BOX_SITE).id
-        self._box_body_id = self._mj_model.body("carried_box").id
-
-
+        # IDs needed for Pickup reward computation
+        self._pelvis_body_id    = self._mj_model.body("pelvis").id
+        self._box_body_id       = self._mj_model.body("carried_box").id
+        self._box_geom_id       = self._mj_model.geom(consts.BOX_GEOM).id
+        self._box_support_geom_id = self._mj_model.geom("box_support_col").id
+        self._hand_geom_ids     = np.array([
+            self._mj_model.geom("left_hand_collision").id,
+            self._mj_model.geom("right_hand_collision").id,
+        ])
 
     @property
     def action_size(self) -> int:
         return len(self.action_joint_names)  # 23
 
     def reset(self, rng: jax.Array) -> mjx_env.State:
-        """Reset with 50-dim qpos (robot 36 + box 7 + support 7) and initialize box PF fields."""
-        qpos = self._init_q.copy()                              # (50,)
-        qvel = jp.zeros(self.mjx_model.nv)                      # (47,) = 6+29+6+6
+        """Reset with fixed surface_z=0.3, box 0.3 m in front, robot yaw ∈ [−90°, 90°]."""
+        qpos = self._init_q.copy()
+        qvel = jp.zeros(self.mjx_model.nv)
 
-        # Random spawn xy
         rng, key = jax.random.split(rng)
         dxy = jax.random.uniform(key, (2,), minval=-1.0, maxval=1.0)
         qpos = qpos.at[0:2].set(qpos[0:2] + dxy)
         qpos = qpos.at[2].set(0.8)
 
-        # Random initial yaw
         rng, key = jax.random.split(rng)
         yaw = jax.random.uniform(key, (1,), minval=-np.pi / 2, maxval=np.pi / 2)
         quat = math.axis_angle_to_quat(jp.array([0, 0, 1]), yaw)
         new_quat = math.quat_mul(qpos[3:7], quat)
         qpos = qpos.at[3:7].set(new_quat)
 
-        # Randomize robot joints [7:36] only (not box freejoint [36:43])
         rng, key = jax.random.split(rng)
         rand_qpos = qpos[7:7 + NUM_ROBOT_JOINTS] * jax.random.uniform(
             key, (NUM_ROBOT_JOINTS,), minval=0.5, maxval=1.5
@@ -423,90 +474,69 @@ class G1CaTraEnv(G1CatEnv):
         rand_qpos = jp.clip(rand_qpos, self._soft_lowers, self._soft_uppers)
         qpos = qpos.at[7:7 + NUM_ROBOT_JOINTS].set(rand_qpos)
 
-        # Random root velocity
-        rng, key = jax.random.split(rng)
-        qvel = qvel.at[0:6].set(jax.random.uniform(key, (6,), minval=-0.5, maxval=0.5))
+        ## randomize the robot's root linear and angular velocity at reset
+        # rng, key = jax.random.split(rng)
+        # qvel = qvel.at[0:6].set(jax.random.uniform(key, (6,), minval=-0.5, maxval=0.5))
 
-        # ctrl is 29-dim (robot actuators only)
         data = mjx_env.init(self.mjx_model, qpos=qpos, qvel=qvel, ctrl=qpos[7:7 + NUM_ROBOT_JOINTS])
 
-        # --- Place box on fixed support surface at random height ---
-        # Place 0.4 m in front of the robot along its forward direction.
-        w, x, y, z = qpos[3], qpos[4], qpos[5], qpos[6]  # root quat wxyz
-        forward_xy = jp.array([1 - 2*(y**2 + z**2), 2*(x*y + w*z)])
-        box_xy = qpos[:2] + 0.4 * forward_xy
+        # Box 0.3 m in front along robot forward direction
+        w, x, y, z = qpos[3], qpos[4], qpos[5], qpos[6]
+        forward_xy = jp.array([1 - 2 * (y ** 2 + z ** 2), 2 * (x * y + w * z)])
+        box_xy = qpos[:2] + 0.3 * forward_xy
 
+        # Box yaw: robot yaw ± 10°
         rng, key = jax.random.split(rng)
-        surface_z = jax.random.uniform(
-            key,
-            minval=self._config.box_surface_height_range[0],
-            maxval=self._config.box_surface_height_range[1],
-        )
-        support_half_z = self.mjx_model.geom_size[self._mj_model.geom("box_support_col").id][2]
-        box_z = surface_z + support_half_z + 0.15   # support_half_z + nominal box half-z
+        box_yaw_offset = jax.random.uniform(key, minval=-np.pi / 18, maxval=np.pi / 18)
+        robot_yaw = yaw[0]
+        box_yaw = robot_yaw + box_yaw_offset
+        box_quat = math.axis_angle_to_quat(jp.array([0, 0, 1]), jp.array([box_yaw]))
+
+        # Fixed surface height
+        surface_z = self._config.box_surface_height_range[0]   # 0.3 m
+        box_half_z = self.mjx_model.geom_size[self._box_geom_id][2]
+        support_half_z = self.mjx_model.geom_size[self._box_support_geom_id][2]
+        box_z = surface_z + support_half_z + box_half_z
 
         new_qpos = data.qpos.at[BOX_QPOS_START:BOX_QPOS_START + 3].set(
             jp.array([box_xy[0], box_xy[1], box_z])
         )
-        new_qpos = new_qpos.at[BOX_QPOS_START + 3].set(1.0)              # quat w
-        new_qpos = new_qpos.at[BOX_QPOS_START + 4:BOX_QPOS_START + 7].set(0.0)  # quat xyz
+        new_qpos = new_qpos.at[BOX_QPOS_START + 3:BOX_QPOS_START + 7].set(box_quat)
         data = data.replace(qpos=new_qpos)
 
-        # Reposition support surface under the box via qpos (freejoint, not mocap)
         new_qpos = data.qpos.at[SUPPORT_QPOS_START:SUPPORT_QPOS_START + 3].set(
             jp.array([box_xy[0], box_xy[1], surface_z])
         )
-        new_qpos = new_qpos.at[SUPPORT_QPOS_START + 3].set(1.0)            # quat w
-        new_qpos = new_qpos.at[SUPPORT_QPOS_START + 4:SUPPORT_QPOS_START + 7].set(0.0)
+        new_qpos = new_qpos.at[SUPPORT_QPOS_START + 3:SUPPORT_QPOS_START + 7].set(box_quat)
         data = data.replace(qpos=new_qpos)
 
         data = mjx.forward(self.mjx_model, data)
 
-        # --- Sample HumanoidPF fields for all body parts ---
+        # --- Sample HumanoidPF fields ---
         head_pos = data.site_xpos[self._head_site_id]
         head_vel = jp.zeros_like(head_pos)
-        headgf = self.sample_field(self.gf, head_pos.reshape(1, -1))
-        headbf = self.sample_field(self.bf, head_pos.reshape(1, -1))
-        headdf = self.sample_field(self.sdf, head_pos.reshape(1, -1))
         pelv_pos = data.site_xpos[self._pelvis_imu_site_id]
         tors_pos = data.site_xpos[self._torso_imu_site_id]
-        pelvgf = self.sample_field(self.gf, pelv_pos.reshape(1, -1))
-        pelvbf = self.sample_field(self.bf, pelv_pos.reshape(1, -1))
-        pelvdf = self.sample_field(self.sdf, pelv_pos.reshape(1, -1))
-        torsgf = self.sample_field(self.gf, tors_pos.reshape(1, -1))
-        torsbf = self.sample_field(self.bf, tors_pos.reshape(1, -1))
-        torsdf = self.sample_field(self.sdf, tors_pos.reshape(1, -1))
         feet_pos = data.site_xpos[self._feet_site_id]
         feet_vel = jp.zeros_like(feet_pos)
-        feetgf = self.sample_field(self.gf, feet_pos)
-        feetbf = self.sample_field(self.bf, feet_pos)
-        feetdf = self.sample_field(self.sdf, feet_pos)
         hands_pos = data.site_xpos[self._hands_site_id]
         hands_vel = jp.zeros_like(hands_pos)
-        handsgf = self.sample_field(self.gf, hands_pos)
-        handsbf = self.sample_field(self.bf, hands_pos)
-        handsdf = self.sample_field(self.sdf, hands_pos)
         knees_pos = data.site_xpos[self._knees_site_id]
-        kneesgf = self.sample_field(self.gf, knees_pos)
-        kneesbf = self.sample_field(self.bf, knees_pos)
-        kneesdf = self.sample_field(self.sdf, knees_pos)
         shlds_pos = data.site_xpos[self._shlds_site_id]
-        shldsgf = self.sample_field(self.gf, shlds_pos)
-        shldsbf = self.sample_field(self.bf, shlds_pos)
-        shldsdf = self.sample_field(self.sdf, shlds_pos)
 
-        command = self.compute_cmd_from_rtf(
-            pelvgf.reshape(-1),
-            jp.concat([headgf, feetgf, handsgf], axis=0),
-            jp.concat([headbf, feetbf, handsbf], axis=0),
-        )
+        all_poses = jp.concatenate([
+            head_pos.reshape(1, -1), pelv_pos.reshape(1, -1), tors_pos.reshape(1, -1),
+            feet_pos, hands_pos, knees_pos, shlds_pos,
+        ], axis=0)
+        all_gf = self.sample_field(self.gf, all_poses)
+        all_bf = self.sample_field(self.bf, all_poses)
+        all_df = self.sample_field(self.sdf, all_poses)
+        headgf, pelvgf, torsgf, feetgf, handsgf, kneesgf, shldsgf = jp.split(all_gf, [1, 2, 3, 5, 7, 9], axis=0)
+        headbf, pelvbf, torsbf, feetbf, handsbf, kneesbf, shldsbf = jp.split(all_bf, [1, 2, 3, 5, 7, 9], axis=0)
+        headdf, pelvdf, torsdf, feetdf, handsdf, kneesdf, shldsdf = jp.split(all_df, [1, 2, 3, 5, 7, 9], axis=0)
 
-        # --- Box PF fields ---
-        box_pos = data.site_xpos[self._box_site_id]
-        box_vel = jp.zeros(3)
-        boxgf = self.sample_field(self.gf, box_pos.reshape(1, -1))
-        boxbf = self.sample_field(self.bf, box_pos.reshape(1, -1))
-        boxdf = self.sample_field(self.sdf, box_pos.reshape(1, -1))
+        # Stage 1 command is always zero; stage 2 command is PF-derived (computed in step())
+        command = jp.zeros(4)
 
         # --- Push interval ---
         rng, push_rng = jax.random.split(rng)
@@ -535,14 +565,13 @@ class G1CaTraEnv(G1CatEnv):
         )
 
         # --- Domain randomization scalars ---
-        rng, key_kp, key_kd, key_rfi, key_delay = jax.random.split(rng, 5)
+        rng, key_kp, key_kd, key_rfi = jax.random.split(rng, 4)
         kp_scale = jax.random.uniform(
             key_kp,
             minval=self._config.dm_rand_config.kp_range[0],
             maxval=self._config.dm_rand_config.kp_range[1],
         )
         kp_scale = jp.where(self._config.dm_rand_config.enable_pd, kp_scale, jp.ones_like(kp_scale))
-
         kd_scale = jax.random.uniform(
             key_kd,
             minval=self._config.dm_rand_config.kd_range[0],
@@ -559,11 +588,15 @@ class G1CaTraEnv(G1CatEnv):
         rfi_lim_scale = self._config.dm_rand_config.rfi_lim * rfi_lim_noise_scale * self.torque_limit
         rfi_lim_scale = jp.where(self._config.dm_rand_config.enable_rfi, rfi_lim_scale, jp.zeros_like(rfi_lim_scale))
 
+        # Box info
+        box_size = self.mjx_model.geom_size[self._box_geom_id]
+        box_mass = self.mjx_model.body_mass[self._box_body_id]
+        box_pos_init = data.xpos[self._box_body_id]
+
         info = {
             "rng": rng,
             "step": 0,
             "command": command,
-            # history
             "last_command": jp.zeros(4),
             "last_act": jp.zeros(self.action_size),
             "last_last_act": jp.zeros(self.action_size),
@@ -586,18 +619,18 @@ class G1CaTraEnv(G1CatEnv):
             "navi_pelvis_rpy": jp.zeros(3),
             "navi_pelvis_lin_vel": jp.zeros(3),
             "navi_pelvis_ang_vel": jp.zeros(3),
-            # Phase
+            # Gait
             "stop_timestep": 100,
             "phase": phase,
             "phase_dt": phase_dt,
             "gait_mask": jp.zeros(2),
             "gait_freq": gait_freq,
             "foot_height": foot_height,
-            # Domain randomization
+            # DR
             "kp_scale": kp_scale,
             "kd_scale": kd_scale,
             "rfi_lim_scale": rfi_lim_scale,
-            # Body HumanoidPF fields (current)
+            # Body HumanoidPF (current, world frame, normalized)
             "headgf": headgf.copy(), "headbf": headbf.copy(), "headdf": headdf.copy(),
             "pelvgf": pelvgf.copy(), "pelvbf": pelvbf.copy(), "pelvdf": pelvdf.copy(),
             "torsgf": torsgf.copy(), "torsbf": torsbf.copy(), "torsdf": torsdf.copy(),
@@ -611,7 +644,7 @@ class G1CaTraEnv(G1CatEnv):
             "feet_pos": feet_pos.copy(), "feet_vel": feet_vel.copy(),
             "hands_pos": hands_pos.copy(), "hands_vel": hands_vel.copy(),
             "knees_pos": knees_pos.copy(), "shlds_pos": shlds_pos.copy(),
-            # Delay buffer (body HumanoidPF)
+            # Delay buffers
             "command_delay": command, "odom_delay": qpos[:7],
             "headgf_delay": headgf.copy(), "headbf_delay": headbf.copy(), "headdf_delay": headdf.copy(),
             "pelvgf_delay": pelvgf.copy(), "pelvbf_delay": pelvbf.copy(), "pelvdf_delay": pelvdf.copy(),
@@ -620,24 +653,28 @@ class G1CaTraEnv(G1CatEnv):
             "handsgf_delay": handsgf.copy(), "handsbf_delay": handsbf.copy(), "handsdf_delay": handsdf.copy(),
             "kneesgf_delay": kneesgf.copy(), "kneesbf_delay": kneesbf.copy(), "kneesdf_delay": kneesdf.copy(),
             "shldsgf_delay": shldsgf.copy(), "shldsbf_delay": shldsbf.copy(), "shldsdf_delay": shldsdf.copy(),
-            # Box PF fields
-            "boxgf": boxgf.copy(), "boxbf": boxbf.copy(), "boxdf": boxdf.copy(),
-            "box_pos": box_pos.copy(), "box_vel": box_vel.copy(),
-            # Support surface height (fixed per episode)
-            "surface_z": surface_z,
+            # Box state
+            "box_pos": box_pos_init.copy(),
+            # Box metadata (for reward computation)
+            "surface_z": jp.array(surface_z),
+            "support_half_z": support_half_z,
+            "box_size": box_size,
+            "box_mass": box_mass,
+            "box_xy_init": box_xy,
+            "box_yaw_init": box_yaw,
         }
 
         metrics = {}
         for k in self._config.reward_config.scales.keys():
             metrics[f"reward/{k}"] = jp.zeros(())
 
-        contact = jp.array([geoms_colliding(data, geom_id, self._floor_geom_id) for geom_id in self._feet_geom_id])
-        obs = self._get_obs(data, info, contact)
+        feet_contact = jp.array([geoms_colliding(data, geom_id, self._floor_geom_id) for geom_id in self._feet_geom_id])
+        obs = self._get_obs(data, info, feet_contact)
         reward, done = jp.zeros(2)
         return mjx_env.State(data, obs, reward, done, metrics, info)
 
     def step(self, state: mjx_env.State, action: jax.Array) -> mjx_env.State:
-        """Step with 23-dim action; updates box PF fields after physics step."""
+        """Step with 23-dim action; pushes gated to stage 2, command switches at step 100."""
         state.info["rng"], push1_rng, push2_rng = jax.random.split(state.info["rng"], 3)
 
         push_theta = jax.random.uniform(push1_rng, maxval=2 * jp.pi)
@@ -647,15 +684,23 @@ class G1CaTraEnv(G1CatEnv):
             maxval=self._config.push_config.magnitude_range[1],
         )
         push_signal = jp.mod(state.info["push_step"] + 1, state.info["push_interval_steps"]) == 0
+        push_signal = push_signal & (state.info["step"] >= self._config.stage1_steps)   # only in stage 2
         push = jp.array([jp.cos(push_theta), jp.sin(push_theta)])
         push *= push_signal
         push *= self._config.push_config.enable
-        qvel = state.data.qvel
-        qvel = qvel.at[:2].set(qvel[:2] + push * push_magnitude)
-        data = state.data.replace(qvel=qvel)
-        state = state.replace(data=data)
+        qvel = state.data.qvel.at[:2].set(state.data.qvel[:2] + push * push_magnitude)
 
-        # Set motor targets (23-dim action, 29-dim full motor_targets)
+        # # One-time kick at stage transition to break standing-still inertia
+        # state.info["rng"], kick_rng = jax.random.split(state.info["rng"])
+        # kick_theta = jax.random.uniform(kick_rng, maxval=2 * jp.pi)
+        # kick = jp.array([jp.cos(kick_theta), jp.sin(kick_theta)]) * 2.0 # 2.0m/s is the kick magnitude
+        # at_transition = (state.info["step"] == self._config.stage1_steps)
+        # qvel = qvel.at[:2].set(qvel[:2] + kick * at_transition)
+
+        
+        state = state.replace(data=state.data.replace(qvel=qvel))
+
+        # Motor targets
         lower_motor_targets = jp.clip(
             state.info["motor_targets"][self.action_joint_ids]
             + action * self._config.action_scale,
@@ -665,7 +710,7 @@ class G1CaTraEnv(G1CatEnv):
         motor_targets = self._default_qpos.copy()
         motor_targets = motor_targets.at[self.action_joint_ids].set(lower_motor_targets)
 
-        # Physics step: use torque_step_catra to handle extra box freejoint DOF in qpos/qvel
+        # Physics step
         state.info["rng"], data = torque_step_catra(
             state.info["rng"],
             self.mjx_model,
@@ -680,7 +725,6 @@ class G1CaTraEnv(G1CatEnv):
             n_substeps=self.n_substeps,
         )
 
-        # Collect body state
         feet_contact = jp.array([geoms_colliding(data, geom_id, self._floor_geom_id) for geom_id in self._feet_geom_id])
         state.info["motor_targets"] = motor_targets
         state.info["local_lin_vel"] = self.get_local_linvel(data, "pelvis")
@@ -691,13 +735,12 @@ class G1CaTraEnv(G1CatEnv):
         pelvis2world_rot = data.site_xmat[self._pelvis_imu_site_id]
         navi2world_rot = base2navi_transform(pelvis2world_rot)
         state.info["navi2world_pose"] = state.info["navi2world_pose"].at[:3, :3].set(navi2world_rot)
-        state.info["navi2world_pose"] = (
-            state.info["navi2world_pose"].at[:2, 3].set(data.site_xpos[self._pelvis_imu_site_id][:2])
+        state.info["navi2world_pose"] = state.info["navi2world_pose"].at[:2, 3].set(
+            data.site_xpos[self._pelvis_imu_site_id][:2]
         )
-        state.info["navi2world_pose"] = (
-            state.info["navi2world_pose"].at[2, 3].set(self._config.reward_config.base_height_target)
+        state.info["navi2world_pose"] = state.info["navi2world_pose"].at[2, 3].set(
+            self._config.reward_config.base_height_target
         )
-
         pelvis2navi_rot = navi2world_rot.T @ pelvis2world_rot
         state.info["navi2world_rot"] = navi2world_rot
         state.info["navi_pelvis_rpy"] = jp.array(jaxlie.SO3.from_matrix(pelvis2navi_rot).as_rpy_radians())
@@ -709,7 +752,6 @@ class G1CaTraEnv(G1CatEnv):
         state.info["navi_torso_lin_vel"] = torso2navi_rot @ self.get_local_linvel(data, "torso")
         state.info["navi_torso_ang_vel"] = torso2navi_rot @ self.get_gyro(data, "torso")
 
-        state.info["rng"], cmd_rng = jax.random.split(state.info["rng"])
         state.info["last_command"] = state.info["command"].copy()
 
         # Sample body positions and PF fields
@@ -723,6 +765,7 @@ class G1CaTraEnv(G1CatEnv):
         hands_vel = (hands_pos - state.info["hands_pos"]) / self.dt
         knees_pos = data.site_xpos[self._knees_site_id]
         shlds_pos = data.site_xpos[self._shlds_site_id]
+
         all_poses = jp.concatenate([
             head_pos.reshape(1, -1), pelv_pos.reshape(1, -1), tors_pos.reshape(1, -1),
             feet_pos, hands_pos, knees_pos, shlds_pos,
@@ -734,12 +777,13 @@ class G1CaTraEnv(G1CatEnv):
         headbf, pelvbf, torsbf, feetbf, handsbf, kneesbf, shldsbf = jp.split(all_bf, [1, 2, 3, 5, 7, 9], axis=0)
         headdf, pelvdf, torsdf, feetdf, handsdf, kneesdf, shldsdf = jp.split(all_df, [1, 2, 3, 5, 7, 9], axis=0)
 
-        command = self.compute_cmd_from_rtf(
+        # PF-derived command (always computed; gated to zero in stage 1)
+        cmd_pf = self.compute_cmd_from_rtf(
             pelvgf.reshape(-1),
             jp.concat([headgf, feetgf, handsgf], axis=0),
             jp.concat([headbf, feetbf, handsbf], axis=0),
         )
-        state.info["command"] = command.copy()
+        state.info["command"] = jp.where(state.info["step"] < self._config.stage1_steps, jp.zeros(4), cmd_pf)
 
         # Delay buffer update
         update_pf = (state.info["step"] % 5) == 0
@@ -770,13 +814,8 @@ class G1CaTraEnv(G1CatEnv):
             jp.concat([headgf_delay, feetgf_delay, handsgf_delay], axis=0),
             jp.concat([headbf_delay, feetbf_delay, handsbf_delay], axis=0),
         )
-
-        # --- Box PF fields (sampled after physics step) ---
-        box_pos = data.site_xpos[self._box_site_id]
-        box_vel = (box_pos - state.info["box_pos"]) / self.dt
-        boxgf = self.sample_field(self.gf, box_pos.reshape(1, -1))
-        boxbf = self.sample_field(self.bf, box_pos.reshape(1, -1))
-        boxdf = self.sample_field(self.sdf, box_pos.reshape(1, -1))
+        # Gate delayed command same as primary command
+        command_delay = jp.where(state.info["step"] < self._config.stage1_steps, jp.zeros(4), command_delay)
 
         # Update info
         state.info["odom_delay"] = odom_delay.copy()
@@ -788,7 +827,6 @@ class G1CaTraEnv(G1CatEnv):
         state.info["kneesgf_delay"] = kneesgf_delay.copy(); state.info["kneesbf_delay"] = kneesbf_delay.copy(); state.info["kneesdf_delay"] = kneesdf_delay.copy()
         state.info["shldsgf_delay"] = shldsgf_delay.copy(); state.info["shldsbf_delay"] = shldsbf_delay.copy(); state.info["shldsdf_delay"] = shldsdf_delay.copy()
         state.info["command_delay"] = command_delay.copy()
-
         state.info["headgf"] = headgf.copy(); state.info["headbf"] = headbf.copy(); state.info["headdf"] = headdf.copy()
         state.info["pelvgf"] = pelvgf.copy(); state.info["pelvbf"] = pelvbf.copy(); state.info["pelvdf"] = pelvdf.copy()
         state.info["torsgf"] = torsgf.copy(); state.info["torsbf"] = torsbf.copy(); state.info["torsdf"] = torsdf.copy()
@@ -802,12 +840,7 @@ class G1CaTraEnv(G1CatEnv):
         state.info["hands_pos"] = hands_pos.copy(); state.info["hands_vel"] = hands_vel.copy()
         state.info["knees_pos"] = knees_pos.copy(); state.info["shlds_pos"] = shlds_pos.copy()
         state.info["push"] = push; state.info["push_step"] += 1; state.info["step"] += 1
-
-        # Box info update
-        state.info["boxgf"] = boxgf.copy(); state.info["boxbf"] = boxbf.copy(); state.info["boxdf"] = boxdf.copy()
-        state.info["box_pos"] = box_pos.copy(); state.info["box_vel"] = box_vel.copy()
-
-        # Update history
+        state.info["box_pos"] = data.xpos[self._box_body_id].copy()
         state.info["last_last_act"] = state.info["last_act"].copy()
         state.info["last_act"] = action.copy()
         state.info["last_joint_vel"] = data.qvel[6:6 + NUM_ROBOT_JOINTS].copy()
@@ -817,7 +850,13 @@ class G1CaTraEnv(G1CatEnv):
 
         rewards = self._get_reward(data, action, state.info, done, feet_contact)
         rewards = {k: v * self._config.reward_config.scales[k] for k, v in rewards.items()}
-        reward = jp.clip(sum(rewards.values()) * self.dt, 0.0, 10000.0)
+
+        # Clip reward for stage 2, just like in CAT
+        raw_reward = sum(rewards.values()) * self.dt
+        in_stage2 = state.info["step"] >= self._config.stage1_steps
+        reward = jp.where(in_stage2, jp.clip(raw_reward, 0.0, 10000.0), raw_reward)
+
+        # reward = sum(rewards.values()) * self.dt
 
         timeout = state.info["step"] >= self._config.episode_length
         state.info["step"] = jp.where(done | timeout, 0, state.info["step"])
@@ -835,33 +874,50 @@ class G1CaTraEnv(G1CatEnv):
         return state
 
     def _get_obs(self, data: mjx.Data, info: dict[str, Any], feet_contact: jax.Array) -> mjx_env.Observation:
-        """State (191-dim) and privileged_state (259-dim) including box PF fields.
+        """195-dim state (deployable, noisy) and 289-dim privileged_state (noiseless + extras).
 
-        Extends G1CatEnv._get_obs by:
-        - Using 23-dim last_act and motor_targets (instead of 12-dim)
-        - Appending box PF fields (boxgf=3, boxbf=3, boxdf=1) to state
-        - Appending box PF + box_pos + box_vel to privileged_state
+        State (195):
+            noisy_gyro(3), noisy_gvec(3),
+            noisy_joint_angles[action_ids](23), noisy_joint_vel[action_ids](23),
+            last_act(23), motor_targets[action_ids](23),
+            command(4), foot_height(1), gait_phase(4),
+            body_pf_delayed_nav(77),
+            box_pos_local(3), box_quat_local(4), box_size(3), stage_flag(1)
+
+        Privileged (289 = 188 noiseless-state-block + 101 extras):
+            [same 188 fields, noiseless, world-frame PF, no box_pos_local/quat_local]
+            + linvel_pelvis(3), body_positions(33), body_velocities(15),
+              box_pos_world(3), box_quat_world(4), box_linvel(3), box_angvel(3),
+              navi_torso_rpy[:2](2)+gait_mask(2)+feet_contact(2),
+              rfi_lim_scale(29), kp_scale(1), kd_scale(1)
         """
         gyro_pelvis = self.get_gyro(data, "pelvis")
         gvec_pelvis = data.site_xmat[self._pelvis_imu_site_id].T @ jp.array([0, 0, -1])
         linvel_pelvis = self.get_local_linvel(data, "pelvis")
-        # Use robot joints only: qpos[7:36], qvel[6:35]
         joint_angles = data.qpos[7:7 + NUM_ROBOT_JOINTS]
         joint_vel = data.qvel[6:6 + NUM_ROBOT_JOINTS]
         gait_phase = jp.concatenate([jp.cos(info["phase"]), jp.sin(info["phase"])])
 
+        # Box pose in pelvis frame (for deployable state)
+        pelvis_pos = data.xpos[self._pelvis_body_id]
+        pelvis_rot = data.site_xmat[self._pelvis_imu_site_id].reshape(3, 3)
+        pelvis_xquat = data.xquat[self._pelvis_body_id]
+        box_pos_world = data.xpos[self._box_body_id]
+        box_quat_world = data.xquat[self._box_body_id]
+        box_pos_local = pelvis_rot.T @ (box_pos_world - pelvis_pos)
+        pelvis_xquat_conj = pelvis_xquat * jp.array([1., -1., -1., -1.])
+        box_quat_local = math.quat_mul(pelvis_xquat_conj, box_quat_world)
+
+        # Box world-frame velocity (for privileged)
+        box_linvel_world = data.qvel[BOX_QVEL_START:BOX_QVEL_START + 3]
+        box_angvel_world = data.qvel[BOX_QVEL_START + 3:BOX_QVEL_START + 6]
+
+        stage_flag = jp.where(info["step"] >= self._config.stage1_steps, jp.array(1.0), jp.array(0.0))
+
         navi2world_pose = info["navi2world_pose"]
 
-        # --- Privileged state (noiseless) ---
-        privileged_state = jp.hstack([
-            gyro_pelvis, gvec_pelvis,
-            (joint_angles - self._default_qpos)[self.obs_joint_ids],
-            joint_vel[self.obs_joint_ids],
-            info["last_act"],                               # 23-dim
-            info["motor_targets"][self.action_joint_ids],   # 23-dim
-            info["command"], info["foot_height"], gait_phase,
-            linvel_pelvis,
-            # Body PF fields (non-delayed, world frame)
+        # --- Build noiseless body PF block (77 dims, world frame, non-delayed) ---
+        pf_noiseless = jp.hstack([
             info["headgf"].reshape(-1), info["headbf"].reshape(-1), info["headdf"].reshape(-1),
             info["pelvgf"].reshape(-1), info["pelvbf"].reshape(-1), info["pelvdf"].reshape(-1),
             info["torsgf"].reshape(-1), info["torsbf"].reshape(-1), info["torsdf"].reshape(-1),
@@ -869,18 +925,30 @@ class G1CaTraEnv(G1CatEnv):
             info["handsgf"].reshape(-1), info["handsbf"].reshape(-1), info["handsdf"].reshape(-1),
             info["kneesgf"].reshape(-1), info["kneesbf"].reshape(-1), info["kneesdf"].reshape(-1),
             info["shldsgf"].reshape(-1), info["shldsbf"].reshape(-1), info["shldsdf"].reshape(-1),
-            # Body positions/velocities
-            info["head_pos"].reshape(-1), info["head_vel"].reshape(-1),
-            info["pelv_pos"].reshape(-1), info["tors_pos"].reshape(-1),
-            info["feet_pos"].reshape(-1), info["feet_vel"].reshape(-1),
-            info["hands_pos"].reshape(-1), info["hands_vel"].reshape(-1),
-            info["knees_pos"].reshape(-1), info["shlds_pos"].reshape(-1),
+        ])
+
+        # --- Privileged state (289 dims) ---
+        privileged_state = jp.hstack([
+            # Noiseless state block (188 dims, without box_pos_local/quat_local)
+            gyro_pelvis, gvec_pelvis,
+            (joint_angles - self._default_qpos)[self.action_joint_ids],
+            joint_vel[self.action_joint_ids],
+            info["last_act"],
+            info["motor_targets"][self.action_joint_ids],
+            info["command"], info["foot_height"], gait_phase,
+            pf_noiseless,
+            info["box_size"],
+            stage_flag.reshape(1),
+            # Privileged extras (101 dims)
+            linvel_pelvis,
+            info["pelv_pos"].reshape(-1), info["tors_pos"].reshape(-1), info["head_pos"].reshape(-1),
+            info["shlds_pos"].reshape(-1), info["hands_pos"].reshape(-1),
+            info["knees_pos"].reshape(-1), info["feet_pos"].reshape(-1),
+            info["head_vel"].reshape(-1), info["hands_vel"].reshape(-1), info["feet_vel"].reshape(-1),
+            box_pos_world, box_quat_world, box_linvel_world, box_angvel_world,
             info["navi_torso_rpy"][:2], info["gait_mask"], feet_contact,
-            # Domain randomization
-            info["kp_scale"], info["kd_scale"], info["rfi_lim_scale"],
-            # Box PF + pose (privileged extra)
-            info["boxgf"].reshape(-1), info["boxbf"].reshape(-1), info["boxdf"].reshape(-1),
-            info["box_pos"].reshape(-1), info["box_vel"].reshape(-1),
+            info["rfi_lim_scale"],
+            info["kp_scale"].reshape(1), info["kd_scale"].reshape(1),
         ])
 
         # --- Noisy observations for deployable state ---
@@ -900,7 +968,7 @@ class G1CaTraEnv(G1CatEnv):
         noisy_joint_vel = joint_vel + (2 * jax.random.uniform(noise_rng, shape=joint_vel.shape) - 1) \
             * self._config.noise_config.level * self._config.noise_config.scales.joint_vel
 
-        # Body PF fields: delayed + nav-frame transform
+        # Body PF: delayed + nav-frame transform
         headgf = world_to_navi_vel(navi2world_pose, info["headgf_delay"].reshape(-1, 3))
         headbf = world_to_navi_vel(navi2world_pose, info["headbf_delay"].reshape(-1, 3))
         pelvgf = world_to_navi_vel(navi2world_pose, info["pelvgf_delay"].reshape(-1, 3))
@@ -915,6 +983,7 @@ class G1CaTraEnv(G1CatEnv):
         kneesbf = world_to_navi_vel(navi2world_pose, info["kneesbf_delay"].reshape(-1, 3))
         shldsgf = world_to_navi_vel(navi2world_pose, info["shldsgf_delay"].reshape(-1, 3))
         shldsbf = world_to_navi_vel(navi2world_pose, info["shldsbf_delay"].reshape(-1, 3))
+
         command = info["command"].copy()
         command = command.at[-3:].set(world_to_navi_vel(navi2world_pose, info["command_delay"][-3:].reshape(-1, 3)).reshape(-1))
         command = command.at[-1].set(0)
@@ -926,12 +995,6 @@ class G1CaTraEnv(G1CatEnv):
         handsbf = handsbf * (info["handsdf_delay"] < 0.5); handsdf = jp.clip(info["handsdf_delay"], -1.0, 0.5)
         kneesbf = kneesbf * (info["kneesdf_delay"] < 0.5); kneesdf = jp.clip(info["kneesdf_delay"], -1.0, 0.5)
         shldsbf = shldsbf * (info["shldsdf_delay"] < 0.5); shldsdf = jp.clip(info["shldsdf_delay"], -1.0, 0.5)
-
-        # Box PF in nav frame (using current, not delayed)
-        boxgf_navi = world_to_navi_vel(navi2world_pose, info["boxgf"].reshape(-1, 3))
-        boxbf_navi = world_to_navi_vel(navi2world_pose, info["boxbf"].reshape(-1, 3))
-        boxdf_clip = jp.clip(info["boxdf"], -1.0, 0.5)
-        boxbf_navi = boxbf_navi * (info["boxdf"] < 0.5)
 
         pf = jp.hstack([
             headgf.reshape(-1), headbf.reshape(-1), headdf.reshape(-1),
@@ -945,40 +1008,48 @@ class G1CaTraEnv(G1CatEnv):
 
         state = jp.hstack([
             noisy_gyro_pelvis, noisy_gvec_pelvis,
-            (noisy_joint_angles - self._default_qpos)[self.obs_joint_ids],
-            noisy_joint_vel[self.obs_joint_ids],
-            info["last_act"],                               # 23-dim
-            info["motor_targets"][self.action_joint_ids],   # 23-dim
+            (noisy_joint_angles - self._default_qpos)[self.action_joint_ids],
+            noisy_joint_vel[self.action_joint_ids],
+            info["last_act"],
+            info["motor_targets"][self.action_joint_ids],
             command, info["foot_height"], gait_phase,
             pf,
-            # Box PF in nav frame (deployable: no absolute positions)
-            boxgf_navi.reshape(-1), boxbf_navi.reshape(-1), boxdf_clip.reshape(-1),
+            box_pos_local, box_quat_local, info["box_size"],
+            stage_flag.reshape(1),
         ])
 
-        state = jp.nan_to_num(state)
-        privileged_state = jp.nan_to_num(privileged_state)
-        return {"state": state, "privileged_state": privileged_state}
+        return {
+            "state": jp.nan_to_num(state),
+            "privileged_state": jp.nan_to_num(privileged_state),
+        }
 
     def _get_termination(self, data: mjx.Data, info: dict[str, Any]) -> jax.Array:
-        """Inherits body termination from G1CatEnv; adds box-in-obstacle termination."""
+        """Fall + body-obstacle SDF collision (active after step 150) + box drop (always active)."""
         fall_termination = self.get_gravity(data, "pelvis")[2] < 0.0
         fall_termination |= info["head_pos"][2] < 0.7
+
         contact_termination = collision.geoms_colliding(data, self._right_foot_geom_id, self._left_foot_geom_id)
         contact_termination |= collision.geoms_colliding(data, self._left_foot_geom_id, self._right_shin_geom_id)
         contact_termination |= collision.geoms_colliding(data, self._right_foot_geom_id, self._left_shin_geom_id)
-        contact_termination |= jp.any(info['headdf'] < -self._config.term_collision_threshold)
-        contact_termination |= jp.any(info['pelvdf'] < -self._config.term_collision_threshold)
-        contact_termination |= jp.any(info['torsdf'] < -self._config.term_collision_threshold)
-        contact_termination |= jp.any(info['feetdf'] < -self._config.term_collision_threshold)
-        contact_termination |= jp.any(info['handsdf'] < -self._config.term_collision_threshold)
-        contact_termination |= jp.any(info['kneesdf'] < -self._config.term_collision_threshold)
-        contact_termination |= jp.any(info['shldsdf'] < -self._config.term_collision_threshold)
-        # Box inside obstacle
-        contact_termination |= jp.any(info['boxdf'] < -self._config.term_collision_threshold)
-        # Box dropped to the floor
-        contact_termination |= info['box_pos'][2] < self._config.box_drop_threshold
-        contact_termination &= (info["step"] >= 50)
-        return fall_termination | contact_termination | jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any()
+
+        thr = self._config.term_collision_threshold
+        contact_termination |= jp.any(info['headdf'] < -thr)
+        contact_termination |= jp.any(info['pelvdf'] < -thr)
+        contact_termination |= jp.any(info['torsdf'] < -thr)
+        contact_termination |= jp.any(info['feetdf'] < -thr)
+        contact_termination |= jp.any(info['handsdf'] < -thr)
+        contact_termination |= jp.any(info['kneesdf'] < -thr)
+        contact_termination |= jp.any(info['shldsdf'] < -thr)
+
+        # Body-obstacle SDF collision active only after step 150 (allow pickup phase to settle)
+        contact_termination &= (info["step"] >= self._config.stage1_steps + 50)
+
+        # Box dropped — active throughout the full episode
+        box_drop_termination = info['box_pos'][2] < self._config.box_drop_threshold
+
+        return fall_termination | contact_termination | box_drop_termination | jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any()
+        # return fall_termination | contact_termination | jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any()   # CHANGED
+
 
     def _get_reward(
             self,
@@ -988,47 +1059,216 @@ class G1CaTraEnv(G1CatEnv):
             done: jax.Array,
             feet_contact: jax.Array,
     ) -> dict[str, jax.Array]:
-        """Same rewards as G1CatEnv; box-specific terms (boxgf, boxdf, box_height) are excluded."""
-        move_flag = info["command"][0]
-        cmd_vel = info["command"][1:].copy()
+        """Two-stage reward: stage 1 uses Pickup terms, stage 2 uses navigation + carry terms."""
+        stage1_active = info["step"] < self._config.stage1_steps
 
-        reward_dict = {
-            # Inherited behavior rewards
+        # -----------------------------------------------------------------------
+        # Always-active terms
+        # -----------------------------------------------------------------------
+        joint_torque   = self._cost_torque(data.actuator_force)
+        smoothness_joint = self._cost_smoothness_joint(data, info["last_joint_vel"])
+        joint_limits   = self._cost_joint_pos_limits(data.qpos[7:7 + NUM_ROBOT_JOINTS])
+
+        # -----------------------------------------------------------------------
+        # Stage 1: Pickup reward computation
+        # -----------------------------------------------------------------------
+        box_pos = data.xpos[self._box_body_id]
+        box_z = box_pos[2]
+        box_half_z = info["box_size"][2]
+        box_half_y = info["box_size"][1]
+
+        left_palm_pos  = data.site_xpos[self._hands_site_id[0]]
+        right_palm_pos = data.site_xpos[self._hands_site_id[1]]
+        box_quat = data.xquat[self._box_body_id]
+
+        # Reach
+        box_left_axis = math.rotate(jp.array([0., 1., 0.]), box_quat)
+        left_target  = box_pos + box_left_axis * box_half_y
+        right_target = box_pos - box_left_axis * box_half_y
+        reach = -(jp.linalg.norm(left_palm_pos - left_target) + jp.linalg.norm(right_palm_pos - right_target))
+
+        # Hand contact
+        left_contact  = geoms_colliding(data, self._hand_geom_ids[0], self._box_geom_id)
+        right_contact = geoms_colliding(data, self._hand_geom_ids[1], self._box_geom_id)
+        hand_contact  = 0.5 * (left_contact.astype(jp.float32) + right_contact.astype(jp.float32))
+
+        # Box–pillar contact
+        box_pillar_contact = geoms_colliding(data, self._box_geom_id, self._box_support_geom_id).astype(jp.float32)
+
+        # Grasp symmetry
+        box_up_axis  = math.rotate(jp.array([0., 0., 1.]), box_quat)
+        box_fwd_axis = math.rotate(jp.array([1., 0., 0.]), box_quat)
+        left_rel  = left_palm_pos - box_pos
+        right_rel = right_palm_pos - box_pos
+        height_diff = jp.dot(left_rel - right_rel, box_up_axis)
+        depth_diff  = jp.dot(left_rel - right_rel, box_fwd_axis)
+        grasp_symmetry = height_diff ** 2 + depth_diff ** 2
+
+        # Palm orientation
+        left_xmat  = data.site_xmat[self._hands_site_id[0]].reshape(3, 3)
+        right_xmat = data.site_xmat[self._hands_site_id[1]].reshape(3, 3)
+        left_palm_normal  = -left_xmat[:, 1]
+        right_palm_normal =  right_xmat[:, 1]
+        left_dot  = jp.dot(left_palm_normal, -box_left_axis)
+        right_dot = jp.dot(right_palm_normal, box_left_axis)
+        palm_orient = 0.5 * (0.5 * (1.0 + left_dot) + 0.5 * (1.0 + right_dot))
+
+        # Hands level
+        hands_vec  = left_palm_pos - right_palm_pos
+        hands_level = hands_vec[2] ** 2 / (jp.dot(hands_vec, hands_vec) + 1e-6)
+
+        # Lift
+        lift_height = box_z - (info["surface_z"] + info["support_half_z"] + box_half_z)
+        lift = jp.clip(lift_height, 0.0, 0.10) / 0.10 - jp.clip(lift_height - 0.10, 0.0, None)
+
+        # Box vertical drift (gated on both hands touching)
+        both_hands = left_contact & right_contact
+        box_xy_drift = jp.linalg.norm(box_pos[:2] - info["box_xy_init"])
+        box_vertical = jp.where(both_hands, box_xy_drift ** 2, 0.0)
+
+        # Hold stable
+        box_linvel_raw = data.qvel[BOX_QVEL_START:BOX_QVEL_START + 3]
+        box_angvel_raw = data.qvel[BOX_QVEL_START + 3:BOX_QVEL_START + 6]
+        hold_stable = -(jp.linalg.norm(box_linvel_raw) + jp.linalg.norm(box_angvel_raw))
+
+        # Box yaw stable
+        qw, qz = box_quat[0], box_quat[3]
+        box_yaw_now = 2.0 * jp.arctan2(qz, qw)
+        yaw_diff = (box_yaw_now - info["box_yaw_init"] + jp.pi) % (2 * jp.pi) - jp.pi
+        box_yaw_stable = jp.where(both_hands, yaw_diff ** 2, 0.0)
+
+        # Box upright
+        qx, qy = box_quat[1], box_quat[2]
+        box_tilt_cos = jp.clip(1.0 - 2.0 * (qx ** 2 + qy ** 2), -1.0, 1.0)
+        box_tilt_angle = jp.arccos(box_tilt_cos)
+        box_upright = jp.where(lift_height > 0.0, jp.exp(-box_tilt_angle ** 2), 0.0)
+
+        # Box centering
+        torso_rot = data.site_xmat[self._torso_imu_site_id].reshape(3, 3)
+        torso_pos = data.site_xpos[self._torso_imu_site_id]
+        torso_right = torso_rot[:, 1]
+        lateral_offset = jp.dot(box_pos - torso_pos, torso_right)
+        box_centering = lateral_offset ** 2
+
+        # Robot upright
+        pelvis_rot = data.site_xmat[self._pelvis_imu_site_id].reshape(3, 3)
+        pelvis_rpy = jp.array(jaxlie.SO3.from_matrix(pelvis_rot).as_rpy_radians())
+        torso_rpy  = jp.array(jaxlie.SO3.from_matrix(torso_rot).as_rpy_radians())
+        err_roll        = jp.abs(pelvis_rpy[0]) + jp.abs(torso_rpy[0])
+        err_pitch_back  = jp.abs(jp.clip(torso_rpy[1], -jp.pi, 0.0))
+        err_pitch_any   = jp.abs(torso_rpy[1])
+        upright = jp.exp(-0.5 * (err_roll + err_pitch_back + err_pitch_any)) - err_pitch_back
+
+        # Foot stability (stage 1: stance only)
+        stance_gait = jp.ones(2)
+        foot_contact_s1  = self._cost_foot_contact(data, feet_contact, stance_gait, jp.array(1.0))
+        foot_slip_s1     = self._cost_foot_slip(data, stance_gait)
+        straight_knee_s1 = self._cost_straight_knee(data.qpos[jp.array(self._knee_indices) + 7])
+        smoothness_s1    = -jp.sum((action - info["last_act"]) ** 2)
+        base_height      = self._reward_base_height(data.qpos[2], jp.zeros(()))
+
+        # Foot balance
+        pelvis_com_xy = data.subtree_com[self.body_id_pelvis][:2]
+        left_foot_xy  = data.site_xpos[self._feet_site_id[0]][:2]
+        right_foot_xy = data.site_xpos[self._feet_site_id[1]][:2]
+        foot_center   = left_foot_xy + right_foot_xy - 2 * pelvis_com_xy
+        centering_cost = jp.sum(jp.square(foot_center))
+        feet_site_pos = data.site_xpos[self._feet_site_id]
+        foot_dist     = jp.linalg.norm(feet_site_pos[0] - feet_site_pos[1])
+        spread_penalty = jp.where(foot_dist < 0.35, (0.35 - foot_dist) * 10, 0.0)
+        foot_balance_s1 = centering_cost * (1 + spread_penalty)
+
+        stage1_dict = {
+            "reach":            reach,
+            "lift":             lift,
+            "hand_contact":     hand_contact,
+            "box_pillar_contact": box_pillar_contact,
+            "grasp_symmetry":   grasp_symmetry,
+            "palm_orient":      palm_orient,
+            "hands_level":      hands_level,
+            "hold_stable":      hold_stable,
+            "box_yaw_stable":   box_yaw_stable,
+            "box_centering":    box_centering,
+            "box_vertical":     box_vertical,
+            "box_upright":      box_upright,
+            "upright":          upright,
+            "foot_contact":     foot_contact_s1,
+            "foot_slip":        foot_slip_s1,
+            "straight_knee":    straight_knee_s1,
+            "smoothness":       smoothness_s1,
+            "base_height":      base_height,
+            "foot_balance":     foot_balance_s1,
+        }
+
+        # -----------------------------------------------------------------------
+        # Stage 2: navigation (CAT) + carry maintenance
+        # -----------------------------------------------------------------------
+        move_flag = info["command"][0]
+        cmd_vel   = info["command"][1:].copy()
+
+        stage2_dict = {
             "tracking_orientation": self._reward_orientation(
                 info["navi_pelvis_rpy"], info["navi_torso_rpy"],
-                info["head_pos"][..., 0] > 1.5,
+                info["head_pos"][2] > (self._config.torso_height[1] + 0.1),
             ),
             "tracking_root_field": self._reward_tracking_root_field(cmd_vel, info["global_lin_vel"]),
-            "body_motion": self._cost_body_motion(info["global_lin_vel"], info["navi_torso_ang_vel"], cmd_vel),
-            "body_rotation": self._reward_body_rotation(data, cmd_vel, info["navi2world_rot"]),
-            "foot_contact": self._cost_foot_contact(data, feet_contact, info["gait_mask"], move_flag),
-            "foot_clearance": self._cost_foot_clearance(data, info["foot_height"], info["gait_mask"], move_flag),
-            "foot_slip": self._cost_foot_slip(data, info["gait_mask"]),
-            "foot_balance": self._cost_foot_balance(data, info["navi2world_pose"], move_flag),
-            "straight_knee": self._cost_straight_knee(data.qpos[jp.array(self._knee_indices) + 7]),
-            "foot_far": self._cost_foot_far(data),
-            # Energy
-            "joint_limits": self._cost_joint_pos_limits(data.qpos[7:7 + NUM_ROBOT_JOINTS]),
-            "joint_torque": self._cost_torque(data.actuator_force),
-            "smoothness_joint": self._cost_smoothness_joint(data, info["last_joint_vel"]),
-            "smoothness_action": self._cost_smoothness_action(action, info["last_act"], info["last_last_act"]),
-            # Body HumanoidPF
+            "body_motion":         self._cost_body_motion(info["global_lin_vel"], info["navi_torso_ang_vel"], cmd_vel),
+            "body_rotation":       self._reward_body_rotation(data, cmd_vel, info["navi2world_rot"]),
+            "foot_contact_trav":   self._cost_foot_contact(data, feet_contact, info["gait_mask"], move_flag),
+            "foot_clearance":      self._cost_foot_clearance(data, info["foot_height"], info["gait_mask"], move_flag),
+            "foot_slip_trav":      self._cost_foot_slip(data, info["gait_mask"]),
+            "foot_balance_trav":   self._cost_foot_balance(data, info["navi2world_pose"], move_flag),
+            "foot_far":            self._cost_foot_far(data),
+            "straight_knee_trav":  self._cost_straight_knee(data.qpos[jp.array(self._knee_indices) + 7]),
+            "smoothness_action":   self._cost_smoothness_action(action, info["last_act"], info["last_last_act"]),
+            "forward_progress":    self._reward_forward_progress(info["global_lin_vel"], cmd_vel),
             "headgf": self._re_gf0(info["headgf"], info["head_vel"], info["headdf"],
                                     (move_flag[None] < 0.5) | (info["head_pos"][..., 0] > 1.5), tau=0.5),
             "feetgf": self._re_gf0(info["feetgf"], info["feet_vel"], info["feetdf"],
                                     (move_flag[None] < 0.5) | (info["gait_mask"] == 1) | (info["feet_pos"][..., 0] > 1.5), tau=0.3),
             "handsgf": self._re_gf0(info["handsgf"], info["hands_vel"], info["handsdf"],
                                      (move_flag[None] < 0.5) | (info["hands_pos"][..., 0] > 1.5), tau=0.5),
-            "headdf": self._re_sdf(info["headdf"]),
-            "feetdf": self._re_sdf(info["feetdf"]),
+            "headdf":  self._re_sdf(info["headdf"]),
+            "feetdf":  self._re_sdf(info["feetdf"]),
             "handsdf": self._re_sdf(info["handsdf"]),
             "kneesdf": self._re_sdf(info["kneesdf"]),
             "shldsdf": self._re_sdf(info["shldsdf"]),
+            # Carry maintenance (reuse computed Pickup values)
+            "reach_carry":          reach,
+            "lift_carry":           lift,
+            "hand_contact_carry":   hand_contact,
+            "grasp_symmetry_carry": grasp_symmetry,
+            "palm_orient_carry":    palm_orient,
+            "hands_level_carry":    hands_level,
         }
-        for k, v in reward_dict.items():
-            reward_dict[k] = jp.where(jp.isnan(v), 0.0, v)
-        return reward_dict
 
+        # -----------------------------------------------------------------------
+        # Gate and combine
+        # -----------------------------------------------------------------------
+        rewards = {
+            "joint_torque":    joint_torque,
+            "smoothness_joint": smoothness_joint,
+            "joint_limits":    joint_limits,
+        }
+        for k, v in stage1_dict.items():
+            rewards[k] = jp.where(stage1_active, v, 0.0)
+        for k, v in stage2_dict.items():
+            rewards[k] = jp.where(stage1_active, 0.0, v)
+
+        for k, v in rewards.items():
+            rewards[k] = jp.where(jp.isnan(v), 0.0, v)
+        return rewards
+
+    def _reward_forward_progress(self, global_lin_vel: jax.Array, cmd_vel: jax.Array) -> jax.Array:
+        """Reward velocity in the commanded direction, linear and always non-negative.
+        Unlike tracking_root_field (exp-based), this gives nonzero gradient from a dead stop.
+        cmd_vel: (3,) [vx, vy, yaw]; global_lin_vel: (3,) pelvis world-frame velocity.
+        """
+        cmd_xy = cmd_vel[:2]
+        cmd_norm = jp.linalg.norm(cmd_xy) + 1e-6
+        cmd_dir = cmd_xy / cmd_norm
+        v_along_cmd = jp.dot(global_lin_vel[:2], cmd_dir)
+        return jp.clip(v_along_cmd, 0.0, cmd_norm)
 
 
 @cat_ppo.registry.register("G1CaTra", "command_to_reference_fn")

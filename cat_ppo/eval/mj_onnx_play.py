@@ -28,6 +28,7 @@ class Args:
     yaw: float = 0.0          # initial robot yaw in degrees (0 = default forward direction)
     box_size: str = None      # box half-extents as "x,y,z" in metres (e.g. "0.15,0.20,0.15")
     box_mass: float = None    # box mass in kg (e.g. 1.5)
+    stage1_steps: int = -1    # for G1CaTra: override stage 1 length; -1 = use task default
     record: bool = False      # save rollout video to disk
     video_path: str = None    # output video path; defaults to <exp_name>/rollout.mp4
     video_width: int = 640
@@ -46,6 +47,8 @@ def play(args: Args):
     task_cfg = cat_ppo.registry.get(args.task, "config")
     env_cfg = task_cfg.env_config
     env_cfg.pf_config.path = args.obs_path
+    if args.stage1_steps >= 0 and hasattr(env_cfg, "stage1_steps"):
+        env_cfg.stage1_steps = args.stage1_steps
     env = env_class(task_type=env_cfg.task_type, config=env_cfg)
     env.pri = args.pri
 
@@ -98,6 +101,14 @@ def play(args: Args):
                 renderer.update_scene(env.mj_data)
                 frame = renderer.render()
                 writer.append_data(frame)
+
+            # DEBUG: print command and root velocity every 10 steps
+            if _ctr % 10 == 0:
+                cmd = state.info.get("command", None)
+                vel_xy = env.mj_data.qvel[0:2]
+                speed = np.linalg.norm(vel_xy)
+                cmd_str = f"command={np.round(cmd, 3)}  move_flag={cmd[0]:.2f}" if cmd is not None else ""
+                print(f"step {_ctr:4d}: vel_xy={np.round(vel_xy, 3)}  speed={speed:.3f}  {cmd_str}")
 
             _ctr += 1
     except KeyboardInterrupt:

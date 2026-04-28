@@ -793,7 +793,6 @@ _NUM_ROBOT = 29   # robot joints / velocities
 _BOX_Q_START = 7 + _NUM_ROBOT   # 36
 
 
-@cat_ppo.registry.register("G1CaTra", "play_env_class")
 class PlayG1CaTraEnv(PlayG1CatEnv):
     """CPU-based inference environment for the G1 CaTra policy.
 

@@ -3,11 +3,9 @@
 Usage:
     python check_catra.py
     python check_catra.py --obs_path data/assets/TypiObs/narrow1
-    python check_catra.py --surface_z 0.6   # fix surface height instead of random
 """
 import time
 from dataclasses import dataclass
-from typing import Optional
 
 import tyro
 
@@ -17,7 +15,6 @@ import cat_ppo
 @dataclass
 class Args:
     obs_path: str = "data/assets/TypiObs/empty"
-    surface_z: Optional[float] = None   # None = random from config range
 
 
 def main(args: Args):
@@ -26,7 +23,7 @@ def main(args: Args):
     cfg.env_config.pf_config.path = args.obs_path
 
     env = env_class(config=cfg.env_config)
-    env.reset(surface_z=args.surface_z)
+    env.reset()
 
     support_body_id = env.mj_model.body("box_support").id
     box_body_id = env.mj_model.body("carried_box").id
