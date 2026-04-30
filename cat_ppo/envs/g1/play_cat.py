@@ -469,6 +469,8 @@ class PlayG1CatEnv(BaseEnv):
         state.info["shldsdf"] = shldsdf.copy()
         state.info["step"] += 1
         state.info["last_act"] = action.copy()
+        succ = (headdf > -0.04).all() and (handsdf > -0.04).all() and (feetdf > -0.04).all() and (head_pos[2] > 0.7)
+        state.info["succ"] = succ
 
         obs = self.get_obs(state.info)
         return State(state.info, obs)
