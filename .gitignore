@@ -193,3 +193,5 @@ eval_videos_catra/
 /data/assets/New_RandObs/
 .env
 fig/
+*.npz
+data/assets/RealObs

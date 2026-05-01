@@ -102,14 +102,6 @@ def play(args: Args):
                 frame = renderer.render()
                 writer.append_data(frame)
 
-            # DEBUG: print command and root velocity every 10 steps
-            if _ctr % 10 == 0:
-                cmd = state.info.get("command", None)
-                vel_xy = env.mj_data.qvel[0:2]
-                speed = np.linalg.norm(vel_xy)
-                cmd_str = f"command={np.round(cmd, 3)}  move_flag={cmd[0]:.2f}" if cmd is not None else ""
-                print(f"step {_ctr:4d}: vel_xy={np.round(vel_xy, 3)}  speed={speed:.3f}  {cmd_str}")
-
             _ctr += 1
     except KeyboardInterrupt:
         pass
