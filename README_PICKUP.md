@@ -223,7 +223,7 @@ MjxEnv (mujoco_playground)
   `torque_step_catra` slices only `[7:36]` / `[6:35]` so the extra DOFs don't interfere.
 - **Support pillar**: The support body has a freejoint (not mocap) so MJX contact detection works. Its position and yaw are set in `reset()` via `qpos[43:50]`; yaw matches the box so the rectangular face (0.4 × 0.5 m, half-extents 0.2 × 0.25) is aligned with the box sides. With `mass=1000 kg` it is effectively immovable. Contact bit scheme: pillar `contype=6/conaffinity=6` (bits 1+2), box `contype=3/conaffinity=3` (bits 0+1), floor `contype=5/conaffinity=5` (bits 0+2) — pillar sits on floor (bit 2) and supports the box (bit 1) without colliding with the robot (bit 0 only).
 - **Box size in DR**: `domain_randomize_pickup` modifies `model.geom_size[box_geom_id]` per-environment via JAX vmap, so each parallel environment sees a different box.
-- **Noisy vs noiseless obs**: State uses per-step noise injection on gyro, gravity, joint_angles, joint_vel. Privileged state is built independently with raw sensor values.
+- **Noisy vs noiseless obs**: State uses per-step noise injection on gyro, gravity, joint_angles, joint_vel. Privileged state is built independently with raw sensor values. `box_pos_local` and `box_quat_local` are currently **noise-free** in both training and eval — in real deployment these would be estimated (e.g. via vision), so noise should be added in a future iteration for better sim-to-real transfer.
 
 ### Files
 

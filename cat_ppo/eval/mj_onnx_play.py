@@ -29,11 +29,17 @@ class Args:
     box_size: str = None      # box half-extents as "x,y,z" in metres (e.g. "0.15,0.20,0.15")
     box_mass: float = None    # box mass in kg (e.g. 1.5)
     stage1_steps: int = -1    # for G1CaTra: override stage 1 length; -1 = use task default
+    warmstart_states_path: str = None  # path to .npz warm-start file; starts episode in Stage 2
+    warmstart_idx: int = -1   # which saved state to load (-1 = random)
     record: bool = False      # save rollout video to disk
     video_path: str = None    # output video path; defaults to <exp_name>/rollout.mp4
     video_width: int = 640
     video_height: int = 480
     video_fps: int = 50       # matches ctrl_dt=0.02 s (50 Hz)
+    cam_distance: float = 5.0       # camera distance from lookat point (metres)
+    cam_azimuth: float = 135.0      # camera azimuth angle (degrees)
+    cam_elevation: float = -20.0    # camera elevation angle (degrees)
+    cam_lookat: str = None          # lookat point as "x,y,z"; defaults to robot base position
 
 
 @dataclass
@@ -49,6 +55,10 @@ def play(args: Args):
     env_cfg.pf_config.path = args.obs_path
     if args.stage1_steps >= 0 and hasattr(env_cfg, "stage1_steps"):
         env_cfg.stage1_steps = args.stage1_steps
+    if args.warmstart_states_path and hasattr(env_cfg, "warmstart_states_path"):
+        env_cfg.warmstart_states_path = args.warmstart_states_path
+        if args.stage1_steps < 0 and hasattr(env_cfg, "stage1_steps"):
+            env_cfg.stage1_steps = 0
     env = env_class(task_type=env_cfg.task_type, config=env_cfg)
     env.pri = args.pri
 
@@ -71,8 +81,16 @@ def play(args: Args):
     # Set up video recorder if requested
     renderer = None
     writer = None
+    cam = None
     if args.record:
         renderer = mujoco.Renderer(env.mj_model, height=args.video_height, width=args.video_width)
+        cam = mujoco.MjvCamera()
+        cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+        cam.distance = args.cam_distance
+        cam.azimuth = args.cam_azimuth
+        cam.elevation = args.cam_elevation
+        if args.cam_lookat is not None:
+            cam.lookat[:] = [float(v) for v in args.cam_lookat.split(",")]
         if args.video_path is not None:
             video_path = args.video_path
         else:
@@ -82,7 +100,7 @@ def play(args: Args):
         writer = imageio.get_writer(video_path, fps=args.video_fps)
         print(f"Recording video to: {video_path}")
 
-    state = env.reset()
+    state = env.reset(warmstart_idx=args.warmstart_idx) if hasattr(env, '_ws_qpos') else env.reset()
     if args.yaw != 0.0:
         angle = np.deg2rad(args.yaw)
         env.mj_data.qpos[3:7] = [np.cos(angle/2), 0, 0, np.sin(angle/2)]  # wxyz pure yaw quaternion
@@ -98,7 +116,9 @@ def play(args: Args):
             state = env.step(state, action)
 
             if renderer is not None:
-                renderer.update_scene(env.mj_data)
+                if args.cam_lookat is None:
+                    cam.lookat[:] = env.mj_data.qpos[:3]  # track robot base
+                renderer.update_scene(env.mj_data, camera=cam)
                 frame = renderer.render()
                 writer.append_data(frame)
 

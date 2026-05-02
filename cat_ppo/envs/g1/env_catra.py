@@ -28,6 +28,8 @@ from mujoco_playground._src import collision
 from mujoco_playground._src import mjx_env
 from mujoco_playground._src.collision import geoms_colliding
 
+import functools
+
 import cat_ppo
 from cat_ppo.envs.g1.env_cat import (
     G1CatEnv,
@@ -148,7 +150,7 @@ def _make_domain_randomize_catra():
             )
 
             rng, key = jax.random.split(rng)
-            box_mass = jax.random.uniform(key, minval=1.0, maxval=3.0)
+            box_mass = jax.random.uniform(key, minval=1.0, maxval=2.0)
             body_mass = body_mass.at[_box_body_id].set(box_mass)
 
             return (pair_friction, dof_frictionloss, dof_armature, body_ipos, body_mass, qpos0, geom_size)
@@ -182,6 +184,108 @@ def _make_domain_randomize_catra():
 
 
 domain_randomize_catra = _make_domain_randomize_catra()
+
+
+def _make_domain_randomize_catra_warmstart(ws_box_mass: "jax.Array", ws_box_size: "jax.Array"):
+    """Factory: returns a DR function that sources box mass/size from saved state file.
+
+    Each env i receives state index i (sequential), box_mass and box_size from
+    ws_box_mass[i] / ws_box_size[i].  The index is encoded in qpos0[0] so reset()
+    can retrieve it without knowing the env axis position.
+    """
+    _mj = mujoco.MjModel.from_xml_path(str(consts.CATRA_FLAT_TERRAIN_XML))
+    _box_geom_id = _mj.geom("box_geom").id
+    _box_body_id = _mj.body("carried_box").id
+    del _mj
+
+    TORSO_BODY_ID = 16
+
+    def domain_randomize_catra_warmstart(model: mjx.Model, rng: jax.Array):
+        """Same robot DR as the default, but box mass/size come from the state file."""
+
+        @functools.partial(jax.vmap, in_axes=(0, 0))
+        def rand_dynamics(rng, idx):
+            pair_friction = model.pair_friction
+
+            rng, key = jax.random.split(rng)
+            frictionloss = model.dof_frictionloss[6:6 + NUM_ROBOT_JOINTS] * jax.random.uniform(
+                key, shape=(NUM_ROBOT_JOINTS,), minval=0.9, maxval=1.1
+            )
+            dof_frictionloss = model.dof_frictionloss.at[6:6 + NUM_ROBOT_JOINTS].set(frictionloss)
+
+            rng, key = jax.random.split(rng)
+            armature = model.dof_armature[6:6 + NUM_ROBOT_JOINTS] * jax.random.uniform(
+                key, shape=(NUM_ROBOT_JOINTS,), minval=1.0, maxval=1.05
+            )
+            dof_armature = model.dof_armature.at[6:6 + NUM_ROBOT_JOINTS].set(armature)
+
+            rng, key = jax.random.split(rng)
+            dpos = jax.random.uniform(key, (3,), minval=-0.1, maxval=0.1)
+            body_ipos = model.body_ipos.at[TORSO_BODY_ID].set(
+                model.body_ipos[TORSO_BODY_ID] + dpos
+            )
+
+            rng, key = jax.random.split(rng)
+            dmass = jax.random.uniform(key, shape=(model.nbody,), minval=0.9, maxval=1.1)
+            body_mass = model.body_mass.at[:].set(model.body_mass * dmass)
+
+            rng, key = jax.random.split(rng)
+            dmass_torso = jax.random.uniform(key, minval=-1.0, maxval=1.0)
+            body_mass = body_mass.at[TORSO_BODY_ID].set(body_mass[TORSO_BODY_ID] + dmass_torso)
+
+            rng, key = jax.random.split(rng)
+            qpos0 = model.qpos0
+            qpos0 = qpos0.at[7:7 + NUM_ROBOT_JOINTS].set(
+                qpos0[7:7 + NUM_ROBOT_JOINTS]
+                + jax.random.uniform(key, shape=(NUM_ROBOT_JOINTS,), minval=-0.05, maxval=0.05)
+            )
+
+            # Box mass/size: taken from the saved state file indexed by env index.
+            geom_size = model.geom_size.at[_box_geom_id].set(ws_box_size[idx])
+            body_mass = body_mass.at[_box_body_id].set(ws_box_mass[idx])
+
+            # Encode state index into qpos0[0] so reset() can retrieve it.
+            # qpos0[0] (root x) is never used after reset overwrites qpos with the saved state.
+            qpos0 = qpos0.at[0].set(idx.astype(jp.float32))
+
+            return (pair_friction, dof_frictionloss, dof_armature, body_ipos, body_mass, qpos0, geom_size)
+
+        num_envs = rng.shape[0]
+        indices = jp.arange(num_envs)
+        (pair_friction, frictionloss, armature, body_ipos, body_mass, qpos0, geom_size) = rand_dynamics(rng, indices)
+
+        in_axes = jax.tree_util.tree_map(lambda x: None, model)
+        in_axes = in_axes.tree_replace({
+            "pair_friction": 0,
+            "dof_frictionloss": 0,
+            "dof_armature": 0,
+            "body_ipos": 0,
+            "body_mass": 0,
+            "qpos0": 0,
+            "geom_size": 0,
+        })
+
+        model = model.tree_replace({
+            "pair_friction": pair_friction,
+            "dof_frictionloss": frictionloss,
+            "dof_armature": armature,
+            "body_ipos": body_ipos,
+            "body_mass": body_mass,
+            "qpos0": qpos0,
+            "geom_size": geom_size,
+        })
+
+        return model, in_axes
+
+    return domain_randomize_catra_warmstart
+
+
+def make_warmstart_domain_randomize_catra(states_path: str):
+    """Load states_path and return a DR function that carries box mass/size per env."""
+    npz = np.load(states_path)
+    ws_box_mass = jp.array(npz["box_mass"])   # (N,)
+    ws_box_size = jp.array(npz["box_size"])   # (N, 3)
+    return _make_domain_randomize_catra_warmstart(ws_box_mass, ws_box_size)
 
 
 def g1_catra_task_config() -> config_dict.ConfigDict:
@@ -291,19 +395,19 @@ def g1_catra_task_config() -> config_dict.ConfigDict:
                 kneesdf=0.0,   # overwritten by --lateral
                 shldsdf=0.0,   # overwritten by --lateral
                 # --- Stage 2 only: carry maintenance (same scales as Pickup) ---
-                # reach_carry=0.75,
-                # lift_carry=1.0,
-                # hand_contact_carry=1.0,
-                # grasp_symmetry_carry=-1.0,
-                # palm_orient_carry=1.0,
-                # hands_level_carry=-0.5,
-                # CHANGED
-                reach_carry=0.0,
-                lift_carry=0.0,
-                hand_contact_carry=0.0,
-                grasp_symmetry_carry=0.0,
-                palm_orient_carry=0.0,
-                hands_level_carry=0.0,
+                reach_carry=1.5,
+                lift_carry=2.0,
+                hand_contact_carry=2.0,
+                grasp_symmetry_carry=-2.0,
+                palm_orient_carry=2.0,
+                hands_level_carry=-1.0,
+                # # CHANGED
+                # reach_carry=0.0,
+                # lift_carry=0.0,
+                # hand_contact_carry=0.0,
+                # grasp_symmetry_carry=0.0,
+                # palm_orient_carry=0.0,
+                # hands_level_carry=0.0,
             ),
             base_height_target=0.75,
             foot_height_stance=0.0,
@@ -311,6 +415,8 @@ def g1_catra_task_config() -> config_dict.ConfigDict:
         term_collision_threshold=0.04,
         box_drop_threshold=0.3,
         box_surface_height_range=[0.3, 0.3],   # fixed: support body centre at 0.3 m
+        # Warm-start: when set, reset() loads robot+box state from a pre-generated file
+        warmstart_states_path=None,
         push_config=config_dict.create(
             enable=True,
             interval_range=[5.0, 10.0],
@@ -447,72 +553,133 @@ class G1CaTraEnv(G1CatEnv):
             self._mj_model.geom("right_hand_collision").id,
         ])
 
+        # Warm-start: load pre-generated states from file if configured
+        self._ws_qpos = None
+        self._ws_qvel = None
+        ws_path = getattr(self._config, "warmstart_states_path", None)
+        if ws_path:
+            npz = np.load(ws_path)
+            self._ws_qpos = jp.array(npz["qpos"])   # (N, nq)
+            self._ws_qvel = jp.array(npz["qvel"])   # (N, nv)
+            N = int(self._ws_qpos.shape[0])
+            print(f"[G1CaTraEnv] Loaded {N} warm-start states from {ws_path}")
+
     @property
     def action_size(self) -> int:
         return len(self.action_joint_names)  # 23
 
     def reset(self, rng: jax.Array) -> mjx_env.State:
-        """Reset with fixed surface_z=0.3, box 0.3 m in front, robot yaw ∈ [−90°, 90°]."""
-        qpos = self._init_q.copy()
-        qvel = jp.zeros(self.mjx_model.nv)
+        """Reset: loads a pre-generated warm-start state if configured, else random init."""
+        if self._ws_qpos is not None:
+            # --- Warm-start path: load saved (qpos, qvel) exactly as recorded ---
+            # State index for this env is encoded in qpos0[0] by domain_randomize_catra_warmstart.
+            state_idx = jp.round(self.mjx_model.qpos0[0]).astype(jp.int32)
+            qpos = self._ws_qpos[state_idx]      # (nq,) full state: root + joints + box + support
+            qvel = self._ws_qvel[state_idx]      # (nv,)
+            data = mjx_env.init(self.mjx_model, qpos=qpos, qvel=qvel, ctrl=qpos[7:7 + NUM_ROBOT_JOINTS])
+            data = mjx.forward(self.mjx_model, data)
 
-        rng, key = jax.random.split(rng)
-        dxy = jax.random.uniform(key, (2,), minval=-1.0, maxval=1.0)
-        qpos = qpos.at[0:2].set(qpos[0:2] + dxy)
-        qpos = qpos.at[2].set(0.8)
+            last_act_init = jp.zeros(self.action_size)
+            motor_targets_init = qpos[7:7 + NUM_ROBOT_JOINTS]   # PD targets match saved pose
+            last_jv_init = qvel[6:6 + NUM_ROBOT_JOINTS]
 
-        rng, key = jax.random.split(rng)
-        yaw = jax.random.uniform(key, (1,), minval=-np.pi / 2, maxval=np.pi / 2)
-        quat = math.axis_angle_to_quat(jp.array([0, 0, 1]), yaw)
-        new_quat = math.quat_mul(qpos[3:7], quat)
-        qpos = qpos.at[3:7].set(new_quat)
+            # Ancillary scalars needed by info dict below; derive from saved state / model.
+            surface_z = self._config.box_surface_height_range[0]
+            support_half_z = self.mjx_model.geom_size[self._box_support_geom_id][2]
+            box_xy = qpos[BOX_QPOS_START:BOX_QPOS_START + 2]
+            box_quat_ws = qpos[BOX_QPOS_START + 3:BOX_QPOS_START + 7]
+            box_yaw = jp.arctan2(2 * (box_quat_ws[0] * box_quat_ws[3] + box_quat_ws[1] * box_quat_ws[2]),
+                                  1 - 2 * (box_quat_ws[2] ** 2 + box_quat_ws[3] ** 2))
+        else:
+            # --- Default random-init path (unchanged) ---
+            qpos = self._init_q.copy()
+            qvel = jp.zeros(self.mjx_model.nv)
 
-        rng, key = jax.random.split(rng)
-        rand_qpos = qpos[7:7 + NUM_ROBOT_JOINTS] * jax.random.uniform(
-            key, (NUM_ROBOT_JOINTS,), minval=0.5, maxval=1.5
+            rng, key = jax.random.split(rng)
+            dxy = jax.random.uniform(key, (2,), minval=-1.0, maxval=1.0)
+            qpos = qpos.at[0:2].set(qpos[0:2] + dxy)
+            qpos = qpos.at[2].set(0.8)
+
+            rng, key = jax.random.split(rng)
+            yaw = jax.random.uniform(key, (1,), minval=-np.pi / 2, maxval=np.pi / 2)
+            quat = math.axis_angle_to_quat(jp.array([0, 0, 1]), yaw)
+            new_quat = math.quat_mul(qpos[3:7], quat)
+            qpos = qpos.at[3:7].set(new_quat)
+
+            rng, key = jax.random.split(rng)
+            rand_qpos = qpos[7:7 + NUM_ROBOT_JOINTS] * jax.random.uniform(
+                key, (NUM_ROBOT_JOINTS,), minval=0.5, maxval=1.5
+            )
+            rand_qpos = jp.clip(rand_qpos, self._soft_lowers, self._soft_uppers)
+            qpos = qpos.at[7:7 + NUM_ROBOT_JOINTS].set(rand_qpos)
+
+            data = mjx_env.init(self.mjx_model, qpos=qpos, qvel=qvel, ctrl=qpos[7:7 + NUM_ROBOT_JOINTS])
+
+            # Box 0.3 m in front along robot forward direction
+            w, x, y, z = qpos[3], qpos[4], qpos[5], qpos[6]
+            forward_xy = jp.array([1 - 2 * (y ** 2 + z ** 2), 2 * (x * y + w * z)])
+            box_xy = qpos[:2] + 0.3 * forward_xy
+
+            # Box yaw: robot yaw ± 10°
+            rng, key = jax.random.split(rng)
+            box_yaw_offset = jax.random.uniform(key, minval=-np.pi / 18, maxval=np.pi / 18)
+            robot_yaw = yaw[0]
+            box_yaw = robot_yaw + box_yaw_offset
+            box_quat = math.axis_angle_to_quat(jp.array([0, 0, 1]), jp.array([box_yaw]))
+
+            # Fixed surface height
+            surface_z = self._config.box_surface_height_range[0]   # 0.3 m
+            box_half_z = self.mjx_model.geom_size[self._box_geom_id][2]
+            support_half_z = self.mjx_model.geom_size[self._box_support_geom_id][2]
+            box_z = surface_z + support_half_z + box_half_z
+
+            new_qpos = data.qpos.at[BOX_QPOS_START:BOX_QPOS_START + 3].set(
+                jp.array([box_xy[0], box_xy[1], box_z])
+            )
+            new_qpos = new_qpos.at[BOX_QPOS_START + 3:BOX_QPOS_START + 7].set(box_quat)
+            data = data.replace(qpos=new_qpos)
+
+            new_qpos = data.qpos.at[SUPPORT_QPOS_START:SUPPORT_QPOS_START + 3].set(
+                jp.array([box_xy[0], box_xy[1], surface_z])
+            )
+            new_qpos = new_qpos.at[SUPPORT_QPOS_START + 3:SUPPORT_QPOS_START + 7].set(box_quat)
+            data = data.replace(qpos=new_qpos)
+
+            data = mjx.forward(self.mjx_model, data)
+
+            last_act_init = jp.zeros(self.action_size)
+            motor_targets_init = self._default_qpos.copy()
+            last_jv_init = jp.zeros(NUM_ROBOT_JOINTS)
+
+        # --- DR scalars (kp/kd/rfi, sampled fresh each reset) ---
+        rng, key_kp, key_kd, key_rfi = jax.random.split(rng, 4)
+        kp_scale = jax.random.uniform(
+            key_kp,
+            minval=self._config.dm_rand_config.kp_range[0],
+            maxval=self._config.dm_rand_config.kp_range[1],
         )
-        rand_qpos = jp.clip(rand_qpos, self._soft_lowers, self._soft_uppers)
-        qpos = qpos.at[7:7 + NUM_ROBOT_JOINTS].set(rand_qpos)
-
-        ## randomize the robot's root linear and angular velocity at reset
-        # rng, key = jax.random.split(rng)
-        # qvel = qvel.at[0:6].set(jax.random.uniform(key, (6,), minval=-0.5, maxval=0.5))
-
-        data = mjx_env.init(self.mjx_model, qpos=qpos, qvel=qvel, ctrl=qpos[7:7 + NUM_ROBOT_JOINTS])
-
-        # Box 0.3 m in front along robot forward direction
-        w, x, y, z = qpos[3], qpos[4], qpos[5], qpos[6]
-        forward_xy = jp.array([1 - 2 * (y ** 2 + z ** 2), 2 * (x * y + w * z)])
-        box_xy = qpos[:2] + 0.3 * forward_xy
-
-        # Box yaw: robot yaw ± 10°
-        rng, key = jax.random.split(rng)
-        box_yaw_offset = jax.random.uniform(key, minval=-np.pi / 18, maxval=np.pi / 18)
-        robot_yaw = yaw[0]
-        box_yaw = robot_yaw + box_yaw_offset
-        box_quat = math.axis_angle_to_quat(jp.array([0, 0, 1]), jp.array([box_yaw]))
-
-        # Fixed surface height
-        surface_z = self._config.box_surface_height_range[0]   # 0.3 m
-        box_half_z = self.mjx_model.geom_size[self._box_geom_id][2]
-        support_half_z = self.mjx_model.geom_size[self._box_support_geom_id][2]
-        box_z = surface_z + support_half_z + box_half_z
-
-        new_qpos = data.qpos.at[BOX_QPOS_START:BOX_QPOS_START + 3].set(
-            jp.array([box_xy[0], box_xy[1], box_z])
+        kp_scale = jp.where(self._config.dm_rand_config.enable_pd, kp_scale, jp.ones_like(kp_scale))
+        kd_scale = jax.random.uniform(
+            key_kd,
+            minval=self._config.dm_rand_config.kd_range[0],
+            maxval=self._config.dm_rand_config.kd_range[1],
         )
-        new_qpos = new_qpos.at[BOX_QPOS_START + 3:BOX_QPOS_START + 7].set(box_quat)
-        data = data.replace(qpos=new_qpos)
+        kd_scale = jp.where(self._config.dm_rand_config.enable_pd, kd_scale, jp.ones_like(kd_scale))
 
-        new_qpos = data.qpos.at[SUPPORT_QPOS_START:SUPPORT_QPOS_START + 3].set(
-            jp.array([box_xy[0], box_xy[1], surface_z])
+        rfi_lim_noise_scale = jax.random.uniform(
+            key_rfi,
+            self.torque_limit.shape,
+            minval=self._config.dm_rand_config.rfi_lim_range[0],
+            maxval=self._config.dm_rand_config.rfi_lim_range[1],
         )
-        new_qpos = new_qpos.at[SUPPORT_QPOS_START + 3:SUPPORT_QPOS_START + 7].set(box_quat)
-        data = data.replace(qpos=new_qpos)
+        rfi_lim_scale = self._config.dm_rand_config.rfi_lim * rfi_lim_noise_scale * self.torque_limit
+        rfi_lim_scale = jp.where(self._config.dm_rand_config.enable_rfi, rfi_lim_scale, jp.zeros_like(rfi_lim_scale))
 
-        data = mjx.forward(self.mjx_model, data)
+        # Box info from DR'd model (mass/size already set correctly by DR)
+        box_size = self.mjx_model.geom_size[self._box_geom_id]
+        box_mass = self.mjx_model.body_mass[self._box_body_id]
 
-        # --- Sample HumanoidPF fields ---
+        # --- Sample HumanoidPF fields (from post-rollout data) ---
         head_pos = data.site_xpos[self._head_site_id]
         head_vel = jp.zeros_like(head_pos)
         pelv_pos = data.site_xpos[self._pelvis_imu_site_id]
@@ -564,33 +731,6 @@ class G1CaTraEnv(G1CatEnv):
             maxval=self._config.gait_config.foot_height_range[1],
         )
 
-        # --- Domain randomization scalars ---
-        rng, key_kp, key_kd, key_rfi = jax.random.split(rng, 4)
-        kp_scale = jax.random.uniform(
-            key_kp,
-            minval=self._config.dm_rand_config.kp_range[0],
-            maxval=self._config.dm_rand_config.kp_range[1],
-        )
-        kp_scale = jp.where(self._config.dm_rand_config.enable_pd, kp_scale, jp.ones_like(kp_scale))
-        kd_scale = jax.random.uniform(
-            key_kd,
-            minval=self._config.dm_rand_config.kd_range[0],
-            maxval=self._config.dm_rand_config.kd_range[1],
-        )
-        kd_scale = jp.where(self._config.dm_rand_config.enable_pd, kd_scale, jp.ones_like(kd_scale))
-
-        rfi_lim_noise_scale = jax.random.uniform(
-            key_rfi,
-            self.torque_limit.shape,
-            minval=self._config.dm_rand_config.rfi_lim_range[0],
-            maxval=self._config.dm_rand_config.rfi_lim_range[1],
-        )
-        rfi_lim_scale = self._config.dm_rand_config.rfi_lim * rfi_lim_noise_scale * self.torque_limit
-        rfi_lim_scale = jp.where(self._config.dm_rand_config.enable_rfi, rfi_lim_scale, jp.zeros_like(rfi_lim_scale))
-
-        # Box info
-        box_size = self.mjx_model.geom_size[self._box_geom_id]
-        box_mass = self.mjx_model.body_mass[self._box_body_id]
         box_pos_init = data.xpos[self._box_body_id]
 
         info = {
@@ -598,16 +738,16 @@ class G1CaTraEnv(G1CatEnv):
             "step": 0,
             "command": command,
             "last_command": jp.zeros(4),
-            "last_act": jp.zeros(self.action_size),
+            "last_act": last_act_init,
             "last_last_act": jp.zeros(self.action_size),
             "last_feet_vel": jp.zeros(2),
-            "last_joint_vel": np.zeros(NUM_ROBOT_JOINTS),
+            "last_joint_vel": last_jv_init,
             # push
             "push": jp.array([0.0, 0.0]),
             "push_step": 0,
             "push_interval_steps": push_interval_steps,
             # state
-            "motor_targets": self._default_qpos.copy(),
+            "motor_targets": motor_targets_init,
             "local_lin_vel": jp.zeros(3),
             "global_lin_vel": jp.zeros(3),
             "global_ang_vel": jp.zeros(3),
@@ -644,8 +784,8 @@ class G1CaTraEnv(G1CatEnv):
             "feet_pos": feet_pos.copy(), "feet_vel": feet_vel.copy(),
             "hands_pos": hands_pos.copy(), "hands_vel": hands_vel.copy(),
             "knees_pos": knees_pos.copy(), "shlds_pos": shlds_pos.copy(),
-            # Delay buffers
-            "command_delay": command, "odom_delay": qpos[:7],
+            # Delay buffers (initialized to post-rollout values)
+            "command_delay": command, "odom_delay": data.qpos[:7],
             "headgf_delay": headgf.copy(), "headbf_delay": headbf.copy(), "headdf_delay": headdf.copy(),
             "pelvgf_delay": pelvgf.copy(), "pelvbf_delay": pelvbf.copy(), "pelvdf_delay": pelvdf.copy(),
             "torsgf_delay": torsgf.copy(), "torsbf_delay": torsbf.copy(), "torsdf_delay": torsdf.copy(),

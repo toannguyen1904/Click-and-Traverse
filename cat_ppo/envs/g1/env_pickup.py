@@ -36,6 +36,7 @@ from cat_ppo.envs.g1.env_catra import (
     domain_randomize_catra,
     torque_step_catra,
 )
+from cat_ppo.envs.g1.pickup_warmstart import pickup_obs_from_data
 
 # 23-DOF action space: all leg joints (12) + waist (3) + arms (8).
 PICKUP_ACTION_JOINT_NAMES = [
@@ -395,6 +396,11 @@ class G1PickupEnv(G1CaTraEnv):
             self._mj_model.geom("right_hand_collision").id,
         ])
 
+        # Gyro sensor address for pickup_obs_from_data
+        _sid = self._mj_model.sensor("gyro_pelvis").id
+        self._gyro_sensor_adr = int(self._mj_model.sensor_adr[_sid])
+        self._gyro_sensor_dim = int(self._mj_model.sensor_dim[_sid])
+
     @property
     def action_size(self) -> int:
         return len(self.action_joint_names)  # 23
@@ -600,91 +606,25 @@ class G1PickupEnv(G1CaTraEnv):
     def _get_obs(self, data: mjx.Data, info: dict[str, Any]) -> mjx_env.Observation:
         """108-dim state (deployable, noisy) and 147-dim privileged_state (noiseless + extras).
 
-        State (108):
-            gyro_pelvis[+noise](3), gvec_pelvis[+noise](3),
-            joint_angles[+noise](23), joint_vel[+noise](23),
-            last_action(23), motor_targets(23),
-            box_pos_local(3), box_quat_local(4), box_size(3)
-
-        Privileged (147 = 108 noiseless + 39 extras):
-            [same 108 fields, noiseless]
-            + box_vel_local(3), box_angvel(3),
-            + left_hand_pos(3), right_hand_pos(3), box_pos_world(3),
-            + pelvis_pos(3), torso_pos(3), left_shld_pos(3), right_shld_pos(3), head_pos(3),
-            + left_hand_vel(3), right_hand_vel(3),
-            + kp_scale(1), kd_scale(1)
+        Thin wrapper around pickup_obs_from_data.
         """
-        # --- Shared (noiseless) ---
-        gyro_pelvis = self.get_gyro(data, "pelvis")
-        gvec_pelvis = data.site_xmat[self._pelvis_imu_site_id].T @ jp.array([0., 0., -1.])
-        joint_angles = data.qpos[7:7 + NUM_ROBOT_JOINTS]
-        joint_vel = data.qvel[6:6 + NUM_ROBOT_JOINTS]
-
-        # Box pose in pelvis frame
-        pelvis_pos = data.xpos[self._pelvis_body_id]
-        pelvis_rot = data.site_xmat[self._pelvis_imu_site_id].reshape(3, 3)
-        pelvis_xquat = data.xquat[self._pelvis_body_id]  # wxyz
-        box_pos_world = data.xpos[self._box_body_id]
-        box_quat_world = data.xquat[self._box_body_id]  # wxyz
-        box_pos_local = pelvis_rot.T @ (box_pos_world - pelvis_pos)
-        pelvis_xquat_conj = pelvis_xquat * jp.array([1., -1., -1., -1.])
-        box_quat_local = math.quat_mul(pelvis_xquat_conj, box_quat_world)
-
-        box_size = info["box_size"]
-
-        # --- Privileged extras ---
-        box_vel_local = pelvis_rot.T @ data.qvel[BOX_QVEL_START:BOX_QVEL_START + 3]
-        box_angvel = data.qvel[BOX_QVEL_START + 3:BOX_QVEL_START + 6]
-        left_hand_pos = data.site_xpos[self._hands_site_id[0]]
-        right_hand_pos = data.site_xpos[self._hands_site_id[1]]
-        left_hand_vel = (left_hand_pos - info["last_left_hand_pos"]) / self.dt
-        right_hand_vel = (right_hand_pos - info["last_right_hand_pos"]) / self.dt
-        pelv_site_pos = data.site_xpos[self._pelvis_imu_site_id]
-        tors_site_pos = data.site_xpos[self._torso_imu_site_id]
-        left_shld_pos = data.site_xpos[self._shlds_site_id[0]]
-        right_shld_pos = data.site_xpos[self._shlds_site_id[1]]
-        head_pos = info["head_pos"]  # updated in step() before _get_obs is called
-
-        # --- Privileged state (noiseless, built from scratch) ---
-        privileged_state = jp.hstack([
-            gyro_pelvis, gvec_pelvis,
-            (joint_angles - self._default_qpos)[self.action_joint_ids],
-            joint_vel[self.action_joint_ids],
-            info["last_act"],
-            info["motor_targets"][self.action_joint_ids],
-            box_pos_local, box_quat_local, box_size,
-            info["box_mass"].reshape(1),
-            # Privileged-only extras
-            box_vel_local, box_angvel,
-            left_hand_pos, right_hand_pos, box_pos_world,
-            pelv_site_pos, tors_site_pos,
-            left_shld_pos, right_shld_pos, head_pos,
-            left_hand_vel, right_hand_vel,
-            info["kp_scale"].reshape(1), info["kd_scale"].reshape(1),
-        ])
-
-        # --- Noisy state (deployable) ---
-        nl = self._config.noise_config.level
-        ns = self._config.noise_config.scales
-        info["rng"], k1, k2, k3, k4 = jax.random.split(info["rng"], 5)
-        noisy_gyro = gyro_pelvis + (2 * jax.random.uniform(k1, (3,)) - 1) * nl * ns.gyro
-        noisy_gvec = gvec_pelvis + (2 * jax.random.uniform(k2, (3,)) - 1) * nl * ns.gravity
-        noisy_ja = joint_angles + (2 * jax.random.uniform(k3, joint_angles.shape) - 1) * nl * ns.joint_pos
-        noisy_jv = joint_vel + (2 * jax.random.uniform(k4, joint_vel.shape) - 1) * nl * ns.joint_vel
-
-        state = jp.hstack([
-            noisy_gyro, noisy_gvec,
-            (noisy_ja - self._default_qpos)[self.action_joint_ids],
-            noisy_jv[self.action_joint_ids],
-            info["last_act"],
-            info["motor_targets"][self.action_joint_ids],
-            box_pos_local, box_quat_local, box_size,
-        ])
-
-        return {
-            "state": jp.nan_to_num(state),
-            "privileged_state": jp.nan_to_num(privileged_state),
-        }
+        obs, updated_rng = pickup_obs_from_data(
+            data, info,
+            gyro_sensor_adr=self._gyro_sensor_adr,
+            gyro_sensor_dim=self._gyro_sensor_dim,
+            pelvis_body_id=self._pelvis_body_id,
+            pelvis_imu_site_id=self._pelvis_imu_site_id,
+            torso_imu_site_id=self._torso_imu_site_id,
+            hands_site_id=self._hands_site_id,
+            shlds_site_id=self._shlds_site_id,
+            box_body_id=self._box_body_id,
+            action_joint_ids=self.action_joint_ids,
+            default_qpos=self._default_qpos,
+            noise_config=self._config.noise_config,
+            dt=self.dt,
+        )
+        info["rng"] = updated_rng
+        return obs
 
     def _get_termination(self, data: mjx.Data, info: dict[str, Any]):
         """Terminate on robot fall, box drop, or NaN. Returns (done, fall, box_drop, nan_term)."""

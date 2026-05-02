@@ -14,9 +14,9 @@ This is **Phase 2** of a two-phase curriculum. It combines the pickup policy (Ph
 | Task | Pick up a box from a pillar, then carry it through obstacles |
 | Action space | 23 DOF (12 legs + 3 waist + 8 arms) |
 | Episode length | 1100 steps (22 s at 50 Hz) |
-| Stage 1 | Steps 0–99 (2 s): stand-and-reach, pickup reward set |
-| Stage 2 | Steps 100–1099 (20 s): PF-guided traversal + grasp-maintenance rewards |
-| Box placement | 0.3 m in front of robot, on a support pillar (surface height = 0.3 m) |
+| Stage 1 | Steps 0–(stage1_steps−1): stand-and-reach, pickup reward set. Set `stage1_steps=0` when using warm-start. |
+| Stage 2 | Steps stage1_steps to stage1_steps+999: PF-guided traversal + grasp-maintenance rewards |
+| Box placement | 0.3 m in front of robot on a support pillar (default), or loaded from warm-start file |
 | Success criterion | Box lifted ≥ 10 cm in Stage 1 AND box still held + robot reaches PF target by Stage 2 end |
 
 ---
@@ -45,10 +45,12 @@ Wrist joints are not actuated. Action scale: `0.5`.
 
 | Stage | Steps | Duration | Command | Reward focus |
 |-------|-------|----------|---------|-------------|
-| Stage 1 — Pickup | 0–99 | 2 s | `[0, 0, 0, 0]` (stationary) | All 22 G1Pickup reward terms |
-| Stage 2 — Carry & Traverse | 100–1099 | 20 s | PF-derived `[move_flag, vx, vy, yaw]` | CAT navigation rewards + 6 `_carry` grasp-maintenance terms |
+| Stage 1 — Pickup | 0–(stage1_steps−1) | `stage1_steps × 0.02` s | `[0, 0, 0, 0]` (stationary) | All 22 G1Pickup reward terms |
+| Stage 2 — Carry & Traverse | stage1_steps–(stage1_steps+999) | 20 s | PF-derived `[move_flag, vx, vy, yaw]` | CAT navigation rewards + 6 `_carry` grasp-maintenance terms |
 
-The stage transition is a hard cut: `info["step"] == 100`. The policy receives a **stage flag** (0.0 in Stage 1, 1.0 in Stage 2) as part of its observation so it can learn stage-specific behaviors from a single policy.
+`stage1_steps` defaults to 100 (2 s pickup phase). When using warm-start (robot already holds the box at reset), set `stage1_steps=0` to skip Stage 1 entirely and start directly in Stage 2. This is done automatically by `train_ppo.py` when `--warmstart_states_path` is provided and `--stage1_steps` is not specified.
+
+The stage transition is a hard cut at `info["step"] == stage1_steps`. The policy receives a **stage flag** (0.0 in Stage 1, 1.0 in Stage 2) as part of its observation so it can learn stage-specific behaviors from a single policy.
 
 Command in Stage 1 is always `[0, 0, 0, 0]`. In Stage 2 the command is derived every step from PF (potential field) grid data via `compute_cmd_from_rtf`: a 4-dim vector `[move_flag, vx, vy, yaw]` in the navigation frame.
 
@@ -113,7 +115,7 @@ All rewards are multiplied by `dt`.
 | `smoothness_joint` | -1e-6 | Penalize jerky joint motion |
 | `joint_limits` | -1.0 | Penalize joint limit violations |
 
-### Stage 1 — Pickup Rewards (active when step < 100)
+### Stage 1 — Pickup Rewards (active when step < stage1_steps)
 
 | Term | Scale | Formula |
 |------|-------|---------|
@@ -137,7 +139,7 @@ All rewards are multiplied by `dt`.
 | `base_height` | 1.0 | Target pelvis height 0.75 m |
 | `foot_balance` | -30.0 | Penalize COM centering and foot spread |
 
-### Stage 2 — Traversal + Carry Rewards (active when step ≥ 100)
+### Stage 2 — Traversal + Carry Rewards (active when step ≥ stage1_steps)
 
 Navigation rewards (from G1CatEnv):
 
@@ -178,7 +180,7 @@ Grasp-maintenance rewards (`_carry` suffix, same formulas as Stage 1):
 | Robot fall (gravity vector) | `gvec_z < 0` |
 | Robot fall (head height) | `head_z < 0.7 m` |
 | Box dropped | `box_z < 0.3 m` — active throughout full episode |
-| Body-obstacle SDF collision | any of head/torso/pelvis/feet/hands/knees/shoulders df < −4 cm (active after step 150) |
+| Body-obstacle SDF collision | any of head/torso/pelvis/feet/hands/knees/shoulders df < −4 cm (active after step stage1_steps+50) |
 | NaN in qpos or qvel | any |
 | Episode timeout | 1100 steps (22 s) |
 
@@ -186,7 +188,11 @@ Grasp-maintenance rewards (`_carry` suffix, same formulas as Stage 1):
 
 ## Randomization
 
-### Per-episode (in `reset`)
+There are two reset modes. The active mode depends on whether `warmstart_states_path` is set.
+
+### Default reset (no warm-start)
+
+Per-episode randomization in `reset()`:
 
 | Property | Range | Notes |
 |----------|-------|-------|
@@ -196,7 +202,7 @@ Grasp-maintenance rewards (`_carry` suffix, same formulas as Stage 1):
 | Box yaw offset | `U[−10°, 10°]` | Relative to robot forward direction |
 | Support pillar height | Fixed at surface_z = 0.3 m | Box-center z at surface_z + box_half_z |
 
-### Per-environment (domain randomization via `domain_randomize_catra`)
+Per-environment DR via `domain_randomize_catra` (applied once at training init):
 
 | Property | Range | Notes |
 |----------|-------|-------|
@@ -206,14 +212,30 @@ Grasp-maintenance rewards (`_carry` suffix, same formulas as Stage 1):
 | All body masses | `U[0.9, 1.1] × nominal` | |
 | Torso mass perturbation | `U[−1, 1]` kg additive | |
 | qpos0 perturbation | `U[−0.05, 0.05]` per joint | |
-| Box half-size x | `U[0.10, 0.15]` m | Per-environment |
-| Box half-size y | `U[0.10, 0.20]` m | Per-environment |
-| Box half-size z | `U[0.10, 0.15]` m | Per-environment |
-| Box mass | `U[1.0, 3.0]` kg | Per-environment (heavier than Pickup) |
-| KP scale | `U[0.75, 1.25]` | |
-| KD scale | `U[0.75, 1.25]` | |
-| RFI (per-joint torque noise) | Enabled | Applied every substep in both stages; simulates actuator noise |
-| Push impulses | Enabled | Random root velocity impulses; gated to step ≥ 100 (Stage 2 only) |
+| Box half-size (x, y, z) | Fixed at (0.15, 0.20, 0.15) m | Uniform size, no DR |
+| Box mass | `U[1.0, 2.0]` kg | Per-environment |
+| KP scale | `U[0.75, 1.25]` | Per-reset |
+| KD scale | `U[0.75, 1.25]` | Per-reset |
+| RFI (per-joint torque noise) | Enabled | Applied every substep in both stages |
+| Push impulses | Enabled | Random root velocity impulses; gated to stage 2 only |
+
+### Warm-start reset (`warmstart_states_path` set)
+
+Per-episode reset loads `(qpos, qvel)` exactly as saved from the pickup policy rollout — robot pose, box position, and box orientation are **not changed**. The only per-reset randomization is KP/KD/RFI scalars.
+
+Per-environment DR via `domain_randomize_catra_warmstart` (applied once at training init):
+
+| Property | Range | Notes |
+|----------|-------|-------|
+| Robot DR (frictionloss, armature, CoM, body masses, qpos0) | Same as default | Unchanged |
+| Box half-size (x, y, z) | Carried from pickup state file | Exact values from `domain_randomize_pickup` at generation time: x∈[0.10,0.15], y∈[0.10,0.20], z∈[0.10,0.15] |
+| Box mass | Carried from pickup state file | Exact value from `domain_randomize_pickup`: `U[1.0, 2.0]` kg |
+| KP scale | `U[0.75, 1.25]` | Per-reset |
+| KD scale | `U[0.75, 1.25]` | Per-reset |
+| RFI | Enabled | Same as default |
+| Push impulses | Enabled | Same as default |
+
+State index `i` is encoded in `qpos0[0]` by DR and decoded in `reset()` to look up env i's pre-saved `(qpos, qvel)` from the `.npz` file.
 
 ---
 
@@ -234,10 +256,11 @@ MjxEnv (mujoco_playground)
 
 ### Key Implementation Details
 
-- **Stage flag in obs**: The scalar `0.0` (Stage 1) or `1.0` (Stage 2) appended as the last element of the state obs. Lets the policy learn stage-specific behavior from a single network.
-- **JIT-friendly reward gating**: Both stage reward dicts are computed every step; `jp.where(step < 100, ...)` gates which set contributes to the return. Dict shape is static — no dynamic branching.
-- **Push forces gated**: Random push perturbations (RFI) are enabled but suppressed during Stage 1 (`step < 100`). Full pushes activate in Stage 2 when locomotion is expected.
-- **Box PF removed**: The old CaTra observation included box goal-field / boundary-field / distance-field (7 dims). These are removed; the policy instead gets `box_pos_local`, `box_quat_local`, and `box_size` directly.
+- **Stage flag in obs**: The scalar `0.0` (Stage 1) or `1.0` (Stage 2) appended as the last element of the state obs. Lets the policy learn stage-specific behavior from a single network. With warm-start (`stage1_steps=0`) the flag is always 1.0.
+- **Warm-start**: When `warmstart_states_path` is set, `reset()` loads `(qpos, qvel)` directly from the pre-generated `.npz` (no physics rollout inside reset). Box mass/size are carried exactly from the pickup generation run via a custom DR function (`domain_randomize_catra_warmstart`) that reads the state file and assigns each env its own fixed box physics at training init. The state file must contain exactly `num_envs` states.
+- **JIT-friendly reward gating**: Both stage reward dicts are computed every step; `jp.where(step < stage1_steps, ...)` gates which set contributes to the return. Dict shape is static — no dynamic branching.
+- **Push forces gated**: Random push perturbations (RFI) are enabled but suppressed during Stage 1 (`step < stage1_steps`). Full pushes activate in Stage 2 when locomotion is expected.
+- **Box PF removed**: The old CaTra observation included box goal-field / boundary-field / distance-field (7 dims). These are removed; the policy instead gets `box_pos_local`, `box_quat_local`, and `box_size` directly. These are currently **noise-free** in both training and eval — in real deployment box pose would be estimated (e.g. via vision), so noise should be added in a future iteration for better sim-to-real transfer.
 - **Box drop threshold**: Termination fires when `box_z < 0.3 m` (at or below pillar surface), allowing the box to move freely at any height above that during carries.
 - **SDF termination gating**: Body-obstacle collision termination is suppressed until step 150 (50 steps into Stage 2), giving the robot time to stabilize its carry before collision penalties apply.
 - **qpos/qvel layout**:
@@ -250,8 +273,12 @@ MjxEnv (mujoco_playground)
 
 | File | Purpose |
 |------|---------|
-| [cat_ppo/envs/g1/env_catra.py](cat_ppo/envs/g1/env_catra.py) | Main training environment, config, DR function |
+| [cat_ppo/envs/g1/env_catra.py](cat_ppo/envs/g1/env_catra.py) | Main training environment, config, DR functions (default + warm-start) |
 | [cat_ppo/envs/g1/play_catra.py](cat_ppo/envs/g1/play_catra.py) | CPU inference env for ONNX playback |
+| [cat_ppo/envs/g1/pickup_warmstart.py](cat_ppo/envs/g1/pickup_warmstart.py) | `load_pickup_inference_fn`, `pickup_obs_from_data` (used by generation) |
+| [cat_ppo/eval/warmstart_generation.py](cat_ppo/eval/warmstart_generation.py) | Offline warm-start state generation implementation |
+| [generate_warmstart_states.py](generate_warmstart_states.py) | CLI entry point for generating warm-start states |
+| [check_warmstart_states.py](check_warmstart_states.py) | Sanity-check script for generated `.npz` state files |
 | [train_ppo_catra.py](train_ppo_catra.py) | Training entry point |
 | [check_catra.py](check_catra.py) | CPU-based visualization (static initial state) |
 | [data/assets/unitree_g1/scene_mjx_feetonly_flat_terrain_catra.xml](data/assets/unitree_g1/scene_mjx_feetonly_flat_terrain_catra.xml) | MJX training scene |
@@ -276,27 +303,52 @@ python check_catra.py
 python check_catra.py --obs_path data/assets/TypiObs/narrow1
 ```
 
+### Generate Warm-Start States (one-time, requires trained G1Pickup checkpoint)
+
+```bash
+python generate_warmstart_states.py \
+    --pickup_checkpoint_path /abs/path/to/G1Pickup/checkpoints/000403046400 \
+    --num_states 32768 \
+    --output data/warmstart/catra_pickup_states.npz
+```
+
+Verify the generated file:
+```bash
+python check_warmstart_states.py --states data/warmstart/catra_pickup_states.npz
+# --view  to open the MuJoCo viewer on one of the saved states
+```
+
 ### Train
 
-Without obstacles (flat empty scene, no body-PF reward/penalty):
+Without obstacles, default reset (2 s Stage 1 pickup + Stage 2 traversal):
 ```bash
 python train_ppo_catra.py \
     --task G1CaTra \
     --exp_name catra_v1
 ```
 
-With obstacles (enable body-PF guidance + SDF penalties, select a scene):
+With warm-start (robot initializes already holding the box, jumps straight to traversal):
 ```bash
 python train_ppo_catra.py \
     --task G1CaTra \
     --exp_name catra_v1 \
+    --warmstart_states_path data/warmstart/catra_pickup_states.npz
+```
+This automatically sets `stage1_steps=0` so the full episode is Stage 2.
+
+With obstacles (enable body-PF guidance + SDF penalties):
+```bash
+python train_ppo_catra.py \
+    --task G1CaTra \
+    --exp_name catra_v1 \
+    --warmstart_states_path data/warmstart/catra_pickup_states.npz \
     --obs_path data/assets/TypiObs/bar0 \
     --ground 1.0 \
     --lateral 1.0 \
     --overhead 1.0
 ```
 
-`--ground` scales `feetgf`/`feetdf`, `--lateral` scales `handsgf`/`handsdf`/`kneesdf`/`shldsdf`, `--overhead` scales `headgf`/`headdf`. All default to 0 (disabled). These are only meaningful in Stage 2.
+`--ground` scales `feetgf`/`feetdf`, `--lateral` scales `handsgf`/`handsdf`/`kneesdf`/`shldsdf`, `--overhead` scales `headgf`/`headdf`. All default to 0 (disabled).
 
 ### Export to ONNX
 
@@ -307,7 +359,13 @@ python -m cat_ppo.eval.brax2onnx --task G1CaTra --exp_name <full_exp_name>
 ### Play in MuJoCo Viewer
 
 ```bash
+# Default: robot starts standing, runs full 2-stage episode
 python -m cat_ppo.eval.mj_onnx_play --task G1CaTra --exp_name <full_exp_name>
+
+# Warm-start: robot starts already holding the box, Stage 2 only
+python -m cat_ppo.eval.mj_onnx_play --task G1CaTra --exp_name <full_exp_name> \
+    --warmstart_states_path data/warmstart/catra_pickup_states.npz
+# Use --warmstart_idx <N> to load a specific state instead of random
 ```
 
 ### Smoke Test (stage transition verification)

@@ -83,6 +83,19 @@ class PlayG1CaTraEnv(BaseEnv):
         self.foot_height = 0.07
         self._post_init()
 
+        ws_path = getattr(config, "warmstart_states_path", None)
+        self._ws_qpos = None
+        self._ws_qvel = None
+        self._ws_box_mass = None
+        self._ws_box_size = None
+        if ws_path:
+            npz = np.load(ws_path)
+            self._ws_qpos      = npz["qpos"]       # (N, nq)
+            self._ws_qvel      = npz["qvel"]        # (N, nv)
+            self._ws_box_mass  = npz["box_mass"]    # (N,)
+            self._ws_box_size  = npz["box_size"]    # (N, 3)
+            print(f"[PlayG1CaTraEnv] Loaded {self._ws_qpos.shape[0]} warm-start states from {ws_path}")
+
     def _post_init(self):
         self._default_qpos = np.array(consts.DEFAULT_QPOS_CATRA[7:7 + NUM_ROBOT_JOINTS])
 
@@ -120,26 +133,36 @@ class PlayG1CaTraEnv(BaseEnv):
     def action_size(self) -> int:
         return len(self.action_joint_names)
 
-    def reset(self):
-        """Reset robot to default pose; place box 0.3 m in front on pillar."""
-        qpos = np.array(consts.DEFAULT_QPOS_CATRA, dtype=np.float64)
-        self.mj_data.qpos[:len(qpos)] = qpos
-        self.mj_data.qvel[:] = 0.0
+    def reset(self, warmstart_idx: int = -1):
+        """Reset to default pose (box on pillar) or to a saved warm-start state."""
+        if self._ws_qpos is not None:
+            # --- Warm-start path: load saved holding-box state ---
+            N = self._ws_qpos.shape[0]
+            idx = np.random.randint(0, N) if warmstart_idx < 0 else int(warmstart_idx) % N
+            self.mj_model.geom_size[self._box_geom_id] = self._ws_box_size[idx]
+            self.mj_model.body_mass[self._box_body_id] = self._ws_box_mass[idx]
+            self.mj_data.qpos[:] = self._ws_qpos[idx]
+            self.mj_data.qvel[:] = self._ws_qvel[idx]
+        else:
+            # --- Default path: robot standing, box on pillar ---
+            qpos = np.array(consts.DEFAULT_QPOS_CATRA, dtype=np.float64)
+            self.mj_data.qpos[:len(qpos)] = qpos
+            self.mj_data.qvel[:] = 0.0
 
-        surface_z = float(self._config.box_surface_height_range[0])
-        box_half_z = float(self.mj_model.geom_size[self._box_geom_id][2])
-        support_half_z = float(self.mj_model.geom_size[self._box_support_geom_id][2])
-        box_z = surface_z + support_half_z + box_half_z
+            surface_z = float(self._config.box_surface_height_range[0])
+            box_half_z = float(self.mj_model.geom_size[self._box_geom_id][2])
+            support_half_z = float(self.mj_model.geom_size[self._box_support_geom_id][2])
+            box_z = surface_z + support_half_z + box_half_z
 
-        w, x, y, z = qpos[3], qpos[4], qpos[5], qpos[6]
-        forward_xy = np.array([1 - 2 * (y ** 2 + z ** 2), 2 * (x * y + w * z)])
-        box_xy = qpos[:2] + 0.3 * forward_xy
-        box_quat = np.array([1.0, 0.0, 0.0, 0.0])
+            w, x, y, z = qpos[3], qpos[4], qpos[5], qpos[6]
+            forward_xy = np.array([1 - 2 * (y ** 2 + z ** 2), 2 * (x * y + w * z)])
+            box_xy = qpos[:2] + 0.3 * forward_xy
+            box_quat = np.array([1.0, 0.0, 0.0, 0.0])
 
-        self.mj_data.qpos[BOX_QPOS_START:BOX_QPOS_START + 3] = [box_xy[0], box_xy[1], box_z]
-        self.mj_data.qpos[BOX_QPOS_START + 3:BOX_QPOS_START + 7] = box_quat
-        self.mj_data.qpos[SUPPORT_QPOS_START:SUPPORT_QPOS_START + 3] = [box_xy[0], box_xy[1], surface_z]
-        self.mj_data.qpos[SUPPORT_QPOS_START + 3:SUPPORT_QPOS_START + 7] = box_quat
+            self.mj_data.qpos[BOX_QPOS_START:BOX_QPOS_START + 3] = [box_xy[0], box_xy[1], box_z]
+            self.mj_data.qpos[BOX_QPOS_START + 3:BOX_QPOS_START + 7] = box_quat
+            self.mj_data.qpos[SUPPORT_QPOS_START:SUPPORT_QPOS_START + 3] = [box_xy[0], box_xy[1], surface_z]
+            self.mj_data.qpos[SUPPORT_QPOS_START + 3:SUPPORT_QPOS_START + 7] = box_quat
 
         mujoco.mj_forward(self.mj_model, self.mj_data)
         if not self.headless:
@@ -168,11 +191,18 @@ class PlayG1CaTraEnv(BaseEnv):
 
         box_size = self.mj_model.geom_size[self._box_geom_id].copy()
 
+        if self._ws_qpos is not None:
+            init_step = self._config.stage1_steps
+            init_motor_targets = self.mj_data.qpos[7:7 + NUM_ROBOT_JOINTS].copy()
+        else:
+            init_step = 0
+            init_motor_targets = self._default_qpos.copy()
+
         info = {
-            "step": 0,
+            "step": init_step,
             "command": np.zeros(4),
             "last_act": np.zeros(self.action_size),
-            "motor_targets": self._default_qpos.copy(),
+            "motor_targets": init_motor_targets,
             "phase_dt": phase_dt,
             "phase": self._init_phase.copy(),
             "foot_height": self.foot_height,

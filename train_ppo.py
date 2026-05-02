@@ -53,6 +53,7 @@ class Args:
     term_collision_threshold: float = 0.04  # SDF below -threshold triggers collision termination
     obs_path: str = 'data/assets/TypiObs/empty'  # path to the obstacle grid files: sdf.npy, bf.npy, gf.npy.
     stage1_steps: int = -1  # for G1CaTra: number of steps in stage 1 (pickup); -1 = use task default
+    warmstart_states_path: str = ""  # path to pre-generated .npz from generate_warmstart_states.py; enables file-load warm-start in G1CaTra
     def generate_exp_name(self):
         # generate a unique experiment name based on the task, difficulty, and seed
         exp_name_parts = [self.exp_name]
@@ -135,6 +136,13 @@ def _apply_args_to_config(args: Args, policy_cfg, env_config, debug: bool):
     env_config.term_collision_threshold = args.term_collision_threshold  # SDF below -threshold triggers collision termination
     if args.stage1_steps >= 0 and hasattr(env_config, "stage1_steps"):
         env_config.stage1_steps = args.stage1_steps  # override stage 1 length (G1CaTra only)
+    if args.warmstart_states_path and hasattr(env_config, "warmstart_states_path"):
+        env_config.warmstart_states_path = args.warmstart_states_path
+        if args.stage1_steps < 0:
+            env_config.stage1_steps = 0
+        # Swap in a warmstart-aware DR function that carries box mass/size from the state file
+        from cat_ppo.envs.g1.env_catra import make_warmstart_domain_randomize_catra
+        policy_cfg.randomization_fn = make_warmstart_domain_randomize_catra(args.warmstart_states_path)
     env_config.pf_config.path = args.obs_path  # directory with sdf.npy, bf.npy, gf.npy for HumanoidPF
 
 def _prepare_training_params(cfg, ckpt_path: Path):
