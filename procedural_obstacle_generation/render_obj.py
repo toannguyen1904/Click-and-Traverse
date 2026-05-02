@@ -1,8 +1,11 @@
-import sys
+import argparse
 import trimesh
 
 if __name__ == "__main__":
-    mesh_file = "/home/tien/Code/Click-and-Traverse/data/assets/RandObs/D8G0L1O0S3/obs.obj"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mesh_file", required=True)
+    args = parser.parse_args()
+    mesh_file = args.mesh_file
     mesh = trimesh.load(mesh_file, force="mesh")
     print(f"Loaded: {mesh_file}")
     print(f"  Vertices : {len(mesh.vertices)}")
