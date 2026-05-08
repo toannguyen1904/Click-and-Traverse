@@ -58,7 +58,9 @@ Command in Stage 1 is always `[0, 0, 0, 0]`. In Stage 2 the command is derived e
 
 ## Observation Space
 
-### State (195-dim) — deployable on real robot
+### State (251-dim) — deployable on real robot
+
+The PF subblock is **not additively noised** — only gyro/gvec/joint_angles/joint_vel get noise injection. The body and box PF subblocks use 5-step-delayed samples transformed into the navigation frame (to simulate odometry latency at deployment).
 
 | Field | Dims | Notes |
 |-------|------|-------|
@@ -71,35 +73,36 @@ Command in Stage 1 is always `[0, 0, 0, 0]`. In Stage 2 the command is derived e
 | `command` | 4 | Navigation command `[move_flag, vx, vy, yaw]`; zeros in Stage 1 |
 | `foot_height` | 1 | Target foot height for gait |
 | `gait_phase` | 4 | cos+sin of 2D gait clock (left + right) |
-| `body_pf` | 77 | Navigation-frame PF fields for 11 body sites: head, pelvis, torso (×1 each), feet, hands, knees, shoulders (×2 each); gf(3)+bf(3)+df(1)=7 dims per site |
+| `body_pf` | 77 | Nav-frame PF fields (delayed) for 11 body sites: head, pelvis, torso (×1), feet, hands, knees, shoulders (×2); gf(3)+bf(3)+df(1)=7 per site |
+| `box_pf` | 56 | Nav-frame PF fields (delayed) for the **8 corners** of the box; gf(3)+bf(3)+df(1)=7 per corner; bf zeroed and df clipped to [−1, 0.5] when df > 0.5 |
 | `box_pos_local` | 3 | Box center position in pelvis frame |
 | `box_quat_local` | 4 | Box orientation in pelvis frame (wxyz) |
-| `box_size` | 3 | Box half-extents (l, w, h) |
+| `box_size` | 3 | Box half-extents (hx, hy, hz) |
 | `stage_flag` | 1 | 0.0 in Stage 1, 1.0 in Stage 2 |
-| **Total** | **195** | |
+| **Total** | **251** | |
 
-### Privileged State (289-dim) — critic only during training
+### Privileged State (345-dim) — critic only during training
 
-Noiseless version of the state block (without `box_pos_local`/`box_quat_local`) plus privileged extras:
+Noiseless, world-frame version of the state block (without `box_pos_local`/`box_quat_local`) plus privileged extras. The PF block here uses non-delayed, world-frame samples for both body and box corners.
 
 | Field | Dims | Notes |
 |-------|------|-------|
-| Noiseless state block | 188 | Same structure as state but noiseless; box_pos/quat_local omitted (world-frame used instead) |
+| Noiseless state block | 244 | Same structure as state but noiseless and world-frame; body_pf(77) + box_pf(56) = 133; box_pos/quat_local omitted |
 | `linvel_pelvis` | 3 | Pelvis linear velocity (world frame) |
 | `pelvis_pos` + `torso_pos` + `head_pos` | 9 | Absolute body positions |
 | `shlds_pos` + `hands_pos` + `knees_pos` + `feet_pos` | 24 | 2 sites × 4 body groups × 3 |
 | `head_vel` + `hands_vel` + `feet_vel` | 15 | Linear velocities for 5 sites (1+2+2) |
 | `box_pos_world` | 3 | Box center in world frame |
 | `box_quat_world` | 4 | Box orientation in world frame (wxyz) |
-| `box_linvel_world` | 3 | Box linear velocity in world frame (finite-diff) |
-| `box_angvel_world` | 3 | Box angular velocity in world frame (finite-diff) |
+| `box_linvel_world` | 3 | Box linear velocity in world frame |
+| `box_angvel_world` | 3 | Box angular velocity in world frame |
 | `navi_torso_rpy[:2]` | 2 | Torso roll + pitch in navigation frame |
 | `gait_mask` | 2 | Per-foot contact-based gait mask (left, right) |
 | `feet_contact` | 2 | Binary foot contact flags: `[left_touching_floor, right_touching_floor]` |
 | `rfi_lim_scale` | 29 | Per-joint random force injection scale |
 | `kp_scale` | 1 | PD gain DR scalar |
 | `kd_scale` | 1 | PD gain DR scalar |
-| **Total** | **289** | |
+| **Total** | **345** | |
 
 ---
 
@@ -159,6 +162,7 @@ Navigation rewards (from G1CatEnv):
 | `forward_progress` | 5.0 | Linear reward for velocity in the command direction; `clip(v·cmd_dir, 0, |cmd|)` — nonzero gradient from a dead stop, unlike the exp-based `tracking_root_field` |
 | `headgf/handsgf/feetgf` | 0.0 | Body goal field tracking (scaled off) |
 | `headdf/handsdf/feetdf/kneesdf/shldsdf` | 0.0 | Body distance field penalties (scaled off) |
+| `boxdf` | 0.0 | Box-corner SDF collision penalty: `mean(softplus((0.05 − sdf) / 0.02))` over 8 corners; enable with `--box <scale>` |
 
 Grasp-maintenance rewards (`_carry` suffix, same formulas as Stage 1):
 
@@ -181,6 +185,7 @@ Grasp-maintenance rewards (`_carry` suffix, same formulas as Stage 1):
 | Robot fall (head height) | `head_z < 0.7 m` |
 | Box dropped | `box_z < 0.3 m` — active throughout full episode |
 | Body-obstacle SDF collision | any of head/torso/pelvis/feet/hands/knees/shoulders df < −4 cm (active after step stage1_steps+50) |
+| Box-corner SDF collision | any of the 8 box corners df < −4 cm (same threshold; active after step stage1_steps+50) |
 | NaN in qpos or qvel | any |
 | Episode timeout | 1100 steps (22 s) |
 
@@ -260,7 +265,7 @@ MjxEnv (mujoco_playground)
 - **Warm-start**: When `warmstart_states_path` is set, `reset()` loads `(qpos, qvel)` directly from the pre-generated `.npz` (no physics rollout inside reset). Box mass/size are carried exactly from the pickup generation run via a custom DR function (`domain_randomize_catra_warmstart`) that reads the state file and assigns each env its own fixed box physics at training init. The state file must contain exactly `num_envs` states.
 - **JIT-friendly reward gating**: Both stage reward dicts are computed every step; `jp.where(step < stage1_steps, ...)` gates which set contributes to the return. Dict shape is static — no dynamic branching.
 - **Push forces gated**: Random push perturbations (RFI) are enabled but suppressed during Stage 1 (`step < stage1_steps`). Full pushes activate in Stage 2 when locomotion is expected.
-- **Box PF removed**: The old CaTra observation included box goal-field / boundary-field / distance-field (7 dims). These are removed; the policy instead gets `box_pos_local`, `box_quat_local`, and `box_size` directly. These are currently **noise-free** in both training and eval — in real deployment box pose would be estimated (e.g. via vision), so noise should be added in a future iteration for better sim-to-real transfer.
+- **Box corner PF**: The obstacle fields (sdf, bf, gf) are sampled at all **8 corners** of the box each step and included in both the deployable state and privileged state (56 dims each: 8 corners × (gf:3 + bf:3 + sdf:1)). This lets the policy steer the box around obstacles rather than only routing its own body. Corners are computed from `data.xpos/xquat[box_body_id]` + `geom_size[box_geom_id]` via a rotation matrix. The same 5-step delay + nav-frame transform applied to body PF is applied to box corner PF in the deployable state. The `boxdf` reward (SDF softplus penalty averaged over 8 corners, same formula as body-part `*df` rewards) is registered with scale 0.0 by default; enable with `--box <scale>` (e.g. `--box 1.0`). Box-corner collision termination also fires when any corner's SDF < −`term_collision_threshold`, gated identically to body-part termination. The policy also receives `box_pos_local`, `box_quat_local`, and `box_size` directly; these are **noise-free** — noise should be added in a future iteration for better sim-to-real transfer.
 - **Box drop threshold**: Termination fires when `box_z < 0.3 m` (at or below pillar surface), allowing the box to move freely at any height above that during carries.
 - **SDF termination gating**: Body-obstacle collision termination is suppressed until step 150 (50 steps into Stage 2), giving the robot time to stabilize its carry before collision penalties apply.
 - **qpos/qvel layout**:
@@ -336,7 +341,7 @@ python train_ppo_catra.py \
 ```
 This automatically sets `stage1_steps=0` so the full episode is Stage 2.
 
-With obstacles (enable body-PF guidance + SDF penalties):
+With obstacles (enable body-PF guidance + SDF penalties, including box-corner collision penalty):
 ```bash
 python train_ppo_catra.py \
     --task G1CaTra \
@@ -345,10 +350,11 @@ python train_ppo_catra.py \
     --obs_path data/assets/TypiObs/bar0 \
     --ground 1.0 \
     --lateral 1.0 \
-    --overhead 1.0
+    --overhead 1.0 \
+    --box 1.0
 ```
 
-`--ground` scales `feetgf`/`feetdf`, `--lateral` scales `handsgf`/`handsdf`/`kneesdf`/`shldsdf`, `--overhead` scales `headgf`/`headdf`. All default to 0 (disabled).
+`--ground` scales `feetgf`/`feetdf`, `--lateral` scales `handsgf`/`handsdf`/`kneesdf`/`shldsdf`, `--overhead` scales `headgf`/`headdf`, `--box` scales `boxdf` (box-corner SDF penalty). All default to 0 (disabled).
 
 ### Export to ONNX
 

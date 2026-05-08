@@ -9,6 +9,10 @@ def build_obstacles(scene, grids):
         return obs_narrow(X, Y, Z)
     elif scene == "narrow1":
         return obs_narrow(X, Y, Z, gap_width=0.25)
+    elif scene == "narrow0_low":
+        return obs_narrow(X, Y, Z, z_high=1.0)
+    elif scene == "narrow1_low":
+        return obs_narrow(X, Y, Z, gap_width=0.25, z_high=0.7)
     elif scene == "bar0":
         return obs_easy_bar(X, Y, Z)
     elif scene == "bar1":
@@ -163,7 +167,7 @@ if __name__ == "__main__":
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
     SCENES = [
-        "pillar", "narrow0", "narrow1",
+        "pillar", "narrow0", "narrow1", "narrow0_low", "narrow1_low",
         "bar0", "bar1", "bar2", "bar3",
         "ceil0", "ceil1",
         "ceilbar0", "ceilbar1",

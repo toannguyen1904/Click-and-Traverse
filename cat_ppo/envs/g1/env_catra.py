@@ -296,8 +296,8 @@ def g1_catra_task_config() -> config_dict.ConfigDict:
       Stage 2 (steps stage1_steps -> stage1_steps+999): PF-derived command, navigation + carry rewards.
 
     Observation dimensions:
-      num_obs = 195  (state, deployable, noisy)
-      num_pri = 289  (privileged_state, noiseless + extras)
+      num_obs = 251  (state, deployable; PF subblock delayed + nav-frame, not additively noised)
+      num_pri = 345  (privileged_state, noiseless + extras)
     """
     env_config = config_dict.create(
         task_type="flat_terrain_catra",
@@ -308,8 +308,8 @@ def g1_catra_task_config() -> config_dict.ConfigDict:
         action_repeat=1,
         action_scale=0.5,
         history_len=15,
-        num_obs=195,
-        num_pri=289,
+        num_obs=251,
+        num_pri=345,
         num_act=23,
         restricted_joint_range=False,
         soft_joint_pos_limit_factor=0.95,
@@ -394,9 +394,10 @@ def g1_catra_task_config() -> config_dict.ConfigDict:
                 feetdf=0.0,    # overwritten by --ground
                 kneesdf=0.0,   # overwritten by --lateral
                 shldsdf=0.0,   # overwritten by --lateral
+                boxdf=0.0,     # box-corner SDF collision penalty (set non-zero to enable)
                 # --- Stage 2 only: carry maintenance (same scales as Pickup) ---
                 reach_carry=1.5,
-                lift_carry=2.0,
+                lift_carry=0.0, #2.0,
                 hand_contact_carry=2.0,
                 grasp_symmetry_carry=-2.0,
                 palm_orient_carry=2.0,
@@ -702,6 +703,12 @@ class G1CaTraEnv(G1CatEnv):
         headbf, pelvbf, torsbf, feetbf, handsbf, kneesbf, shldsbf = jp.split(all_bf, [1, 2, 3, 5, 7, 9], axis=0)
         headdf, pelvdf, torsdf, feetdf, handsdf, kneesdf, shldsdf = jp.split(all_df, [1, 2, 3, 5, 7, 9], axis=0)
 
+        # Box corner HumanoidPF: 8 corners x {gf:3, bf:3, sdf:1}
+        box_corners = self._box_corners_world(data, box_size)
+        boxgf = self.sample_field(self.gf, box_corners)
+        boxbf = self.sample_field(self.bf, box_corners)
+        boxdf = self.sample_field(self.sdf, box_corners)
+
         # Stage 1 command is always zero; stage 2 command is PF-derived (computed in step())
         command = jp.zeros(4)
 
@@ -793,6 +800,9 @@ class G1CaTraEnv(G1CatEnv):
             "handsgf_delay": handsgf.copy(), "handsbf_delay": handsbf.copy(), "handsdf_delay": handsdf.copy(),
             "kneesgf_delay": kneesgf.copy(), "kneesbf_delay": kneesbf.copy(), "kneesdf_delay": kneesdf.copy(),
             "shldsgf_delay": shldsgf.copy(), "shldsbf_delay": shldsbf.copy(), "shldsdf_delay": shldsdf.copy(),
+            # Box corner HumanoidPF (8 corners): current world frame and delayed
+            "boxgf": boxgf.copy(), "boxbf": boxbf.copy(), "boxdf": boxdf.copy(),
+            "boxgf_delay": boxgf.copy(), "boxbf_delay": boxbf.copy(), "boxdf_delay": boxdf.copy(),
             # Box state
             "box_pos": box_pos_init.copy(),
             # Box metadata (for reward computation)
@@ -917,6 +927,11 @@ class G1CaTraEnv(G1CatEnv):
         headbf, pelvbf, torsbf, feetbf, handsbf, kneesbf, shldsbf = jp.split(all_bf, [1, 2, 3, 5, 7, 9], axis=0)
         headdf, pelvdf, torsdf, feetdf, handsdf, kneesdf, shldsdf = jp.split(all_df, [1, 2, 3, 5, 7, 9], axis=0)
 
+        box_corners = self._box_corners_world(data, state.info["box_size"])
+        boxgf = self.sample_field(self.gf, box_corners)
+        boxbf = self.sample_field(self.bf, box_corners)
+        boxdf = self.sample_field(self.sdf, box_corners)
+
         # PF-derived command (always computed; gated to zero in stage 1)
         cmd_pf = self.compute_cmd_from_rtf(
             pelvgf.reshape(-1),
@@ -936,6 +951,11 @@ class G1CaTraEnv(G1CatEnv):
         all_bf_delay = self.sample_field(self.bf, all_poses_delay)
         all_df_delay = self.sample_field(self.sdf, all_poses_delay)
 
+        box_corners_delay = delay_body_pos(p_gt, q_gt, p_odom, q_odom, box_corners)
+        boxgf_delay = self.sample_field(self.gf, box_corners_delay)
+        boxbf_delay = self.sample_field(self.bf, box_corners_delay)
+        boxdf_delay = self.sample_field(self.sdf, box_corners_delay)
+
         # Gait update
         self._update_phase(state)
         move_flag = state.info["command"][0]
@@ -949,6 +969,11 @@ class G1CaTraEnv(G1CatEnv):
         headgf_delay, pelvgf_delay, torsgf_delay, feetgf_delay, handsgf_delay, kneesgf_delay, shldsgf_delay = jp.split(all_gf_delay, [1, 2, 3, 5, 7, 9], axis=0)
         headbf_delay, pelvbf_delay, torsbf_delay, feetbf_delay, handsbf_delay, kneesbf_delay, shldsbf_delay = jp.split(all_bf_delay, [1, 2, 3, 5, 7, 9], axis=0)
         headdf_delay, pelvdf_delay, torsdf_delay, feetdf_delay, handsdf_delay, kneesdf_delay, shldsdf_delay = jp.split(all_df_delay, [1, 2, 3, 5, 7, 9], axis=0)
+
+        boxgf       = boxgf       * (move_flag[None] > 0.5) / (jp.linalg.norm(boxgf,       axis=-1, keepdims=True) + EPS)
+        boxbf       = boxbf       / (jp.linalg.norm(boxbf,       axis=-1, keepdims=True) + EPS)
+        boxgf_delay = boxgf_delay * (move_flag[None] > 0.5) / (jp.linalg.norm(boxgf_delay, axis=-1, keepdims=True) + EPS)
+        boxbf_delay = boxbf_delay / (jp.linalg.norm(boxbf_delay, axis=-1, keepdims=True) + EPS)
         command_delay = self.compute_cmd_from_rtf(
             pelvgf_delay.reshape(-1),
             jp.concat([headgf_delay, feetgf_delay, handsgf_delay], axis=0),
@@ -974,6 +999,8 @@ class G1CaTraEnv(G1CatEnv):
         state.info["handsgf"] = handsgf.copy(); state.info["handsbf"] = handsbf.copy(); state.info["handsdf"] = handsdf.copy()
         state.info["kneesgf"] = kneesgf.copy(); state.info["kneesbf"] = kneesbf.copy(); state.info["kneesdf"] = kneesdf.copy()
         state.info["shldsgf"] = shldsgf.copy(); state.info["shldsbf"] = shldsbf.copy(); state.info["shldsdf"] = shldsdf.copy()
+        state.info["boxgf"] = boxgf.copy(); state.info["boxbf"] = boxbf.copy(); state.info["boxdf"] = boxdf.copy()
+        state.info["boxgf_delay"] = boxgf_delay.copy(); state.info["boxbf_delay"] = boxbf_delay.copy(); state.info["boxdf_delay"] = boxdf_delay.copy()
         state.info["head_pos"] = head_pos.copy(); state.info["head_vel"] = head_vel.copy()
         state.info["pelv_pos"] = pelv_pos.copy(); state.info["tors_pos"] = tors_pos.copy()
         state.info["feet_pos"] = feet_pos.copy(); state.info["feet_vel"] = feet_vel.copy()
@@ -1013,19 +1040,31 @@ class G1CaTraEnv(G1CatEnv):
         state = state.replace(data=data, obs=obs, reward=reward, done=done)
         return state
 
-    def _get_obs(self, data: mjx.Data, info: dict[str, Any], feet_contact: jax.Array) -> mjx_env.Observation:
-        """195-dim state (deployable, noisy) and 289-dim privileged_state (noiseless + extras).
+    def _box_corners_world(self, data: mjx.Data, box_size: jax.Array) -> jax.Array:
+        # Returns (8, 3) world positions of the box's corners. box_size is the (hx, hy, hz) half-extents.
+        corner_signs = jp.array([
+            [-1., -1., -1.], [-1., -1.,  1.], [-1.,  1., -1.], [-1.,  1.,  1.],
+            [ 1., -1., -1.], [ 1., -1.,  1.], [ 1.,  1., -1.], [ 1.,  1.,  1.],
+        ], dtype=jp.float32)
+        box_pos = data.xpos[self._box_body_id]
+        box_quat = data.xquat[self._box_body_id]
+        R = math.quat_to_mat(box_quat)
+        local_corners = corner_signs * box_size
+        return box_pos + local_corners @ R.T
 
-        State (195):
+    def _get_obs(self, data: mjx.Data, info: dict[str, Any], feet_contact: jax.Array) -> mjx_env.Observation:
+        """251-dim state (deployable; PF subblock delayed + nav-frame, not additively noised) and 345-dim privileged_state.
+
+        State (251):
             noisy_gyro(3), noisy_gvec(3),
             noisy_joint_angles[action_ids](23), noisy_joint_vel[action_ids](23),
             last_act(23), motor_targets[action_ids](23),
             command(4), foot_height(1), gait_phase(4),
-            body_pf_delayed_nav(77),
+            body_pf_delayed_nav(77) + box_pf_delayed_nav(56) = 133,
             box_pos_local(3), box_quat_local(4), box_size(3), stage_flag(1)
 
-        Privileged (289 = 188 noiseless-state-block + 101 extras):
-            [same 188 fields, noiseless, world-frame PF, no box_pos_local/quat_local]
+        Privileged (345 = 244 noiseless-state-block + 101 extras):
+            [same fields, noiseless, world-frame PF (body 77 + box 56 = 133), no box_pos_local/quat_local]
             + linvel_pelvis(3), body_positions(33), body_velocities(15),
               box_pos_world(3), box_quat_world(4), box_linvel(3), box_angvel(3),
               navi_torso_rpy[:2](2)+gait_mask(2)+feet_contact(2),
@@ -1056,7 +1095,7 @@ class G1CaTraEnv(G1CatEnv):
 
         navi2world_pose = info["navi2world_pose"]
 
-        # --- Build noiseless body PF block (77 dims, world frame, non-delayed) ---
+        # --- Build noiseless PF block (77 body + 56 box = 133 dims, world frame, non-delayed) ---
         pf_noiseless = jp.hstack([
             info["headgf"].reshape(-1), info["headbf"].reshape(-1), info["headdf"].reshape(-1),
             info["pelvgf"].reshape(-1), info["pelvbf"].reshape(-1), info["pelvdf"].reshape(-1),
@@ -1065,6 +1104,7 @@ class G1CaTraEnv(G1CatEnv):
             info["handsgf"].reshape(-1), info["handsbf"].reshape(-1), info["handsdf"].reshape(-1),
             info["kneesgf"].reshape(-1), info["kneesbf"].reshape(-1), info["kneesdf"].reshape(-1),
             info["shldsgf"].reshape(-1), info["shldsbf"].reshape(-1), info["shldsdf"].reshape(-1),
+            info["boxgf"].reshape(-1), info["boxbf"].reshape(-1), info["boxdf"].reshape(-1),
         ])
 
         # --- Privileged state (289 dims) ---
@@ -1136,6 +1176,11 @@ class G1CaTraEnv(G1CatEnv):
         kneesbf = kneesbf * (info["kneesdf_delay"] < 0.5); kneesdf = jp.clip(info["kneesdf_delay"], -1.0, 0.5)
         shldsbf = shldsbf * (info["shldsdf_delay"] < 0.5); shldsdf = jp.clip(info["shldsdf_delay"], -1.0, 0.5)
 
+        boxgf = world_to_navi_vel(navi2world_pose, info["boxgf_delay"].reshape(-1, 3))
+        boxbf = world_to_navi_vel(navi2world_pose, info["boxbf_delay"].reshape(-1, 3))
+        boxbf = boxbf * (info["boxdf_delay"] < 0.5)
+        boxdf = jp.clip(info["boxdf_delay"], -1.0, 0.5)
+
         pf = jp.hstack([
             headgf.reshape(-1), headbf.reshape(-1), headdf.reshape(-1),
             pelvgf.reshape(-1), pelvbf.reshape(-1), pelvdf.reshape(-1),
@@ -1144,6 +1189,7 @@ class G1CaTraEnv(G1CatEnv):
             handsgf.reshape(-1), handsbf.reshape(-1), handsdf.reshape(-1),
             kneesgf.reshape(-1), kneesbf.reshape(-1), kneesdf.reshape(-1),
             shldsgf.reshape(-1), shldsbf.reshape(-1), shldsdf.reshape(-1),
+            boxgf.reshape(-1), boxbf.reshape(-1), boxdf.reshape(-1),
         ])
 
         state = jp.hstack([
@@ -1180,6 +1226,7 @@ class G1CaTraEnv(G1CatEnv):
         contact_termination |= jp.any(info['handsdf'] < -thr)
         contact_termination |= jp.any(info['kneesdf'] < -thr)
         contact_termination |= jp.any(info['shldsdf'] < -thr)
+        contact_termination |= jp.any(info['boxdf'] < -thr)
 
         # Body-obstacle SDF collision active only after step 150 (allow pickup phase to settle)
         contact_termination &= (info["step"] >= self._config.stage1_steps + 50)
@@ -1373,6 +1420,7 @@ class G1CaTraEnv(G1CatEnv):
             "handsdf": self._re_sdf(info["handsdf"]),
             "kneesdf": self._re_sdf(info["kneesdf"]),
             "shldsdf": self._re_sdf(info["shldsdf"]),
+            "boxdf":   self._re_sdf(info["boxdf"]),
             # Carry maintenance (reuse computed Pickup values)
             "reach_carry":          reach,
             "lift_carry":           lift,

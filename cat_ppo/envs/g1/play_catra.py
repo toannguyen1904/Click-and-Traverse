@@ -46,9 +46,15 @@ def _quat_mul(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
     ])
 
 
+_BOX_CORNER_SIGNS = np.array([
+    [-1., -1., -1.], [-1., -1.,  1.], [-1.,  1., -1.], [-1.,  1.,  1.],
+    [ 1., -1., -1.], [ 1., -1.,  1.], [ 1.,  1., -1.], [ 1.,  1.,  1.],
+], dtype=np.float32)
+
+
 @cat_ppo.registry.register("G1CaTra", "play_env_class")
 class PlayG1CaTraEnv(BaseEnv):
-    """CPU inference env for two-stage G1CaTra (195-dim state)."""
+    """CPU inference env for two-stage G1CaTra (251-dim state)."""
 
     def __init__(
         self,
@@ -190,6 +196,10 @@ class PlayG1CaTraEnv(BaseEnv):
         headdf, pelvdf, torsdf, feetdf, handsdf, kneesdf, shldsdf = np.split(all_df, [1, 2, 3, 5, 7, 9], axis=0)
 
         box_size = self.mj_model.geom_size[self._box_geom_id].copy()
+        box_corners = self._box_corners_world(box_size)
+        boxgf = self.sample_field(self.gf,  box_corners)
+        boxbf = self.sample_field(self.bf,  box_corners)
+        boxdf = self.sample_field(self.sdf, box_corners)
 
         if self._ws_qpos is not None:
             init_step = self._config.stage1_steps
@@ -218,6 +228,7 @@ class PlayG1CaTraEnv(BaseEnv):
             "handsgf": handsgf, "handsbf": handsbf, "handsdf": handsdf,
             "kneesgf": kneesgf, "kneesbf": kneesbf, "kneesdf": kneesdf,
             "shldsgf": shldsgf, "shldsbf": shldsbf, "shldsdf": shldsdf,
+            "boxgf": boxgf, "boxbf": boxbf, "boxdf": boxdf,
             "head_pos": head_pos, "head_vel": np.zeros(3),
             "feet_pos": feet_pos, "feet_vel": np.zeros_like(feet_pos),
             "hands_pos": hands_pos, "hands_vel": np.zeros_like(hands_pos),
@@ -296,6 +307,15 @@ class PlayG1CaTraEnv(BaseEnv):
         headgf, pelvgf, torsgf, feetgf, handsgf, kneesgf, shldsgf = np.split(all_gf, [1, 2, 3, 5, 7, 9], axis=0)
         headbf, pelvbf, torsbf, feetbf, handsbf, kneesbf, shldsbf = np.split(all_bf, [1, 2, 3, 5, 7, 9], axis=0)
 
+        # Box corner PF (delayed, then move_flag-normalized)
+        box_corners = self._box_corners_world(state.info["box_size"])
+        box_corners_delay = delay_body_pos(p_gt, q_gt, p_odom, q_odom, box_corners)
+        boxgf = self.sample_field(self.gf,  box_corners_delay)
+        boxbf = self.sample_field(self.bf,  box_corners_delay)
+        boxdf = self.sample_field(self.sdf, box_corners_delay)
+        boxgf = boxgf * (move_flag_val > 0.5) / (np.linalg.norm(boxgf, axis=-1, keepdims=True) + EPS)
+        boxbf = boxbf / (np.linalg.norm(boxbf, axis=-1, keepdims=True) + EPS)
+
         state.info.update({
             "step": step + 1,
             "command": command,
@@ -308,6 +328,7 @@ class PlayG1CaTraEnv(BaseEnv):
             "handsgf": handsgf, "handsbf": handsbf, "handsdf": handsdf,
             "kneesgf": kneesgf, "kneesbf": kneesbf, "kneesdf": kneesdf,
             "shldsgf": shldsgf, "shldsbf": shldsbf, "shldsdf": shldsdf,
+            "boxgf": boxgf, "boxbf": boxbf, "boxdf": boxdf,
             "head_pos": head_pos, "head_vel": head_vel,
             "feet_pos": feet_pos, "feet_vel": feet_vel,
             "hands_pos": hands_pos, "hands_vel": hands_vel,
@@ -317,7 +338,7 @@ class PlayG1CaTraEnv(BaseEnv):
         return State(state.info, obs)
 
     def get_obs(self, info: dict) -> dict:
-        """Build 195-dim deployable state (matches G1CaTraEnv._get_obs)."""
+        """Build 251-dim deployable state (matches G1CaTraEnv._get_obs)."""
         nl = self._config.noise_config.level
         ns = self._config.noise_config.scales
 
@@ -381,6 +402,11 @@ class PlayG1CaTraEnv(BaseEnv):
         kneesbf = kneesbf * (info["kneesdf"] < 0.5); kneesdf = np.clip(info["kneesdf"], -1.0, 0.5)
         shldsbf = shldsbf * (info["shldsdf"] < 0.5); shldsdf = np.clip(info["shldsdf"], -1.0, 0.5)
 
+        boxgf_n = world_to_navi_vel(navi2world_pose, info["boxgf"].reshape(-1, 3))
+        boxbf_n = world_to_navi_vel(navi2world_pose, info["boxbf"].reshape(-1, 3))
+        boxbf_n = boxbf_n * (info["boxdf"] < 0.5)
+        boxdf_c = np.clip(info["boxdf"], -1.0, 0.5)
+
         gait_phase = np.hstack([np.cos(info["phase"]), np.sin(info["phase"])])
         ids = self.action_joint_ids
 
@@ -392,6 +418,7 @@ class PlayG1CaTraEnv(BaseEnv):
             handsgf.reshape(-1), handsbf.reshape(-1), handsdf.reshape(-1),
             kneesgf.reshape(-1), kneesbf.reshape(-1), kneesdf.reshape(-1),
             shldsgf.reshape(-1), shldsbf.reshape(-1), shldsdf.reshape(-1),
+            boxgf_n.reshape(-1), boxbf_n.reshape(-1), boxdf_c.reshape(-1),
         ])
 
         state = np.concatenate([
@@ -464,6 +491,13 @@ class PlayG1CaTraEnv(BaseEnv):
         gait_mask = np.where(gait_cycle > 0.6, 1.0, 0.0)
         gait_mask = np.where(gait_cycle < -0.6, -1.0, gait_mask)
         state.info["gait_mask"] = np.float32(gait_mask)
+
+    def _box_corners_world(self, box_size: np.ndarray) -> np.ndarray:
+        # Returns (8, 3) world positions of box corners. box_size: (hx, hy, hz) half-extents.
+        box_pos  = self.mj_data.xpos [self._box_body_id]
+        box_quat = self.mj_data.xquat[self._box_body_id]  # wxyz
+        R_mat = R.from_quat([box_quat[1], box_quat[2], box_quat[3], box_quat[0]]).as_matrix()
+        return box_pos + (_BOX_CORNER_SIGNS * box_size) @ R_mat.T
 
     def sample_field(self, field: np.ndarray, pos: np.ndarray) -> np.ndarray:
         """Trilinear interpolation of a 3D field at world-space positions (N,3) → (N,C)."""

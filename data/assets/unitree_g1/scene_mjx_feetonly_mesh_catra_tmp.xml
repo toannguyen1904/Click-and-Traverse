@@ -26,14 +26,15 @@
         <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="60 60" reflectance="0.01" specular="0.25" shininess="0.35" />
         <texture name="tex_brick_cube" type="2d" file="texture.png" />
         <material name="mat_brick_cube" texture="tex_brick_cube" reflectance="0.10" specular="0.20" shininess="0.30" />
-        <mesh name="scene_mesh" file="../TypiObs/empty/obs.obj" />
+        <mesh name="scene_mesh" file="../TypiObs/Mceilbar1/obs.obj" />
     </asset>
 
     <worldbody>
         <light name="key" pos="0 0 5" dir="0 0 -1" directional="true" />
         <light name="fill" pos="3 -3 3" dir="-1 1 -1" directional="true" />
         <body name="scene" pos="-0.5 -1.0 0">
-            <geom type="mesh" mesh="scene_mesh" rgba="0.7 0.7 0.7 1" contype="1" conaffinity="1" material="mat_brick_cube" />
+            
+            <geom type="mesh" mesh="scene_mesh" rgba="0.7 0.7 0.7 1" contype="8" conaffinity="8" material="mat_brick_cube" />
         </body>
         <geom name="floor" size="0 0 0.01" type="plane" material="groundplane" contype="5" conaffinity="5" />
         
@@ -59,6 +60,9 @@
         <pair geom1="right_elbow_collision" geom2="box_geom" condim="3" friction="0.5 0.5 0.5" />
         <pair geom1="left_shoulder_yaw_collision" geom2="box_geom" condim="3" friction="0.5 0.5 0.5" />
         <pair geom1="right_shoulder_yaw_collision" geom2="box_geom" condim="3" friction="0.5 0.5 0.5" />
+        <pair geom1="torso_collision" geom2="box_geom" condim="3" friction="0.5 0.5 0.5" />
+        <pair geom1="head_collision" geom2="box_geom" condim="3" friction="0.5 0.5 0.5" />
+
         
         <pair geom1="left_shin" geom2="floor" condim="3" friction="0.5 0.5" />
         <pair geom1="right_shin" geom2="floor" condim="3" friction="0.5 0.5" />

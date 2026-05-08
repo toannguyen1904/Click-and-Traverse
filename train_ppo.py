@@ -50,6 +50,7 @@ class Args:
     ground: float = 0    # reward scale for feet body group: GF guidance alignment + SDF penalty vs ground-level obstacles
     lateral: float = 0   # reward scale for hands/knees/shoulders body group: GF guidance alignment + SDF penalty vs side obstacles
     overhead: float = 0  # reward scale for head body group: GF guidance alignment + SDF penalty vs overhead obstacles
+    box: float = 0       # reward scale for box-corner SDF penalty (G1CaTra only): keeps the carried box clear of obstacles
     term_collision_threshold: float = 0.04  # SDF below -threshold triggers collision termination
     obs_path: str = 'data/assets/TypiObs/empty'  # path to the obstacle grid files: sdf.npy, bf.npy, gf.npy.
     stage1_steps: int = -1  # for G1CaTra: number of steps in stage 1 (pickup); -1 = use task default
@@ -66,6 +67,9 @@ class Args:
 
         if self.overhead != 0:
             exp_name_parts.append('O'+str(self.overhead).replace('.', ''))
+
+        if self.box != 0:
+            exp_name_parts.append('B'+str(self.box).replace('.', ''))
 
         exp_name_parts.append(f"T{str(self.term_collision_threshold).replace('.', '')}")
 
@@ -133,6 +137,8 @@ def _apply_args_to_config(args: Args, policy_cfg, env_config, debug: bool):
     env_config.reward_config.scales.handsdf = args.lateral  # scale: SDF penalty for hands vs side obstacles
     env_config.reward_config.scales.kneesdf = args.lateral  # scale: SDF penalty for knees vs obstacles
     env_config.reward_config.scales.shldsdf = args.lateral  # scale: SDF penalty for shoulders vs obstacles
+    if "boxdf" in env_config.reward_config.scales:
+        env_config.reward_config.scales.boxdf = args.box  # scale: SDF penalty for box corners vs obstacles (G1CaTra only)
     env_config.term_collision_threshold = args.term_collision_threshold  # SDF below -threshold triggers collision termination
     if args.stage1_steps >= 0 and hasattr(env_config, "stage1_steps"):
         env_config.stage1_steps = args.stage1_steps  # override stage 1 length (G1CaTra only)
