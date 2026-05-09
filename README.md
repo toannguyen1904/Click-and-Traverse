@@ -234,7 +234,7 @@ Refer to `train_batch.py` for args details.
 ```bash
 python -m cat_ppo.eval.brax2onnx \
   --task G1Cat \
-  --exp_name exp_name
+  --exp_name 04271342_G1LocoPFR10_SlowV4_xP2xMxK-004x427Mhurdle
 ```
 
 ### Evaluation
@@ -242,7 +242,7 @@ python -m cat_ppo.eval.brax2onnx \
 To evaluate the model without privileged observation, run:
 
 ```bash
-python -m cat_ppo.eval.mj_onnx_play --task G1Cat --exp_name 04171610_G1Cat_debug_xT00xdataassetsTypiObsempty --obs_path data/assets/TypiObs/empty
+python -m cat_ppo.eval.mj_onnx_play --task G1Cat --exp_name 04171800_G1Cat_0417testV0_xT0p0xempty --obs_path data/assets/R2SObs/oav_test0
 ```
 
 To evaluate the model with privileged observation, run:

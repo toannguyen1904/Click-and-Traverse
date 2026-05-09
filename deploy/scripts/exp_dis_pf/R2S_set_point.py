@@ -2,6 +2,7 @@ import numpy as np
 
 def crop_rotated_box(occ, p1, p2, z_start=0,
                      size_x=128, size_y=128, size_z=35):
+                    #  size_x=75, size_y=50, size_z=38):
     """
     occ: (H, W, D) 占据栅格
     p1, p2: 在 xy 平面上的两个点坐标 (2,), 单位: voxel index
@@ -117,8 +118,8 @@ def onclick(event):
 
 
 if __name__ == '__main__':
-    occ_path = '/home/ubuntu/workspace/Click-and-Traverse/data/assets/R2SObs/door/voxel_1768229892.3615618.npy' # obs_pf_save_path in octomap_bridge.py
-    obj_path = '/home/ubuntu/workspace/Click-and-Traverse/data/assets/R2SObs/door/obs.npy'
+    occ_path = '/home/galbot/workspace/Click-and-Traverse/data/assets/R2SObs/uhln/voxel_1777284034.5574436.npy' # obs_pf_save_path in octomap_bridge.py
+    obj_path = '/home/galbot/workspace/Click-and-Traverse/data/assets/R2SObs/uhln/voxel.npy'
     occ=np.load(occ_path)
     proj = show_topdown(occ)
 

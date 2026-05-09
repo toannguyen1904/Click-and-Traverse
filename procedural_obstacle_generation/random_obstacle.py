@@ -3,13 +3,20 @@ import torch
 from dataclasses import dataclass
 from scipy.ndimage import binary_closing, binary_opening, binary_erosion, rotate as ndi_rotate
 import os
+from grid_config import apply_grid_config
+
+
 @dataclass
 class Cfg:
-    Lx: float = 3.0; Ly: float = 2.0; Lz: float = 1.5
-    voxel: float = 0.04
-    origin_w: tuple = (-0.5, -1.0, 0.0)
-    start_w:  tuple = (0.0,  0.0, 0.75)
-    goal_w:   tuple = (2.0,  0.0, 0.75)
+    grid_config_path: str | None = None
+    # voxel: float = field(init=False)
+    # Lx: float = field(init=False)
+    # Ly: float = field(init=False)
+    # Lz: float = field(init=False)
+    # origin_w: np.ndarray = field(init=False)
+    # start_w: np.ndarray = field(init=False)
+    # goal_w: np.ndarray = field(init=False)
+    # axis_order: str = field(init=False)
 
     difficulty: float = 0.9
     seed: int = 42
@@ -65,6 +72,9 @@ class Cfg:
     widen_extra:   float = 0.2
     top_band_z:    float = 0.30
     bot_band_z:    float = 0.20
+
+    def __post_init__(self):
+        apply_grid_config(self, self.grid_config_path)
 
 
 def _lerp(a, b, t): 

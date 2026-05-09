@@ -185,6 +185,5 @@ cython_debug/
 #.idea/
 /swanlog/
 /data/assets/mujoco_menagerie/
-/data/assets/RandObs/
-/data/assets/TypiObs/
+/data/assets/
 /output_logs/

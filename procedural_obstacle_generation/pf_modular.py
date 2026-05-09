@@ -4,19 +4,16 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from dataclasses import dataclass
 import skfmm
+from grid_config import apply_grid_config
 # @dataclass
 class PFConfig:
-    voxel: float = 0.04           # resolution (m)
-    Lx: float = 3.0               # x-axis (m) forward
-    Ly: float = 2.0               # y-axis (m) left
-    Lz: float = 1.5               # z-axis (m) up
-    origin_w: np.ndarray = np.array([-0.5, -1.0, 0.0], dtype=np.float32) # pre-defined origin in canonical frame (m)
-    start_w:  np.ndarray = np.array([0.0,  0.0, 0.75], dtype=np.float32)
-    goal_w:   np.ndarray = np.array([2.0,  0.0, 0.75], dtype=np.float32)
-
+    grid_config_path: str | None = None
     v_max: float = 0.6          # max velocity far from goal (m/s)
     k_decay: float = 0.6        # decay radius near goal (m)
     goal_seed_r: float = 0.12   # goal negative region radius (m)
+
+    def __init__(self, grid_config_path=None):
+        apply_grid_config(self, grid_config_path)
 
 def world_to_local(p_w, cfg: PFConfig):
     return p_w - cfg.origin_w
@@ -209,5 +206,4 @@ def visualize_all(xv, yv, zv, sdf, T, gf, obs_mask, start_l, goal_l, title_prefi
     plt.tight_layout(); #plt.show()
     plt.savefig(f"{title_prefix}_front.png", dpi=300)
     plt.close()
-
 

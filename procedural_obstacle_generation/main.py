@@ -6,7 +6,10 @@ from pf_modular import make_sdf, make_guidance_field_progressive, grad3, PFConfi
 import numpy as np
 from utills import marching_cubes_mesh, occupancy_to_points, preview_matplotlib, combine_meshes
 import itertools
-def generate_random_obstacle(difficulty, seed, n_rect_R, n_rect_F, n_rect_C):
+from grid_config import expected_shape_from_config
+
+
+def generate_random_obstacle(difficulty, seed, n_rect_R, n_rect_F, n_rect_C, grid_config_path=None):
     n_rect_L=n_rect_R
     prefix = f"D{int(difficulty*10)}G{n_rect_F:01d}L{n_rect_R:01d}O{n_rect_C:01d}S{seed}/"
 
@@ -14,7 +17,15 @@ def generate_random_obstacle(difficulty, seed, n_rect_R, n_rect_F, n_rect_C):
     save = False
     if save:
         os.makedirs(prefix, exist_ok=True)
-    obs_cfg = ObsCfg(difficulty=difficulty, seed=seed, n_rect_L=n_rect_L, n_rect_R=n_rect_R, n_rect_F=n_rect_F, n_rect_C=n_rect_C)
+    obs_cfg = ObsCfg(
+        grid_config_path=grid_config_path,
+        difficulty=difficulty,
+        seed=seed,
+        n_rect_L=n_rect_L,
+        n_rect_R=n_rect_R,
+        n_rect_F=n_rect_F,
+        n_rect_C=n_rect_C,
+    )
     obs_mask, xv, yv, zv = generate_and_save(obs_cfg, prefix=prefix, save=save)
     if obs_mask.any() == False:
         shutil.rmtree(prefix)
@@ -27,14 +38,7 @@ def generate_random_obstacle(difficulty, seed, n_rect_R, n_rect_F, n_rect_C):
     mesh = better_mesh(spacing, obs_mask)
     mesh.export(f"../data/assets/RandObs/{prefix}obs.obj")
 
-    cfg = PFConfig()
-    cfg.voxel = obs_cfg.voxel
-    cfg.start_w = obs_cfg.start_w
-    cfg.goal_w = obs_cfg.goal_w
-    cfg.origin_w = obs_cfg.origin_w
-    cfg.Lx = obs_cfg.Lx
-    cfg.Ly = obs_cfg.Ly
-    cfg.Lz = obs_cfg.Lz
+    cfg = PFConfig(grid_config_path=grid_config_path)
     
     # SDF and gradient
     sdf = make_sdf(obs_mask, cfg.voxel)
@@ -56,17 +60,9 @@ def generate_random_obstacle(difficulty, seed, n_rect_R, n_rect_F, n_rect_C):
     os.makedirs(f"fig/", exist_ok=True)
     visualize_all(xv, yv, zv, sdf, T, gf, obs_mask, cfg.start_w, cfg.goal_w, title_prefix=f'fig/{prefix[:-1]}')
 
-def generate_typical_obstacle(scene_type):
+def generate_typical_obstacle(scene_type, grid_config_path=None):
     prefix = f"{scene_type}/"
-    obs_cfg = ObsCfg()
-    cfg = PFConfig()
-    assert cfg.voxel == obs_cfg.voxel
-    assert (cfg.start_w == obs_cfg.start_w).all()
-    assert (cfg.goal_w == obs_cfg.goal_w).all()
-    assert (cfg.origin_w == obs_cfg.origin_w).all()
-    assert cfg.Lx == obs_cfg.Lx
-    assert cfg.Ly == obs_cfg.Ly
-    assert cfg.Lz == obs_cfg.Lz
+    cfg = PFConfig(grid_config_path=grid_config_path)
     
     xv, yv, zv = make_axes(cfg)
     X, Y, Z = np.meshgrid(xv, yv, zv, indexing='ij')
@@ -97,18 +93,11 @@ def generate_typical_obstacle(scene_type):
 
     # visualize_all(xv, yv, zv, sdf, T, gf, obs_mask, cfg.start_w, cfg.goal_w)
 
-
-def generate_pf(scene_type, pc_path):
+def generate_pf(scene_type, pc_path, grid_config_path=None):
     prefix = f"{scene_type}/"
-    obs_cfg = ObsCfg()
-    cfg = PFConfig()
-    assert cfg.voxel == obs_cfg.voxel
-    assert (cfg.start_w == obs_cfg.start_w).all()
-    assert (cfg.goal_w == obs_cfg.goal_w).all()
-    assert (cfg.origin_w == obs_cfg.origin_w).all()
-    assert cfg.Lx == obs_cfg.Lx
-    assert cfg.Ly == obs_cfg.Ly
-    assert cfg.Lz == obs_cfg.Lz
+    cfg = PFConfig(grid_config_path=grid_config_path)
+    expected_shape = expected_shape_from_config(grid_config_path)
+
     
     xv, yv, zv = make_axes(cfg)
     X, Y, Z = np.meshgrid(xv, yv, zv, indexing='ij')
@@ -116,6 +105,11 @@ def generate_pf(scene_type, pc_path):
     obs_mask = np.load(pc_path, allow_pickle=True) 
     if obs_mask.dtype != np.bool_:
         obs_mask = obs_mask.astype(np.uint8) > 0
+    if tuple(obs_mask.shape) != expected_shape:
+        raise ValueError(
+            f"obs_mask shape {obs_mask.shape} does not match PF grid shape {expected_shape}. "
+            "Pass the matching voxel .meta.yaml or config path to generate_pf(..., grid_config_path=...)."
+        )
 
     # some pre-processing for real-to-sim occupancy
     z_bar_thresh = 6
@@ -127,7 +121,7 @@ def generate_pf(scene_type, pc_path):
     pts = occupancy_to_points(obs_mask, voxel_size=cfg.voxel)
     preview_matplotlib(pts)
     spacing = (cfg.voxel, cfg.voxel, cfg.voxel)
-    mesh = marching_cubes_mesh(obs_mask, spacing=spacing)
+    mesh = better_mesh(spacing, obs_mask)
     mesh.export(f"../data/assets/R2SObs/{prefix}obs.obj")
 
     sdf = make_sdf(obs_mask, cfg.voxel)
@@ -143,7 +137,7 @@ def generate_pf(scene_type, pc_path):
     # sur = extract_surface_voxels(obs_mask)
     # np.save(f"../data/assets/R2SObs/{prefix}sur.npy", sur.astype(np.uint8))
     # 可视化
-    # visualize_all(xv, yv, zv, sdf, T, gf, obs_mask, cfg.start_w, cfg.goal_w)
+    visualize_all(xv, yv, zv, sdf, T, gf, obs_mask, cfg.start_w, cfg.goal_w)
 
 
 def better_mesh(spacing, obs_mask): # for mujoco visualization
@@ -182,13 +176,14 @@ if __name__ == "__main__":
     # generate_typical_obstacle('Mceil1')
     # generate_typical_obstacle('Mbar0')
     # generate_typical_obstacle('Mbar1')
-    generate_typical_obstacle('ceilbar0')
-    generate_typical_obstacle('ceilbar1')
+    # generate_typical_obstacle('ceilbar0')
+    # generate_typical_obstacle('ceilbar1')
     # generate_typical_obstacle('chest')
     # generate_typical_obstacle('Nbar0')
     # generate_typical_obstacle('Nbar1')
     # generate_typical_obstacle('doubar')
     # generate_typical_obstacle('lowcorner')
     # generate_typical_obstacle('hole')
-    # generate_random_obstacle(0.8, 13, 1, 0, 0)
+    # generate_random_obstacle(0.4, 13, 2, 1, 1)
     # generate_random_obstacle(0.8, 4, 1, 0, 1)
+    generate_pf('oav_hard0', '/home/galbot/workspace/oav/short/tasks/hard/scene_0000_diff80_seed20260410/export/scene.voxel.npy', '/home/galbot/workspace/oav/short/tasks/hard/scene_0000_diff80_seed20260410/export/scene.voxel.meta.yaml')

@@ -1,0 +1,19 @@
+grid:
+  voxel: 0.04
+  size:
+    - 3.0
+    - 2.0
+    - 1.4
+  origin_w:
+    - -0.5
+    - -1.0
+    - 0.0
+  start_w:
+    - 0.0
+    - 0.0
+    - 0.75
+  goal_w:
+    - 2.0
+    - 0.0
+    - 0.75
+  axis_order: xyz

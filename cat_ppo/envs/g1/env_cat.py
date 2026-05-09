@@ -121,9 +121,11 @@ def g1_loco_task_config() -> config_dict.ConfigDict:
         ang_vel_yaw=[-0.5, 0.5],
         torso_height=[0.5, consts.DEFAULT_CHEST_Z],
         pf_config=config_dict.create(
-            path='data/assets/TypiObs/empty', # NOTE
             dx=0.04,
-            origin=np.array([-0.5, -1.0, 0.0], dtype=np.float32),
+            # path='data/assets/TypiObs/empty', # NOTE
+            # origin=np.array([-0.5, -1.0, 0.0], dtype=np.float32),
+            path='data/assets/R2SObs/Mhurdle', # NOTE
+            origin=np.array([-2.56, -2.56, 0.0], dtype=np.float32),
         ),
     )
 
