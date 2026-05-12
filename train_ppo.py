@@ -30,7 +30,8 @@ import wandb  # noqa: E402
 xla_flags = os.environ.get("XLA_FLAGS", "")
 xla_flags += " --xla_gpu_triton_gemm_any=True"  # allows more GPU matrix multiplications to use the Triton GEMM path
 os.environ["XLA_FLAGS"] = xla_flags
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"   # Stops JAX from grabbing most GPU memory upfront at startup.
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.9"   # Preallocate 90% of GPU memory upfront as a contiguous block, avoiding fragmentation-induced OOM during training.
 os.environ["MUJOCO_GL"] = "egl" # for headless rendering
 
 WANDB_PROJECT = os.environ.get("WANDB_PROJECT")  # Project name in WandB
