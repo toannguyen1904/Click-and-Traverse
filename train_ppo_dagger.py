@@ -28,6 +28,9 @@ from train_ppo import (
 @dataclass
 class DaggerArgs(Args):
     teacher_restore_names: list[str] = field(default_factory=list)
+    dagger_timesteps: int = 0
+    dagger_actor_loss_scale: float = 1.0
+    dagger_value_loss_scale: float = 1.0
 
 
 def _dagger_task_name(task: str) -> str:
@@ -80,6 +83,11 @@ def _prepare_dagger_config(policy_cfg, env_config, args: DaggerArgs):
     env_config.pf_config.origin = [-0.5, -1.0, 0.0]
     dagger_cfg.teacher_restore_names = teacher_names
     dagger_cfg.teacher_checkpoint_paths = teacher_checkpoint_paths
+    dagger_cfg.dagger_timesteps = args.dagger_timesteps or (policy_cfg.num_timesteps // 2)
+    if args.dagger_actor_loss_scale <= 0:
+        raise ValueError("dagger_actor_loss_scale must be > 0 because DAgger phase should train the actor.")
+    dagger_cfg.actor_loss_scale = args.dagger_actor_loss_scale
+    dagger_cfg.value_loss_scale = args.dagger_value_loss_scale
 
 
 def train(args: DaggerArgs):
@@ -92,7 +100,7 @@ def train(args: DaggerArgs):
     base_args = {
         key: value
         for key, value in args.__dict__.items()
-        if key != "teacher_restore_names"
+        if key not in ("teacher_restore_names", "dagger_timesteps", "dagger_actor_loss_scale", "dagger_value_loss_scale")
     }
     train_args = Args(**{**base_args, "task": task_name})
 

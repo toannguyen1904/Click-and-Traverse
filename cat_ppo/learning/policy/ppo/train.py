@@ -18,6 +18,7 @@ See: https://arxiv.org/pdf/1707.06347.pdf
 """
 
 import functools
+import collections
 import time
 from typing import Any, Callable, Mapping, Optional, Tuple, Union
 
@@ -26,7 +27,6 @@ from brax import base
 from brax import envs
 from brax.training import acting
 from brax.training import gradients
-from brax.training import logger as metric_logger
 from brax.training import pmap
 from brax.training import types
 from brax.training.acme import running_statistics
@@ -71,6 +71,81 @@ def _strip_weak_type(tree):
         return leaf.astype(leaf.dtype)
 
     return jax.tree_util.tree_map(f, tree)
+
+
+class TrainingMetricsLogger:
+    """Aggregates rollout episode metrics without flattening names under one prefix."""
+
+    def __init__(self, buffer_size=100, steps_between_logging=1e5, progress_fn=None):
+        self._metrics_buffer = collections.defaultdict(
+            lambda: collections.deque(maxlen=buffer_size)
+        )
+        self._rollout_buffer = collections.defaultdict(
+            lambda: collections.deque(maxlen=buffer_size)
+        )
+        self._buffer_size = buffer_size
+        self._steps_between_logging = steps_between_logging
+        self._num_steps = 0
+        self._last_log_steps = 0
+        self._log_count = 0
+        self._progress_fn = progress_fn
+
+    @staticmethod
+    def _metric_key(name: str) -> str:
+        if name.startswith("reward/"):
+            return f"episode/{name}"
+        if name in ("sum_reward", "length"):
+            return f"episode/{name}"
+        return f"episode_metrics/{name}"
+
+    def update_rollout_metrics(self, metrics, dones, truncations):
+        dones = np.asarray(dones).astype(bool)
+        truncations = np.asarray(truncations).astype(bool)
+        self._num_steps += int(np.prod(dones.shape))
+
+        done_count = int(np.sum(dones))
+        if done_count > 0:
+            timeout_count = int(np.sum(dones & truncations))
+            termination_count = done_count - timeout_count
+            total_count = int(np.prod(dones.shape))
+            self._rollout_buffer["done_rate"].append(done_count / total_count)
+            self._rollout_buffer["termination_step_rate"].append(termination_count / total_count)
+            self._rollout_buffer["timeout_step_rate"].append(timeout_count / total_count)
+            self._rollout_buffer["timeout_rate"].append(timeout_count / done_count)
+            self._rollout_buffer["termination_rate"].append(termination_count / done_count)
+            self._rollout_buffer["episodes"].append(done_count)
+
+            done_mask = dones.astype(bool)
+            for name, metric in metrics.items():
+                metric = np.asarray(metric)
+                done_metrics = metric[done_mask].flatten().tolist()
+                self._metrics_buffer[self._metric_key(name)].extend(done_metrics)
+        else:
+            self._rollout_buffer["done_rate"].append(0.0)
+            self._rollout_buffer["termination_step_rate"].append(0.0)
+            self._rollout_buffer["timeout_step_rate"].append(0.0)
+            self._rollout_buffer["timeout_rate"].append(0.0)
+            self._rollout_buffer["termination_rate"].append(0.0)
+            self._rollout_buffer["episodes"].append(0.0)
+
+        if self._num_steps - self._last_log_steps >= self._steps_between_logging:
+            self.log_metrics()
+            self._last_log_steps = self._num_steps
+
+    def log_metrics(self, pad=35):
+        self._log_count += 1
+        log_string = f"\n{'Steps':>{pad}} Env: {self._num_steps} Log: {self._log_count}\n"
+        mean_metrics = {}
+        for metric_name in self._metrics_buffer:
+            mean_metrics[metric_name] = np.mean(self._metrics_buffer[metric_name])
+            log_string += f"{f'{metric_name}:':>{pad}} {mean_metrics[metric_name]:.4f}\n"
+        for metric_name in self._rollout_buffer:
+            key = f"rollout/{metric_name}"
+            mean_metrics[key] = np.mean(self._rollout_buffer[metric_name])
+            log_string += f"{f'{key}:':>{pad}} {mean_metrics[key]:.4f}\n"
+        logging.info(log_string)
+        if self._progress_fn is not None:
+            self._progress_fn(int(self._num_steps), mean_metrics)
 
 
 def _validate_madrona_args(
@@ -210,6 +285,12 @@ def _assert_same_tree_shapes(label: str, expected: Any, actual: Any):
             )
 
 
+def _uint64_lt(value: types.UInt64, other: int) -> jnp.ndarray:
+    other_hi = jnp.uint32(other >> 32)
+    other_lo = jnp.uint32(other & 0xFFFFFFFF)
+    return (value.hi < other_hi) | ((value.hi == other_hi) & (value.lo < other_lo))
+
+
 def compute_dagger_loss(
     params: ppo_losses.PPONetworkParams,
     normalizer_params: Any,
@@ -220,13 +301,22 @@ def compute_dagger_loss(
     teacher_policy_params: Any,
     num_teachers: int,
     kl_eps: float = 1e-5,
+    discounting: float = 0.9,
+    reward_scaling: float = 1.0,
+    gae_lambda: float = 0.95,
+    actor_loss_scale: float = 1.0,
+    value_loss_scale: float = 1.0,
 ) -> Tuple[jnp.ndarray, types.Metrics]:
     del rng
     policy_apply = ppo_network.policy_network.apply
+    value_apply = ppo_network.value_network.apply
     parametric_action_distribution = ppo_network.parametric_action_distribution
 
     data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), data)
     student_logits = policy_apply(normalizer_params, params.policy, data.observation)
+    baseline = value_apply(normalizer_params, params.value, data.observation)
+    terminal_obs = jax.tree_util.tree_map(lambda x: x[-1], data.next_observation)
+    bootstrap_value = value_apply(normalizer_params, params.value, terminal_obs)
 
     def teacher_apply(teacher_normalizer, teacher_policy):
         return policy_apply(teacher_normalizer, teacher_policy, data.observation)
@@ -245,13 +335,99 @@ def compute_dagger_loss(
     numerator = jnp.square(student_std) + jnp.square(student_dist.loc - teacher_dist.loc)
     denominator = 2.0 * jnp.square(teacher_std)
     dagger_kl = jnp.sum(log_term + numerator / denominator - 0.5, axis=-1)
-    total_loss = jnp.mean(dagger_kl)
+    dagger_kl = jnp.mean(dagger_kl)
+
+    rewards = data.reward * reward_scaling
+    truncation = data.extras["state_extras"]["truncation"]
+    termination = (1 - data.discount) * (1 - truncation)
+    vs, _ = ppo_losses.compute_gae(
+        truncation=truncation,
+        termination=termination,
+        rewards=rewards,
+        values=baseline,
+        bootstrap_value=bootstrap_value,
+        lambda_=gae_lambda,
+        discount=discounting,
+    )
+    v_loss = jnp.mean(jnp.square(vs - baseline)) * 0.5 * 0.5
+
+    actor_loss = actor_loss_scale * dagger_kl
+    value_loss = value_loss_scale * v_loss
+    total_loss = actor_loss + value_loss
     return total_loss, {
         "total_loss": total_loss,
-        "dagger_kl": total_loss,
+        "policy_loss": actor_loss,
+        "v_loss": value_loss,
+        "entropy_loss": jnp.zeros_like(total_loss),
+        "dagger_kl": dagger_kl,
         "student_std": jnp.mean(student_std),
         "teacher_std": jnp.mean(teacher_std),
+        "loss_mode": jnp.ones_like(total_loss),
     }
+
+
+def compute_dagger_then_ppo_loss(
+    params: ppo_losses.PPONetworkParams,
+    normalizer_params: Any,
+    data: types.Transition,
+    rng: jnp.ndarray,
+    dagger_phase: jnp.ndarray,
+    ppo_network: ppo_networks.PPONetworks,
+    teacher_normalizer_params: Any,
+    teacher_policy_params: Any,
+    num_teachers: int,
+    kl_eps: float = 1e-5,
+    entropy_cost: float = 1e-4,
+    discounting: float = 0.9,
+    reward_scaling: float = 1.0,
+    gae_lambda: float = 0.95,
+    clipping_epsilon: float = 0.3,
+    normalize_advantage: bool = True,
+    actor_loss_scale: float = 1.0,
+    value_loss_scale: float = 1.0,
+) -> Tuple[jnp.ndarray, types.Metrics]:
+    def dagger_loss(_):
+        return compute_dagger_loss(
+            params,
+            normalizer_params,
+            data,
+            rng,
+            ppo_network=ppo_network,
+            teacher_normalizer_params=teacher_normalizer_params,
+            teacher_policy_params=teacher_policy_params,
+            num_teachers=num_teachers,
+            kl_eps=kl_eps,
+            discounting=discounting,
+            reward_scaling=reward_scaling,
+            gae_lambda=gae_lambda,
+            actor_loss_scale=actor_loss_scale,
+            value_loss_scale=value_loss_scale,
+        )
+
+    def ppo_loss(_):
+        total_loss, metrics = ppo_losses.compute_ppo_loss(
+            params,
+            normalizer_params,
+            data,
+            rng,
+            ppo_network=ppo_network,
+            entropy_cost=entropy_cost,
+            discounting=discounting,
+            reward_scaling=reward_scaling,
+            gae_lambda=gae_lambda,
+            clipping_epsilon=clipping_epsilon,
+            normalize_advantage=normalize_advantage,
+        )
+        metrics = {
+            **metrics,
+            "dagger_kl": jnp.zeros_like(total_loss),
+            "student_std": jnp.zeros_like(total_loss),
+            "teacher_std": jnp.zeros_like(total_loss),
+            "loss_mode": jnp.zeros_like(total_loss),
+        }
+        return total_loss, metrics
+
+    return jax.lax.cond(dagger_phase, dagger_loss, ppo_loss, operand=None)
 
 
 def train(
@@ -460,6 +636,7 @@ def train(
 
     use_dagger = bool(_cfg_get(dagger_config, "enable", False))
     teacher_checkpoint_paths = list(_cfg_get(dagger_config, "teacher_checkpoint_paths", []))
+    dagger_timesteps = int(_cfg_get(dagger_config, "dagger_timesteps", 0))
     teacher_params = ()
     teacher_normalizer_params = None
     teacher_policy_params = None
@@ -482,12 +659,20 @@ def train(
 
     if use_dagger:
         loss_fn = functools.partial(
-            compute_dagger_loss,
+            compute_dagger_then_ppo_loss,
             ppo_network=ppo_network,
             teacher_normalizer_params=teacher_normalizer_params,
             teacher_policy_params=teacher_policy_params,
             num_teachers=len(teacher_checkpoint_paths),
             kl_eps=_cfg_get(dagger_config, "kl_eps", 1e-5),
+            entropy_cost=entropy_cost,
+            discounting=discounting,
+            reward_scaling=reward_scaling,
+            gae_lambda=gae_lambda,
+            clipping_epsilon=clipping_epsilon,
+            normalize_advantage=normalize_advantage,
+            actor_loss_scale=_cfg_get(dagger_config, "actor_loss_scale", 1.0),
+            value_loss_scale=_cfg_get(dagger_config, "value_loss_scale", 1.0),
         )
     else:
         loss_fn = functools.partial(
@@ -505,7 +690,7 @@ def train(
         loss_fn, optimizer, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True
     )
 
-    metrics_aggregator = metric_logger.EpisodeMetricsLogger(
+    metrics_aggregator = TrainingMetricsLogger(
         buffer_size=training_metrics_buffer_size,
         steps_between_logging=training_metrics_steps or env_step_per_training_step,
         progress_fn=progress_fn,
@@ -522,16 +707,27 @@ def train(
         carry,
         data: types.Transition,
         normalizer_params: running_statistics.RunningStatisticsState,
+        dagger_phase: jnp.ndarray,
     ):
         optimizer_state, params, key = carry
         key, key_loss = jax.random.split(key)
-        (_, metrics), params, optimizer_state = gradient_update_fn(
-            params,
-            normalizer_params,
-            data,
-            key_loss,
-            optimizer_state=optimizer_state,
-        )
+        if use_dagger:
+            (_, metrics), params, optimizer_state = gradient_update_fn(
+                params,
+                normalizer_params,
+                data,
+                key_loss,
+                dagger_phase,
+                optimizer_state=optimizer_state,
+            )
+        else:
+            (_, metrics), params, optimizer_state = gradient_update_fn(
+                params,
+                normalizer_params,
+                data,
+                key_loss,
+                optimizer_state=optimizer_state,
+            )
 
         return (optimizer_state, params, key), metrics
 
@@ -540,6 +736,7 @@ def train(
         unused_t,
         data: types.Transition,
         normalizer_params: running_statistics.RunningStatisticsState,
+        dagger_phase: jnp.ndarray,
     ):
         optimizer_state, params, key = carry
         key, key_perm, key_grad = jax.random.split(key, 3)
@@ -563,7 +760,11 @@ def train(
 
         shuffled_data = jax.tree_util.tree_map(convert_data, data)
         (optimizer_state, params, _), metrics = jax.lax.scan(
-            functools.partial(minibatch_step, normalizer_params=normalizer_params),
+            functools.partial(
+                minibatch_step,
+                normalizer_params=normalizer_params,
+                dagger_phase=dagger_phase,
+            ),
             (optimizer_state, params, key_grad),
             shuffled_data,
             length=num_minibatches,
@@ -615,9 +816,10 @@ def train(
 
         if log_training_metrics:  # log unroll metrics
             jax.debug.callback(
-                metrics_aggregator.update_episode_metrics,
+                metrics_aggregator.update_rollout_metrics,
                 data.extras["state_extras"]["episode_metrics"],
                 data.extras["state_extras"]["episode_done"],
+                data.extras["state_extras"]["truncation"],
             )
 
         # Update normalization params and normalize observations.
@@ -626,9 +828,15 @@ def train(
             _remove_pixels(data.observation),
             pmap_axis_name=_PMAP_AXIS_NAME,
         )
+        dagger_phase = _uint64_lt(training_state.env_steps, dagger_timesteps)
 
         (optimizer_state, params, _), metrics = jax.lax.scan(
-            functools.partial(sgd_step, data=data, normalizer_params=normalizer_params),
+            functools.partial(
+                sgd_step,
+                data=data,
+                normalizer_params=normalizer_params,
+                dagger_phase=dagger_phase,
+            ),
             (training_state.optimizer_state, training_state.params, key_sgd),
             (),
             length=num_updates_per_batch,

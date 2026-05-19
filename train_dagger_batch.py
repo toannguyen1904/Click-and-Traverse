@@ -11,14 +11,26 @@ python_executable = sys.executable
 # Use run names under data/logs/$WANDB_PROJECT. The latest checkpoint is selected
 # automatically, and each teacher's checkpoints/config.json provides its scene.
 teacher_restore_names = [
-    "04171623_G1Cat_0417testV0_xT0p0xempty",
-    # "05111302_G1Cat_V0_xG1p0xT0p0xhurdle0",
+    "04171800_G1Cat_0417testV0_xT0p0xempty",
+    "05130748_G1Cat_V0_xG1p0xL1p0xT0p0xside-hurdle2",
+    "05130748_G1Cat_V0_xG1p0xL1p0xT0p0xside-hurdle3",
+    "05130748_G1Cat_V0_xG1p0xL1p0xT0p0xside-hurdle4",
+    "05141019_G1Cat_V0_xG1p0xT0p0xhurdle0",
+    "05141019_G1Cat_V0_xG1p0xT0p0xhurdle1",
+    "05141019_G1Cat_V0_xG1p0xT0p0xhurdle2",
+    "05130748_G1Cat_V0_xO1p0xT0p0xcrouch0",
+    "05130748_G1Cat_V0_xO1p0xT0p0xcrouch1",
+    "05141019_G1Cat_V0_xG1p0xL1p0xO1p0xT0p0xside-crouch0",
+    "05130748_G1Cat_V0_xG1p0xL1p0xO1p0xT0p0xside-hurdle-crouch3",
 ]
 
 tasks = [
-    # cuda_devices, task, exp_name, restore_name, ground, lateral, overhead, obs_path, term_collision_threshold
+    # cuda_devices, task, exp_name, restore_name, ground, lateral, overhead, obs_path, term_collision_threshold, dagger_timesteps
     # cuda_devices can be 0, "0,1,2,3", or [0, 1, 2, 3].
-    (0, "G1Cat", "dagger_debug", "none", 0.0, 0.0, 0.0, "data/assets/TypiObs/empty", 0.0),
+    ([0,1], "G1Cat", "dagger_v4DG1", "05180809_G1CatDagger_dagger_v3thenrlxG1p0xL1p0xO1p0xT0p0", 1.0, 1.0, 1.0, "", 0.0, 100_000_000),
+    ([2,3], "G1Cat", "dagger_v4DG2", "05180809_G1CatDagger_dagger_v3thenrlxG1p0xL1p0xO1p0xT0p0", 1.0, 1.0, 1.0, "", 0.0, 200_000_000),
+    ([4,5], "G1Cat", "dagger_v4DG3", "05180809_G1CatDagger_dagger_v3thenrlxG1p0xL1p0xO1p0xT0p0", 1.0, 1.0, 1.0, "", 0.0, 300_000_000),
+    ([6,7], "G1Cat", "dagger_v4DG4", "05180809_G1CatDagger_dagger_v3thenrlxG1p0xL1p0xO1p0xT0p0", 1.0, 1.0, 1.0, "", 0.0, 400_000_000),
     # ([0, 1, 2, 3], "G1Cat", "dagger_4gpu", "none", 0.0, 0.0, 0.0, "data/assets/TypiObs/empty", 0.0),
 ]
 
@@ -43,7 +55,7 @@ if __name__ == "__main__":
     os.makedirs(output_dir, exist_ok=True)
     process_cmd_map = {}
 
-    for cuda_devices, task, exp_name, restore_name, ground, lateral, overhead, obs_path, term_collision_threshold in tasks:
+    for cuda_devices, task, exp_name, restore_name, ground, lateral, overhead, obs_path, term_collision_threshold, dagger_timesteps in tasks:
         cuda_visible_devices = _cuda_visible_devices(cuda_devices)
         cmd = [
             python_executable,
@@ -63,6 +75,8 @@ if __name__ == "__main__":
             str(overhead),
             "--term_collision_threshold",
             str(term_collision_threshold),
+            "--dagger_timesteps",
+            str(dagger_timesteps),
             "--obs_path",
             obs_path,
             "--teacher_restore_names",

@@ -20,6 +20,9 @@ def g1_cat_dagger_task_config() -> config_dict.ConfigDict:
         teacher_restore_names=[],
         teacher_checkpoint_paths=[],
         kl_eps=1e-5,
+        dagger_timesteps=0,
+        actor_loss_scale=1.0,
+        value_loss_scale=1.0,
     )
     config.env_config.pf_config.origin = [-0.5, -1.0, 0.0]
     return config

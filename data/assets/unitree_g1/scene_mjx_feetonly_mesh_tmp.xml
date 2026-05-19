@@ -28,7 +28,7 @@
           <texture name="tex_brick_cube" type="2d" file="texture.png" />
 
           <material name="mat_brick_cube" texture="tex_brick_cube" reflectance="0.10" specular="0.20" shininess="0.30" />
-        <mesh name="scene_mesh" file="../TypiObs/side-hurdle3/obs.obj" />
+        <mesh name="scene_mesh" file="../TypiObs/side-hurdle-crouch3/obs.obj" />
     </asset>
 
     <worldbody>

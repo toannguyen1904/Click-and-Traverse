@@ -242,7 +242,7 @@ python -m cat_ppo.eval.brax2onnx \
 To evaluate the model without privileged observation, run:
 
 ```bash
-python -m cat_ppo.eval.mj_onnx_play --task G1Cat --exp_name 05151400_G1CatDagger_dagger_test1xT0p0 --obs_path data/assets/TypiObs/side-hurdle3
+python -m cat_ppo.eval.mj_onnx_play --task G1Cat --exp_name 05180857_G1CatDagger_dagger_v4DG1xG1p0xL1p0xO1p0xT0p0 --obs_path data/assets/TypiObs/side-hurdle-crouch3
 ```
 
 To evaluate the model with privileged observation, run:
