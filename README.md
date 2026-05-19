@@ -248,7 +248,7 @@ python -m cat_ppo.eval.mj_onnx_play --task G1Cat --exp_name 05180857_G1CatDagger
 To evaluate the model with privileged observation, run:
 
 ```bash
-python -m cat_ppo.eval.mj_onnx_play --task G1CatPri --pri --exp_name G1CatPri_narrow1 --obs_path data/assets/TypiObs/narrow1
+python -m cat_ppo.eval.mj_onnx_play --task G1CatPri --pri --exp_name 05190650_G1CatPri_V0_xT0p0xforward --obs_path data/assets/TypiObs/forward
 ```
 
 ---

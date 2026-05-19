@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import jax
+import numpy as np
 import tyro
 from absl import logging
 
@@ -31,11 +32,19 @@ class DaggerArgs(Args):
     dagger_timesteps: int = 0
     dagger_actor_loss_scale: float = 1.0
     dagger_value_loss_scale: float = 1.0
+    pf_sampling_weights: list[float] = field(default_factory=list)
+    pf_sampling_alpha: float = 1.0
+    pf_sampling_ema_decay: float = 0.95
+    network_kind: str = "mlp"
+    policy_hidden_layer_sizes: list[int] = field(default_factory=list)
+    value_hidden_layer_sizes: list[int] = field(default_factory=list)
 
 
 def _dagger_task_name(task: str) -> str:
     if task == "G1Cat":
         return "G1CatDagger"
+    if task == "G1CatPri":
+        return "G1CatPriDagger"
     return task
 
 
@@ -81,6 +90,17 @@ def _prepare_dagger_config(policy_cfg, env_config, args: DaggerArgs):
     env_config.pf_config.paths = scene_paths
     env_config.pf_config.path = scene_paths[0]
     env_config.pf_config.origin = [-0.5, -1.0, 0.0]
+    if args.pf_sampling_weights:
+        if len(args.pf_sampling_weights) != len(scene_paths):
+            raise ValueError(
+                f"--pf_sampling_weights length must match --teacher_restore_names: "
+                f"{len(args.pf_sampling_weights)} != {len(scene_paths)}"
+            )
+        env_config.pf_config.sampling_weights = args.pf_sampling_weights
+    else:
+        env_config.pf_config.sampling_weights = [1.0] * len(scene_paths)
+    env_config.pf_config.sampling_alpha = args.pf_sampling_alpha
+    env_config.pf_config.sampling_ema_decay = args.pf_sampling_ema_decay
     dagger_cfg.teacher_restore_names = teacher_names
     dagger_cfg.teacher_checkpoint_paths = teacher_checkpoint_paths
     dagger_cfg.dagger_timesteps = args.dagger_timesteps or (policy_cfg.num_timesteps // 2)
@@ -88,6 +108,18 @@ def _prepare_dagger_config(policy_cfg, env_config, args: DaggerArgs):
         raise ValueError("dagger_actor_loss_scale must be > 0 because DAgger phase should train the actor.")
     dagger_cfg.actor_loss_scale = args.dagger_actor_loss_scale
     dagger_cfg.value_loss_scale = args.dagger_value_loss_scale
+
+
+def _apply_dagger_network_config(policy_cfg, args: DaggerArgs):
+    if args.network_kind != "mlp":
+        raise ValueError(
+            f"Unsupported network_kind={args.network_kind!r}. Current Brax PPO rollout is stateless; "
+            "GRU/RNN/Transformer policies need recurrent state support in acting.generate_unroll."
+        )
+    if args.policy_hidden_layer_sizes:
+        policy_cfg.network_factory.policy_hidden_layer_sizes = tuple(args.policy_hidden_layer_sizes)
+    if args.value_hidden_layer_sizes:
+        policy_cfg.network_factory.value_hidden_layer_sizes = tuple(args.value_hidden_layer_sizes)
 
 
 def train(args: DaggerArgs):
@@ -100,7 +132,18 @@ def train(args: DaggerArgs):
     base_args = {
         key: value
         for key, value in args.__dict__.items()
-        if key not in ("teacher_restore_names", "dagger_timesteps", "dagger_actor_loss_scale", "dagger_value_loss_scale")
+        if key not in (
+            "teacher_restore_names",
+            "dagger_timesteps",
+            "dagger_actor_loss_scale",
+            "dagger_value_loss_scale",
+            "pf_sampling_weights",
+            "pf_sampling_alpha",
+            "pf_sampling_ema_decay",
+            "network_kind",
+            "policy_hidden_layer_sizes",
+            "value_hidden_layer_sizes",
+        )
     }
     train_args = Args(**{**base_args, "task": task_name})
 
@@ -113,6 +156,7 @@ def train(args: DaggerArgs):
     _log_checkpoint_path(ckpt_path)
 
     _apply_args_to_config(train_args, policy_cfg, env_cfg, debug_mode)
+    _apply_dagger_network_config(policy_cfg, args)
     _prepare_dagger_config(policy_cfg, env_cfg, args)
     task_cfg.env_config = env_cfg
     policy_params = _prepare_training_params(policy_cfg, ckpt_path)

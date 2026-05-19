@@ -6,6 +6,7 @@ import inspect
 import functools
 import time
 import os
+import collections
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime
@@ -33,6 +34,7 @@ os.environ["MUJOCO_GL"] = "egl"
 
 WANDB_PROJECT = os.environ.get("WANDB_PROJECT")
 WANDB_ENTITY = os.environ.get("WANDB_ENTITY")
+_PFID_PLOT_HISTORY = collections.defaultdict(lambda: collections.defaultdict(list))
 
 @dataclass
 class Args:
@@ -47,6 +49,7 @@ class Args:
     overhead: float = 0
     term_collision_threshold: float = 0.04
     obs_path: str = 'data/assets/TypiObs/empty'
+    randomize_initial_episode_steps: bool = True
     def generate_exp_name(self):
         exp_name_parts = [self.exp_name]
 
@@ -119,6 +122,7 @@ def _apply_args_to_config(args: Args, policy_cfg, env_config, debug: bool):
     env_config.reward_config.scales.shldsdf = args.lateral
     env_config.term_collision_threshold = args.term_collision_threshold
     env_config.pf_config.path = args.obs_path
+    policy_cfg.randomize_initial_episode_steps = args.randomize_initial_episode_steps
 
 def _prepare_training_params(cfg, ckpt_path: Path):
     params = cfg.to_dict()
@@ -158,7 +162,36 @@ def _progress(num_steps, metrics, times, total_steps, debug_mode, exp_name):
     times.append(now)
     if metrics and not debug_mode:
         try:
-            wandb.log(metrics, step=num_steps)
+            scalar_metrics = {}
+            pfid_groups = collections.defaultdict(dict)
+            for key, value in metrics.items():
+                prefix = "rollout/pfid/"
+                if key.startswith(prefix):
+                    parts = key[len(prefix):].split("/", 1)
+                    if len(parts) == 2:
+                        pfid, metric_name = parts
+                        pfid_groups[metric_name][pfid] = float(value)
+                        continue
+                scalar_metrics[key] = value
+
+            grouped_plots = {}
+            for metric_name, values_by_pfid in pfid_groups.items():
+                metric_history = _PFID_PLOT_HISTORY[metric_name]
+                for pfid, value in values_by_pfid.items():
+                    metric_history[pfid].append((num_steps, value))
+
+                keys = sorted(metric_history, key=lambda item: int(item) if item.isdigit() else item)
+                xs = [[point[0] for point in metric_history[pfid]] for pfid in keys]
+                ys = [[point[1] for point in metric_history[pfid]] for pfid in keys]
+                grouped_plots[f"rollout/pfid_grouped/{metric_name}"] = wandb.plot.line_series(
+                    xs=xs,
+                    ys=ys,
+                    keys=[f"pfid/{pfid}" for pfid in keys],
+                    title=f"rollout/pfid/{metric_name}",
+                    xname="Step",
+                )
+
+            wandb.log({**scalar_metrics, **grouped_plots}, step=num_steps)
         except Exception as e:
             logging.warning(f"wandb.log failed: {e}")
 

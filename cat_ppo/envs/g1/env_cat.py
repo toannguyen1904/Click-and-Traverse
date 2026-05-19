@@ -32,7 +32,7 @@ import cat_ppo
 from cat_ppo.envs.g1.env_loco import G1LocoEnv
 from cat_ppo.envs.g1 import constants as consts
 
-ENABLE_RANDOMIZE = True
+ENABLE_RANDOMIZE = False
 EPS = 1e-6
 
 def g1_loco_task_config() -> config_dict.ConfigDict:
@@ -366,39 +366,41 @@ class G1CatEnv(G1LocoEnv):
         qvel = qvel.at[0:6].set(jax.random.uniform(key, (6,), minval=-0.5, maxval=0.5))
         data = mjx_env.init(self.mjx_model, qpos=qpos, qvel=qvel, ctrl=qpos[7:])
 
-        # rng, cmd_rng = jax.random.split(rng)
         head_pos = data.site_xpos[self._head_site_id]
         head_vel = jp.zeros_like(head_pos)
-        headgf = self.sample_field(self.gf, head_pos.reshape(1, -1))
-        headbf = self.sample_field(self.bf, head_pos.reshape(1, -1))
-        headdf = self.sample_field(self.sdf, head_pos.reshape(1, -1))
         pelv_pos = data.site_xpos[self._pelvis_imu_site_id]
         tors_pos = data.site_xpos[self._torso_imu_site_id]
-        pelvgf = self.sample_field(self.gf, pelv_pos.reshape(1, -1))
-        pelvbf = self.sample_field(self.bf, pelv_pos.reshape(1, -1))
-        pelvdf = self.sample_field(self.sdf, pelv_pos.reshape(1, -1))
-        torsgf = self.sample_field(self.gf, tors_pos.reshape(1, -1))
-        torsbf = self.sample_field(self.bf, tors_pos.reshape(1, -1))
-        torsdf = self.sample_field(self.sdf, tors_pos.reshape(1, -1))
         feet_pos = data.site_xpos[self._feet_site_id]
         feet_vel = jp.zeros_like(feet_pos)
-        feetgf = self.sample_field(self.gf, feet_pos)
-        feetbf = self.sample_field(self.bf, feet_pos)
-        feetdf = self.sample_field(self.sdf, feet_pos)
         hands_pos = data.site_xpos[self._hands_site_id]
         hands_vel = jp.zeros_like(hands_pos)
-        handsgf = self.sample_field(self.gf, hands_pos)
-        handsbf = self.sample_field(self.bf, hands_pos)
-        handsdf = self.sample_field(self.sdf, hands_pos)
         knees_pos = data.site_xpos[self._knees_site_id]
-        kneesgf = self.sample_field(self.gf, knees_pos)
-        kneesbf = self.sample_field(self.bf, knees_pos)
-        kneesdf = self.sample_field(self.sdf, knees_pos)
         shlds_pos = data.site_xpos[self._shlds_site_id]
-        shldsgf = self.sample_field(self.gf, shlds_pos)
-        shldsbf = self.sample_field(self.bf, shlds_pos)
-        shldsdf = self.sample_field(self.sdf, shlds_pos)
-        command = self.compute_cmd_from_rtf(pelvgf.reshape(-1), jp.concat([headgf, feetgf, handsgf], axis=0), jp.concat([headbf, feetbf, handsbf], axis=0))
+        all_poses = jp.concatenate([
+            head_pos.reshape(1, -1),
+            pelv_pos.reshape(1, -1),
+            tors_pos.reshape(1, -1),
+            feet_pos,
+            hands_pos,
+            knees_pos,
+            shlds_pos,
+        ], axis=0)
+        all_gf = self.sample_field(self.gf, all_poses)
+        all_bf = self.sample_field(self.bf, all_poses)
+        all_df = self.sample_field(self.sdf, all_poses)
+        all_gf = all_gf / (jp.linalg.norm(all_gf, axis=-1, keepdims=True) + EPS)
+        all_bf = all_bf / (jp.linalg.norm(all_bf, axis=-1, keepdims=True) + EPS)
+        # headgf_raw, pelvgf_raw, torsgf_raw, feetgf_raw, handsgf_raw, kneesgf_raw, shldsgf_raw = jp.split(all_gf, [1,2,3,5,7,9], axis=0)
+        # headbf_raw, pelvbf_raw, torsbf_raw, feetbf_raw, handsbf_raw, kneesbf_raw, shldsbf_raw = jp.split(all_bf, [1,2,3,5,7,9], axis=0)
+
+        headgf, pelvgf, torsgf, feetgf, handsgf, kneesgf, shldsgf = jp.split(all_gf, [1,2,3,5,7,9], axis=0)
+        headbf, pelvbf, torsbf, feetbf, handsbf, kneesbf, shldsbf = jp.split(all_bf, [1,2,3,5,7,9], axis=0)
+        headdf, pelvdf, torsdf, feetdf, handsdf, kneesdf, shldsdf = jp.split(all_df, [1,2,3,5,7,9], axis=0)
+        command = self.compute_cmd_from_rtf(
+            pelvgf.reshape(-1),
+            jp.concat([headgf, feetgf, handsgf], axis=0),
+            jp.concat([headbf, feetbf, handsbf], axis=0),
+        )
 
         # Sample push interval.
         rng, push_rng = jax.random.split(rng)

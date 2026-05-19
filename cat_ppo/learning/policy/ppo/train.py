@@ -98,9 +98,10 @@ class TrainingMetricsLogger:
             return f"episode/{name}"
         return f"episode_metrics/{name}"
 
-    def update_rollout_metrics(self, metrics, dones, truncations):
+    def update_rollout_metrics(self, metrics, dones, truncations, pf_ids=None):
         dones = np.asarray(dones).astype(bool)
         truncations = np.asarray(truncations).astype(bool)
+        pf_ids = None if pf_ids is None else np.asarray(pf_ids).astype(np.int32)
         self._num_steps += int(np.prod(dones.shape))
 
         done_count = int(np.sum(dones))
@@ -114,6 +115,20 @@ class TrainingMetricsLogger:
             self._rollout_buffer["timeout_rate"].append(timeout_count / done_count)
             self._rollout_buffer["termination_rate"].append(termination_count / done_count)
             self._rollout_buffer["episodes"].append(done_count)
+            if pf_ids is not None:
+                done_pf_ids = pf_ids[dones]
+                done_truncations = truncations[dones]
+                for pf_id in np.unique(done_pf_ids):
+                    pf_mask = done_pf_ids == pf_id
+                    pf_done_count = int(np.sum(pf_mask))
+                    pf_timeout_count = int(np.sum(done_truncations[pf_mask]))
+                    pf_termination_count = pf_done_count - pf_timeout_count
+                    prefix = f"pfid/{int(pf_id)}"
+                    self._rollout_buffer[f"{prefix}/episodes"].append(pf_done_count)
+                    self._rollout_buffer[f"{prefix}/timeout_rate"].append(pf_timeout_count / pf_done_count)
+                    self._rollout_buffer[f"{prefix}/termination_rate"].append(
+                        pf_termination_count / pf_done_count
+                    )
 
             done_mask = dones.astype(bool)
             for name, metric in metrics.items():
@@ -285,6 +300,65 @@ def _assert_same_tree_shapes(label: str, expected: Any, actual: Any):
             )
 
 
+def _assert_policy_shapes_for_dagger_teacher(
+    label: str,
+    expected: Any,
+    actual: Any,
+    allow_input_dim_mismatch: bool,
+):
+    if not allow_input_dim_mismatch:
+        _assert_same_tree_shapes(label, expected, actual)
+        return
+
+    expected_items, expected_def = jax.tree_util.tree_flatten_with_path(expected)
+    actual_items, actual_def = jax.tree_util.tree_flatten_with_path(actual)
+    if expected_def != actual_def:
+        raise ValueError(f"{label} pytree structure does not match the student policy")
+
+    for idx, ((path, expected_leaf), (_, actual_leaf)) in enumerate(zip(expected_items, actual_items)):
+        expected_shape = np.shape(expected_leaf)
+        actual_shape = np.shape(actual_leaf)
+        if expected_shape == actual_shape:
+            continue
+        path_keys = [getattr(entry, "key", str(entry)) for entry in path]
+        is_first_kernel = path_keys[-2:] == ["hidden_0", "kernel"]
+        same_output_dim = (
+            len(expected_shape) == 2
+            and len(actual_shape) == 2
+            and expected_shape[1:] == actual_shape[1:]
+        )
+        if is_first_kernel and same_output_dim:
+            continue
+        raise ValueError(
+            f"{label} leaf {idx} shape mismatch: expected {expected_shape}, "
+            f"got {actual_shape}"
+        )
+
+
+def _teacher_observation(
+    observation: Any,
+    teacher_obs_key: Optional[str],
+    teacher_privileged_obs_key: Optional[str],
+) -> Any:
+    if teacher_obs_key is None:
+        return observation
+    if not isinstance(observation, Mapping):
+        raise ValueError("teacher_obs_key requires dict observations")
+    if teacher_obs_key not in observation:
+        raise ValueError(f"Missing DAgger teacher obs key: {teacher_obs_key}")
+
+    teacher_obs = {"state": observation[teacher_obs_key]}
+    if teacher_privileged_obs_key is not None:
+        if teacher_privileged_obs_key not in observation:
+            raise ValueError(
+                f"Missing DAgger teacher privileged obs key: {teacher_privileged_obs_key}"
+            )
+        teacher_obs["privileged_state"] = observation[teacher_privileged_obs_key]
+    elif "privileged_state" in observation:
+        teacher_obs["privileged_state"] = observation["privileged_state"]
+    return teacher_obs
+
+
 def _uint64_lt(value: types.UInt64, other: int) -> jnp.ndarray:
     other_hi = jnp.uint32(other >> 32)
     other_lo = jnp.uint32(other & 0xFFFFFFFF)
@@ -306,6 +380,8 @@ def compute_dagger_loss(
     gae_lambda: float = 0.95,
     actor_loss_scale: float = 1.0,
     value_loss_scale: float = 1.0,
+    teacher_obs_key: Optional[str] = None,
+    teacher_privileged_obs_key: Optional[str] = None,
 ) -> Tuple[jnp.ndarray, types.Metrics]:
     del rng
     policy_apply = ppo_network.policy_network.apply
@@ -318,8 +394,12 @@ def compute_dagger_loss(
     terminal_obs = jax.tree_util.tree_map(lambda x: x[-1], data.next_observation)
     bootstrap_value = value_apply(normalizer_params, params.value, terminal_obs)
 
+    teacher_observation = _teacher_observation(
+        data.observation, teacher_obs_key, teacher_privileged_obs_key
+    )
+
     def teacher_apply(teacher_normalizer, teacher_policy):
-        return policy_apply(teacher_normalizer, teacher_policy, data.observation)
+        return policy_apply(teacher_normalizer, teacher_policy, teacher_observation)
 
     teacher_logits_all = jax.vmap(teacher_apply)(teacher_normalizer_params, teacher_policy_params)
     pf_id = data.extras["state_extras"]["pf_id"].astype(jnp.int32)
@@ -385,6 +465,8 @@ def compute_dagger_then_ppo_loss(
     normalize_advantage: bool = True,
     actor_loss_scale: float = 1.0,
     value_loss_scale: float = 1.0,
+    teacher_obs_key: Optional[str] = None,
+    teacher_privileged_obs_key: Optional[str] = None,
 ) -> Tuple[jnp.ndarray, types.Metrics]:
     def dagger_loss(_):
         return compute_dagger_loss(
@@ -402,6 +484,8 @@ def compute_dagger_then_ppo_loss(
             gae_lambda=gae_lambda,
             actor_loss_scale=actor_loss_scale,
             value_loss_scale=value_loss_scale,
+            teacher_obs_key=teacher_obs_key,
+            teacher_privileged_obs_key=teacher_privileged_obs_key,
         )
 
     def ppo_loss(_):
@@ -442,6 +526,7 @@ def train(
     num_envs: int = 1,
     episode_length: Optional[int] = None,
     action_repeat: int = 1,
+    randomize_initial_episode_steps: bool = True,
     wrap_env_fn: Optional[Callable[[Any], Any]] = None,
     randomization_fn: Optional[
         Callable[[base.System, jnp.ndarray], Tuple[base.System, base.System]]
@@ -503,6 +588,10 @@ def train(
           leading dimension of `batch_size`
       episode_length: the length of an environment episode
       action_repeat: the number of timesteps to repeat an action
+      randomize_initial_episode_steps: whether to randomize the EpisodeWrapper
+        steps counter after the initial training reset to avoid synchronized
+        timeout waves across vectorized environments. This does not affect eval
+        or later autoresets.
       wrap_env_fn: a custom function that wraps the environment for training. If
         not specified, the environment is wrapped with the default training
         wrapper.
@@ -623,6 +712,17 @@ def train(
     key_envs = jax.random.split(key_env, num_envs // process_count)
     key_envs = jnp.reshape(key_envs, (local_devices_to_use, -1) + key_envs.shape[1:])
     env_state = reset_fn(key_envs)
+    if randomize_initial_episode_steps and "steps" in env_state.info:
+        if episode_length is None:
+            raise ValueError("episode_length must be specified to randomize initial episode steps")
+        initial_steps = jax.random.randint(
+            jax.random.fold_in(key_env, 1),
+            env_state.info["steps"].shape,
+            minval=0,
+            maxval=episode_length,
+            dtype=jnp.int32,
+        )
+        env_state.info["steps"] = initial_steps.astype(env_state.info["steps"].dtype)
     # Discard the batch axes over devices and envs.
     obs_shape = jax.tree_util.tree_map(lambda x: x.shape[2:], env_state.obs)
 
@@ -665,6 +765,10 @@ def train(
             teacher_policy_params=teacher_policy_params,
             num_teachers=len(teacher_checkpoint_paths),
             kl_eps=_cfg_get(dagger_config, "kl_eps", 1e-5),
+            teacher_obs_key=_cfg_get(dagger_config, "teacher_obs_key", None),
+            teacher_privileged_obs_key=_cfg_get(
+                dagger_config, "teacher_privileged_obs_key", None
+            ),
             entropy_cost=entropy_cost,
             discounting=discounting,
             reward_scaling=reward_scaling,
@@ -815,12 +919,21 @@ def train(
         assert data.discount.shape[1:] == (unroll_length,)
 
         if log_training_metrics:  # log unroll metrics
-            jax.debug.callback(
-                metrics_aggregator.update_rollout_metrics,
-                data.extras["state_extras"]["episode_metrics"],
-                data.extras["state_extras"]["episode_done"],
-                data.extras["state_extras"]["truncation"],
-            )
+            if use_dagger:
+                jax.debug.callback(
+                    metrics_aggregator.update_rollout_metrics,
+                    data.extras["state_extras"]["episode_metrics"],
+                    data.extras["state_extras"]["episode_done"],
+                    data.extras["state_extras"]["truncation"],
+                    data.extras["state_extras"]["pf_id"],
+                )
+            else:
+                jax.debug.callback(
+                    metrics_aggregator.update_rollout_metrics,
+                    data.extras["state_extras"]["episode_metrics"],
+                    data.extras["state_extras"]["episode_done"],
+                    data.extras["state_extras"]["truncation"],
+                )
 
         # Update normalization params and normalize observations.
         normalizer_params = running_statistics.update(
@@ -901,11 +1014,13 @@ def train(
         value=ppo_network.value_network.init(key_value),
     )
     if use_dagger:
+        teacher_obs_key = _cfg_get(dagger_config, "teacher_obs_key", None)
         for teacher_idx, loaded_params in enumerate(teacher_params):
-            _assert_same_tree_shapes(
+            _assert_policy_shapes_for_dagger_teacher(
                 f"DAgger teacher {teacher_idx} policy params",
                 init_params.policy,
                 loaded_params[1],
+                allow_input_dim_mismatch=teacher_obs_key is not None,
             )
 
     obs_shape = jax.tree_util.tree_map(
@@ -920,12 +1035,14 @@ def train(
         env_steps=types.UInt64(hi=0, lo=0),
     )
     if use_dagger:
-        for teacher_idx, loaded_params in enumerate(teacher_params):
-            _assert_same_tree_shapes(
-                f"DAgger teacher {teacher_idx} normalizer params",
-                training_state.normalizer_params,
-                loaded_params[0],
-            )
+        teacher_obs_key = _cfg_get(dagger_config, "teacher_obs_key", None)
+        if teacher_obs_key is None:
+            for teacher_idx, loaded_params in enumerate(teacher_params):
+                _assert_same_tree_shapes(
+                    f"DAgger teacher {teacher_idx} normalizer params",
+                    training_state.normalizer_params,
+                    loaded_params[0],
+                )
 
     if restore_checkpoint_path is not None:
         params = checkpoint.load(restore_checkpoint_path)
