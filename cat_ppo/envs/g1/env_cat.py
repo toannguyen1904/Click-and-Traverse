@@ -47,7 +47,7 @@ def g1_loco_task_config() -> config_dict.ConfigDict:
         action_scale=0.5,
         history_len=15,
         num_obs=162,
-        num_pri=224,
+        num_pri=250,
         num_act=12,
         restricted_joint_range=False,
         soft_joint_pos_limit_factor=0.95,
@@ -390,8 +390,6 @@ class G1CatEnv(G1LocoEnv):
         all_df = self.sample_field(self.sdf, all_poses)
         all_gf = all_gf / (jp.linalg.norm(all_gf, axis=-1, keepdims=True) + EPS)
         all_bf = all_bf / (jp.linalg.norm(all_bf, axis=-1, keepdims=True) + EPS)
-        # headgf_raw, pelvgf_raw, torsgf_raw, feetgf_raw, handsgf_raw, kneesgf_raw, shldsgf_raw = jp.split(all_gf, [1,2,3,5,7,9], axis=0)
-        # headbf_raw, pelvbf_raw, torsbf_raw, feetbf_raw, handsbf_raw, kneesbf_raw, shldsbf_raw = jp.split(all_bf, [1,2,3,5,7,9], axis=0)
 
         headgf, pelvgf, torsgf, feetgf, handsgf, kneesgf, shldsgf = jp.split(all_gf, [1,2,3,5,7,9], axis=0)
         headbf, pelvbf, torsbf, feetbf, handsbf, kneesbf, shldsbf = jp.split(all_bf, [1,2,3,5,7,9], axis=0)

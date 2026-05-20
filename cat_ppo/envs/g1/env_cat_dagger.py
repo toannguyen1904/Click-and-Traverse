@@ -37,12 +37,6 @@ def g1_cat_dagger_task_config() -> config_dict.ConfigDict:
     return _add_dagger_config(env_cat.g1_loco_task_config())
 
 
-def g1_cat_pri_dagger_task_config() -> config_dict.ConfigDict:
-    config = _add_dagger_config(env_cat.g1_loco_task_config())
-    config.policy_config.dagger_config.teacher_obs_key = "teacher_state"
-    config.policy_config.dagger_config.teacher_privileged_obs_key = "teacher_privileged_state"
-    return config
-
 
 def _load_pf_fields(config: config_dict.ConfigDict):
     pf_paths = list(getattr(config.pf_config, "paths", []))
@@ -79,7 +73,6 @@ def _load_pf_fields(config: config_dict.ConfigDict):
 
 
 cat_ppo.registry.register("G1CatDagger", "config")(g1_cat_dagger_task_config())
-cat_ppo.registry.register("G1CatPriDagger", "config")(g1_cat_pri_dagger_task_config())
 
 
 class _DaggerSceneMixin:
@@ -145,20 +138,5 @@ class G1CatDaggerEnv(_DaggerSceneMixin, G1CatEnv):
     """G1Cat with per-scene potential-field routing for DAgger teachers."""
 
 
-@cat_ppo.registry.register("G1CatPriDagger", "train_env_class")
-class G1CatPriDaggerEnv(_DaggerSceneMixin, G1CatEnv):
-    """G1Cat student with G1CatPri observations for DAgger teachers."""
-
-    def _get_obs(self, data, info, feet_contact):
-        student_obs = G1CatEnv._get_obs(self, data, info, feet_contact)
-        teacher_obs = student_obs["privileged_state"]
-
-        return {
-            **student_obs,
-            "teacher_state": teacher_obs,
-            "teacher_privileged_state": teacher_obs,
-        }
-
 
 cat_ppo.registry.register("G1CatDagger", "command_to_reference_fn")(env_cat.command_to_reference)
-cat_ppo.registry.register("G1CatPriDagger", "command_to_reference_fn")(env_cat.command_to_reference)

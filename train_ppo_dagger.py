@@ -43,8 +43,6 @@ class DaggerArgs(Args):
 def _dagger_task_name(task: str) -> str:
     if task == "G1Cat":
         return "G1CatDagger"
-    if task == "G1CatPri":
-        return "G1CatPriDagger"
     return task
 
 

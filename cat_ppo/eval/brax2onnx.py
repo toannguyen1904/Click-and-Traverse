@@ -114,6 +114,24 @@ def get_latest_ckpt(path):
     return ckpts[-1] if ckpts else None
 
 
+def _obs_shape(size):
+    if isinstance(size, int):
+        return (size,)
+    return tuple(size)
+
+
+def _normalize_obs_size(obs_size):
+    if isinstance(obs_size, Mapping):
+        return {key: _obs_shape(value) for key, value in obs_size.items()}
+
+    shape = _obs_shape(obs_size)
+    return {"state": shape, "privileged_state": shape}
+
+
+def _policy_input_size(jax_params):
+    return int(jax_params[1]["params"]["hidden_0"]["kernel"].shape[0])
+
+
 def convert_jax2onnx(
     ckpt_dir,
     output_path,
@@ -125,6 +143,27 @@ def convert_jax2onnx(
     jax_params,
     activation="swish",
 ):
+    obs_size = _normalize_obs_size(obs_size)
+    policy_input_size = _policy_input_size(jax_params)
+    configured_policy_size = obs_size[policy_obs_key][0]
+    logging.info(
+        "ONNX export obs sizes: policy_obs_key=%s, state=%s, privileged_state=%s, "
+        "checkpoint_policy_input=%d.",
+        policy_obs_key,
+        obs_size.get("state"),
+        obs_size.get("privileged_state"),
+        policy_input_size,
+    )
+    if configured_policy_size != policy_input_size:
+        logging.warning(
+            "Policy obs size mismatch during ONNX export: config/env has %s=%d, "
+            "checkpoint policy expects %d. Using checkpoint shape for export.",
+            policy_obs_key,
+            configured_policy_size,
+            policy_input_size,
+        )
+        obs_size[policy_obs_key] = (policy_input_size,)
+
     rand_obs = {
         "state": np.random.randn(1, obs_size["state"][0]).astype(np.float32),
         "privileged_state": np.random.randn(1, obs_size["privileged_state"][0]).astype(
@@ -141,7 +180,7 @@ def convert_jax2onnx(
         activation=activation,
     )
 
-    example_input = tf.ones((1, obs_size[policy_obs_key][0]))
+    example_input = tf.ones((1, policy_input_size))
     tf_model(example_input)  # build model
 
     transfer_weights(jax_params[1]["params"], tf_model)
@@ -159,7 +198,7 @@ def convert_jax2onnx(
     # ]
 
     # Dynamic shape for ONNX conversion
-    spec = (tf.TensorSpec([None, obs_size[policy_obs_key][0]], tf.float32, name="obs"),)
+    spec = (tf.TensorSpec([None, policy_input_size], tf.float32, name="obs"),)
     tf2onnx.convert.from_keras(
         tf_model, input_signature=spec, opset=11, output_path=output_path
     )

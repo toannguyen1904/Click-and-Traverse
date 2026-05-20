@@ -233,8 +233,8 @@ Refer to `train_batch.py` for args details.
 
 ```bash
 python -m cat_ppo.eval.brax2onnx \
-  --task G1Cat \
-  --exp_name 04271342_G1LocoPFR10_SlowV4_xP2xMxK-004x427Mhurdle
+  --task G1CatPri \
+  --exp_name 05200601_G1CatPri_V0_xT0p0xforward
 ```
 
 ### Evaluation
@@ -242,13 +242,13 @@ python -m cat_ppo.eval.brax2onnx \
 To evaluate the model without privileged observation, run:
 
 ```bash
-python -m cat_ppo.eval.mj_onnx_play --task G1Cat --exp_name 05180857_G1CatDagger_dagger_v4DG1xG1p0xL1p0xO1p0xT0p0 --obs_path data/assets/TypiObs/side-hurdle-crouch3
+python -m cat_ppo.eval.mj_onnx_play --task G1Cat --exp_name 05190819_G1CatDagger_dagger_v5testsamplexG1p0xL1p0xO1p0xT0p0 --obs_path data/assets/TypiObs/side-hurdle-crouch3
 ```
 
 To evaluate the model with privileged observation, run:
 
 ```bash
-python -m cat_ppo.eval.mj_onnx_play --task G1CatPri --pri --exp_name 05190650_G1CatPri_V0_xT0p0xforward --obs_path data/assets/TypiObs/forward
+python -m cat_ppo.eval.mj_onnx_play --task G1CatPri --pri --exp_name 05200601_G1CatPri_V0_xT0p0xforward --obs_path data/assets/TypiObs/forward
 ```
 
 ---
