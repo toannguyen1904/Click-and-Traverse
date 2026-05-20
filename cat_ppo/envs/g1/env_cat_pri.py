@@ -652,7 +652,7 @@ class G1CatPriEnv(G1LocoEnv):
         contact_termination |= jp.any(info['feetdf'] < -self._config.term_collision_threshold)
         contact_termination |= jp.any(info['handsdf'] < -self._config.term_collision_threshold)
         contact_termination &= (info["step"] >= 100)
-        return fall_termination | contact_termination | jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any() | timeout
+        return fall_termination | contact_termination | jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any()
 
     def _get_obs(self, data: mjx.Data, info: dict[str, Any], feet_contact: jax.Array) -> mjx_env.Observation:
         # body pose
