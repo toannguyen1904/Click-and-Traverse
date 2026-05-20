@@ -11,6 +11,7 @@ Collision-Free Humanoid Traversal in Cluttered Indoor Scenes
 
 ## News
 
+- 2026/05/20: We release the **specialist-to-generalist policy distillation code**.
 - 2026/03/07: We release the **real-world deployment code** of CAT! Please refer to deploy/Click-and-Traverse-SLAM for details.
 - 2026/01/08: We release the official implementation of CAT!
 
@@ -58,7 +59,7 @@ In this repository, we present:
 - [X] 🗂️ Pre-trained specialist models and scene data
 - [X] 🚀 Real-world deployment code
 - [X] 🧩 Real-to-sim contruction for sim2sim test and real-scene finetuning
-- [ ] 🧩 Specialist-to-generalist policy distillation code
+- [X] 🧩 Specialist-to-generalist policy distillation code
 - [ ] 🗂️ Pre-trained generalist models
 - [ ] 🗂️ Expanded scene datasets
 
@@ -205,7 +206,7 @@ Parameters:
 
 ## Traversal Skill Learning
 
-### Training
+### Training Specialist
 
 ```bash
 export PATH=/usr/local/cuda-12.5/bin:$PATH
@@ -226,6 +227,27 @@ Supported tasks:
 - `G1CatPri`: privileged task (privileged observation is more informative for distilling generalist policies)
 
 Refer to `train_batch.py` for args details.
+
+### Training Generalist
+
+```bash
+export PATH=/usr/local/cuda-12.5/bin:$PATH
+source .env
+source .venv/bin/activate
+python train_dagger_batch.py
+```
+
+If you want to train a specific experiment, you can run:
+
+```bash
+python -m train_ppo_dagger --task {task} --restore_name {restore_name} --exp_name {exp_name}  --ground {ground} --lateral {lateral} --overhead {overhead} --term_collision_threshold {term_collision_threshold} --dagger_timesteps {dagger_timesteps} --obs_path {obs_path} --teacher_restore_names {teacher_restore_names}
+```
+
+Supported tasks:
+
+- `G1Cat`: generalist student policy trained by specialist-to-generalist DAgger distillation
+
+The teacher policies are specified by `--teacher_restore_names`. Refer to `train_dagger_batch.py` for args details.
 
 ### brax2onnx
 

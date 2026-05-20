@@ -11,6 +11,7 @@ Collision-Free Humanoid Traversal in Cluttered Indoor Scenes
  
 ## 进展
 
+- 2026/05/20: 我们开源了**专家到通用策略的蒸馏代码**。
 - 2026/03/07: 我们发布了CAT的**真实部署**代码！详情请参阅deploy/Click-and-Traverse-SLAM。
 - 2026/01/08: 我们发布了CAT的官网实现！
 
@@ -58,7 +59,7 @@ Collision-Free Humanoid Traversal in Cluttered Indoor Scenes
 - [X] 🗂️ 预训练专家模型与场景数据
 - [X] 🚀 真机部署代码
 - [X] 🧩 真机到仿真场景采集（用于验证实验与微调）
-- [ ] 🧩 专家到通用策略的蒸馏代码
+- [X] 🧩 专家到通用策略的蒸馏代码
 - [ ] 🗂️ 预训练通用模型
 - [ ] 🗂️ 扩展的场景数据集
 
@@ -206,7 +207,7 @@ generate_random_obstacle(difficulty, seed, dL, dG, dO)
 
 ## 穿行技能学习
 
-### 训练
+### 训练 Specialist
 
 ```bash
 export PATH=/usr/local/cuda-12.5/bin:$PATH
@@ -215,12 +216,41 @@ source .venv/bin/activate
 python train_batch.py
 ```
 
+如果你希望训练单个实验，可以运行：
+
+```bash
+python -m train_ppo --task {task} --restore_name {restore_name} --exp_name {exp_name}  --ground {ground} --lateral {lateral} --overhead {overhead} --term_collision_threshold {term_collision_threshold} --obs_path {obs_path}
+```
+
 支持的任务：
 
 - `G1Cat`：默认任务（便于直接上真机）
 - `G1CatPri`：带特权观测的任务（对蒸馏到通用策略有更有帮助）
 
 详见 `train_batch.py` 中的参数说明。
+
+### 训练 Generalist
+
+```bash
+export PATH=/usr/local/cuda-12.5/bin:$PATH
+source .env
+source .venv/bin/activate
+python train_dagger_batch.py
+```
+
+如果你希望训练单个实验，可以运行：
+
+```bash
+python -m train_ppo_dagger --task {task} --restore_name {restore_name} --exp_name {exp_name}  --ground {ground} --lateral {lateral} --overhead {overhead} --term_collision_threshold {term_collision_threshold} --dagger_timesteps {dagger_timesteps} --obs_path {obs_path} --teacher_restore_names {teacher_restore_names}
+```
+
+支持的任务：
+
+- `G1Cat`：通过 specialist-to-generalist DAgger 蒸馏训练的通用 student 策略
+
+Teacher 策略通过 `--teacher_restore_names` 指定。详见 `train_dagger_batch.py` 中的参数说明。
+
+### brax2onnx
 
 `train_batch.py` 会自动将 checkpoints 转换为 ONNX 格式；如果你更改了策略结构，可能需要手动转换：
 
