@@ -2,14 +2,14 @@
 
 Phase 1 of the CaTra curriculum:
 - Robot stands in place but can crouch using sagittal-plane leg joints.
-- 23-DOF action space: all leg joints (12) + waist (3) + arms (8).
+- 20-DOF action space: all leg joints (12) + arms (8). Waist joints stay at default.
 - Box placed 0.3 m in front of robot on a support surface at random height.
 - Reward guides the robot to reach the box, reduce table contact force, and lift.
 - Terminal states feed into the CaTra traversal policy.
 
 Observation dimensions:
-  num_obs = 85   (state, deployable with sensor noise)
-  num_pri = 123  (privileged_state, built from scratch with noiseless sensors)
+  num_obs = 96   (state, deployable with sensor noise)
+  num_pri = 135  (privileged_state, built from scratch with noiseless sensors)
 """
 
 from typing import Any, Dict, Optional, Union
@@ -38,7 +38,8 @@ from cat_ppo.envs.g1.env_catra import (
 )
 from cat_ppo.envs.g1.pickup_warmstart import pickup_obs_from_data
 
-# 23-DOF action space: all leg joints (12) + waist (3) + arms (8).
+# 20-DOF action space: all leg joints (12) + arms (8). Waist joints (yaw/roll/pitch)
+# and wrist joints are held at their default targets via the PD controller.
 PICKUP_ACTION_JOINT_NAMES = [
     "left_hip_pitch_joint",
     "left_hip_roll_joint",
@@ -52,9 +53,6 @@ PICKUP_ACTION_JOINT_NAMES = [
     "right_knee_joint",
     "right_ankle_pitch_joint",
     "right_ankle_roll_joint",
-    "waist_yaw_joint",
-    "waist_roll_joint",
-    "waist_pitch_joint",
     "left_shoulder_pitch_joint",
     "left_shoulder_roll_joint",
     "left_shoulder_yaw_joint",
@@ -179,8 +177,8 @@ def g1_pickup_task_config() -> config_dict.ConfigDict:
     """Config for G1Pickup: stationary manipulation with crouching support.
 
     Observation dimensions:
-      num_obs = 108  (state, deployable)
-      num_pri = 147  (privileged_state)
+      num_obs = 96   (state, deployable)
+      num_pri = 135  (privileged_state)
     """
     env_config = config_dict.create(
         task_type="flat_terrain_catra",
@@ -189,9 +187,9 @@ def g1_pickup_task_config() -> config_dict.ConfigDict:
         episode_length=200,
         action_repeat=1,
         action_scale=0.5,
-        num_obs=108,
-        num_pri=147,
-        num_act=23,
+        num_obs=96,
+        num_pri=135,
+        num_act=20,
         soft_joint_pos_limit_factor=0.95,
         # Required by G1LocoEnv._post_init() — unused by G1PickupEnv which overrides reset/step
         history_len=15,
@@ -356,7 +354,7 @@ class G1PickupEnv(G1CaTraEnv):
     """G1 humanoid reaching for and lifting a box from a support surface.
 
     Extends G1CaTraEnv with:
-    - 23-DOF action space (all leg joints + waist + arms)
+    - 20-DOF action space (all leg joints + arms; waist joints held at default)
     - Compact pickup-specific observations (no HumanoidPF fields)
     - Pickup reward set: reach, lift, table_force, hold_stable, box_upright, upright
     - No gait clock, no push force, no command tracking
@@ -376,8 +374,8 @@ class G1PickupEnv(G1CaTraEnv):
         self._post_init_pickup()
 
     def _post_init_pickup(self) -> None:
-        """Override to 23-DOF action space and cache pickup IDs."""
-        # 17-DOF action space: sagittal-plane legs + waist + arms
+        """Override to 20-DOF action space and cache pickup IDs."""
+        # 20-DOF action space: legs + arms (waist + wrists held at default)
         self.action_joint_names = PICKUP_ACTION_JOINT_NAMES.copy()
         self.action_joint_ids = jp.array([
             self.mj_model.actuator(name).id for name in self.action_joint_names
@@ -403,7 +401,7 @@ class G1PickupEnv(G1CaTraEnv):
 
     @property
     def action_size(self) -> int:
-        return len(self.action_joint_names)  # 23
+        return len(self.action_joint_names)  # 20
 
     def reset(self, rng: jax.Array) -> mjx_env.State:
         """Reset with 50-dim qpos; place box 3 m in front on support surface."""
@@ -412,7 +410,7 @@ class G1PickupEnv(G1CaTraEnv):
 
         # Random root xy spawn (small offset)
         rng, key = jax.random.split(rng)
-        dxy = jax.random.uniform(key, (2,), minval=-1.0, maxval=1.0)
+        dxy = jax.random.uniform(key, (2,), minval=-0.5, maxval=0.5)
         qpos = qpos.at[0:2].set(qpos[0:2] + dxy)
         qpos = qpos.at[2].set(0.8)
 
@@ -538,7 +536,7 @@ class G1PickupEnv(G1CaTraEnv):
         return mjx_env.State(data, obs, reward, done, metrics, info)
 
     def step(self, state: mjx_env.State, action: jax.Array) -> mjx_env.State:
-        """Step with 23-DOF action; wrist joints stay at default."""
+        """Step with 20-DOF action; waist and wrist joints stay at default."""
         # Update motor targets for controlled joints.
         lower_motor_targets = jp.clip(
             state.info["motor_targets"][self.action_joint_ids]
@@ -604,7 +602,7 @@ class G1PickupEnv(G1CaTraEnv):
         return state
 
     def _get_obs(self, data: mjx.Data, info: dict[str, Any]) -> mjx_env.Observation:
-        """108-dim state (deployable, noisy) and 147-dim privileged_state (noiseless + extras).
+        """96-dim state (deployable, noisy) and 135-dim privileged_state (noiseless + extras).
 
         Thin wrapper around pickup_obs_from_data.
         """

@@ -12,7 +12,7 @@ This is **Phase 1** of a two-phase curriculum. The pickup policy produces divers
 |----------|-------|
 | Robot | Unitree G1 humanoid |
 | Task | Reach, grasp, and lift a box from a support surface |
-| Action space | 23 DOF (all leg joints × 2 + waist × 3 + arms × 8) |
+| Action space | 20 DOF (all leg joints × 2 + arms × 8; waist joints held at default) |
 | Legs | All 12 leg joints actuated (hip pitch/roll/yaw, knee, ankle pitch/roll × 2) |
 | Episode length | 200 steps (4 s at 50 Hz) |
 | Box placement | 0.3 m in front of robot, on a support pillar (0.4 × 0.5 m top, 0.6 m tall) |
@@ -22,7 +22,7 @@ This is **Phase 1** of a two-phase curriculum. The pickup policy produces divers
 
 ## Action Space
 
-The robot controls **23 joints** via PD position targets (delta from current target):
+The robot controls **20 joints** via PD position targets (delta from current target):
 
 ```
 left_hip_pitch_joint
@@ -37,9 +37,6 @@ right_hip_yaw_joint
 right_knee_joint
 right_ankle_pitch_joint
 right_ankle_roll_joint
-waist_yaw_joint
-waist_roll_joint
-waist_pitch_joint
 left_shoulder_pitch_joint
 left_shoulder_roll_joint
 left_shoulder_yaw_joint
@@ -50,13 +47,13 @@ right_shoulder_yaw_joint
 right_elbow_joint
 ```
 
-Wrist joints are **not actuated** — the PD controller holds them at their default pose. Action scale: `0.5`.
+Waist (yaw/roll/pitch) and wrist joints are **not actuated** — the PD controller holds them at their default pose. Action scale: `0.5`.
 
 ---
 
 ## Observation Space
 
-### State (108-dim) — deployable on real robot
+### State (96-dim) — deployable on real robot
 
 All sensor readings include realistic noise to match real deployment conditions.
 
@@ -64,16 +61,16 @@ All sensor readings include realistic noise to match real deployment conditions.
 |-------|------|-------|
 | `gyro_pelvis` | 3 | Angular velocity from pelvis IMU `[+ noise]` |
 | `gvec_pelvis` | 3 | Gravity direction in pelvis frame `[+ noise]` |
-| `joint_angles` | 23 | Controlled joint positions (legs + waist + arms, relative to default) `[+ noise]` |
-| `joint_vel` | 23 | Controlled joint velocities `[+ noise]` |
-| `last_action` | 23 | Previous policy output |
-| `motor_targets` | 23 | Current PD targets for controlled joints |
+| `joint_angles` | 20 | Controlled joint positions (legs + arms, relative to default) `[+ noise]` |
+| `joint_vel` | 20 | Controlled joint velocities `[+ noise]` |
+| `last_action` | 20 | Previous policy output |
+| `motor_targets` | 20 | Current PD targets for controlled joints |
 | `box_pos_local` | 3 | Box center position in pelvis frame |
 | `box_quat_local` | 4 | Box orientation in pelvis frame (wxyz) |
 | `box_size` | 3 | Box half-extents (l, w, h) — pre-determined at deployment |
-| **Total** | **108** | |
+| **Total** | **96** | |
 
-### Privileged State (147-dim) — critic only during training
+### Privileged State (135-dim) — critic only during training
 
 Built from scratch with **noiseless** sensor readings. The critic sees clean versions of all noisy state fields, plus additional privileged quantities not available at deployment.
 
@@ -81,10 +78,10 @@ Built from scratch with **noiseless** sensor readings. The critic sees clean ver
 |-------|------|-------|
 | `gyro_pelvis` | 3 | Noiseless |
 | `gvec_pelvis` | 3 | Noiseless |
-| `joint_angles` | 23 | Noiseless |
-| `joint_vel` | 23 | Noiseless |
-| `last_action` | 23 | Same as state |
-| `motor_targets` | 23 | Same as state |
+| `joint_angles` | 20 | Noiseless |
+| `joint_vel` | 20 | Noiseless |
+| `last_action` | 20 | Same as state |
+| `motor_targets` | 20 | Same as state |
 | `box_pos_local` | 3 | Same as state |
 | `box_quat_local` | 4 | Same as state |
 | `box_size` | 3 | Same as state |
@@ -103,7 +100,7 @@ Built from scratch with **noiseless** sensor readings. The critic sees clean ver
 | `right_hand_vel` | 3 | Right palm linear velocity |
 | `kp_scale` | 1 | PD gain DR scalar |
 | `kd_scale` | 1 | PD gain DR scalar |
-| **Total** | **147** | 108 state (noiseless) + 39 privileged-only |
+| **Total** | **135** | 96 state (noiseless) + 39 privileged-only |
 
 ---
 

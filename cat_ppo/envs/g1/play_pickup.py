@@ -25,7 +25,7 @@ NUM_ROBOT_JOINTS = 29
 
 @cat_ppo.registry.register("G1Pickup", "play_env_class")
 class PlayG1PickupEnv(BaseEnv):
-    """CPU inference env for G1Pickup. 23-DOF action, compact obs."""
+    """CPU inference env for G1Pickup. 20-DOF action (legs + arms), compact obs."""
 
     def __init__(
         self,
