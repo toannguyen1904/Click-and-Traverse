@@ -59,7 +59,7 @@ def play(args: Args):
         env_cfg.warmstart_states_path = args.warmstart_states_path
         if args.stage1_steps < 0 and hasattr(env_cfg, "stage1_steps"):
             env_cfg.stage1_steps = 0
-    env = env_class(task_type=env_cfg.task_type, config=env_cfg)
+    env = env_class(task_type=env_cfg.task_type, config=env_cfg, headless=args.record)
     env.pri = args.pri
 
     # Override box geometry in the MuJoCo model before reset

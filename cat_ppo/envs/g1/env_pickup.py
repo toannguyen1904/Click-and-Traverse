@@ -63,6 +63,9 @@ PICKUP_ACTION_JOINT_NAMES = [
     "right_elbow_joint",
 ]
 
+# Arm joints occupy the last 8 entries of PICKUP_ACTION_JOINT_NAMES (indices 12–19).
+_ARM_ACTION_SLICE = slice(12, 20)
+
 
 # ---------------------------------------------------------------------------
 # Domain randomization
@@ -186,7 +189,7 @@ def g1_pickup_task_config() -> config_dict.ConfigDict:
         sim_dt=0.002,
         episode_length=200,
         action_repeat=1,
-        action_scale=0.5,
+        action_scale=0.2,
         num_obs=96,
         num_pri=135,
         num_act=20,
@@ -254,6 +257,7 @@ def g1_pickup_task_config() -> config_dict.ConfigDict:
                 joint_torque=-1e-4,
                 smoothness_joint=-1e-6,
                 smoothness=1e-3,
+                arm_smoothness=10,
                 joint_limits=-1.0,
                 base_height=1.0,
                 foot_balance=-30.0,
@@ -758,6 +762,8 @@ class G1PickupEnv(G1CaTraEnv):
         joint_torque = self._cost_torque(data.actuator_force)
         smoothness_joint = self._cost_smoothness_joint(data, info["last_joint_vel"])
         smoothness = -jp.sum((action - info["last_act"]) ** 2)
+        arm_delta = action[_ARM_ACTION_SLICE] - info["last_act"][_ARM_ACTION_SLICE]
+        arm_smoothness = -jp.sum(arm_delta ** 2)
 
         # Joint limits (only robot joints; box freejoint has no meaningful range)
         joint_limits = self._cost_joint_pos_limits(data.qpos[7:7 + NUM_ROBOT_JOINTS])
@@ -797,6 +803,7 @@ class G1PickupEnv(G1CaTraEnv):
             "joint_torque": joint_torque,
             "smoothness_joint": smoothness_joint,
             "smoothness": smoothness,
+            "arm_smoothness": arm_smoothness,
             "joint_limits": joint_limits,
             "base_height": base_height,
             "foot_balance": foot_balance,

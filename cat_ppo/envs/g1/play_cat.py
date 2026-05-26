@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import mujoco
-import mujoco.viewer
 import numpy as np
 
 import cat_ppo
@@ -212,7 +211,8 @@ class PlayG1CatEnv(BaseEnv):
         self.mj_model.opt.timestep = sim_dt
         self.headless = headless
         if not self.headless:
-            self.viewer = mujoco.viewer.launch_passive(self.mj_model, self.mj_data)
+            import mujoco.viewer as _mv
+            self.viewer = _mv.launch_passive(self.mj_model, self.mj_data)
         self.fix_body = fix_body
         self._config = config
         self._post_init()
@@ -811,7 +811,8 @@ class PlayG1CaTraEnv(PlayG1CatEnv):
         self.mj_model.opt.timestep = sim_dt
         self.headless = headless
         if not self.headless:
-            self.viewer = mujoco.viewer.launch_passive(self.mj_model, self.mj_data)
+            import mujoco.viewer as _mv
+            self.viewer = _mv.launch_passive(self.mj_model, self.mj_data)
         self.fix_body = fix_body
         self._config = config
         self._post_init()

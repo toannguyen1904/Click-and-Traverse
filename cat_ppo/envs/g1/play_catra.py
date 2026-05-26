@@ -8,7 +8,6 @@ Mirrors G1CaTraEnv._get_obs (195-dim state) for ONNX policy playback.
 import time
 
 import mujoco
-import mujoco.viewer
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
@@ -71,7 +70,8 @@ class PlayG1CaTraEnv(BaseEnv):
         self.mj_model.opt.timestep = sim_dt
         self.headless = headless
         if not self.headless:
-            self.viewer = mujoco.viewer.launch_passive(self.mj_model, self.mj_data)
+            import mujoco.viewer as _mv
+            self.viewer = _mv.launch_passive(self.mj_model, self.mj_data)
         self._config = config
         self.dt = dt
         self.sim_dt = sim_dt
