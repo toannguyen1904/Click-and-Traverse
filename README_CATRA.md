@@ -12,7 +12,7 @@ This is **Phase 2** of a two-phase curriculum. It combines the pickup policy (Ph
 |----------|-------|
 | Robot | Unitree G1 humanoid |
 | Task | Pick up a box from a pillar, then carry it through obstacles |
-| Action space | 23 DOF (12 legs + 3 waist + 8 arms) |
+| Action space | 20 DOF (12 legs + 8 arms; TEMP: all 3 waist joints removed, held at default) |
 | Episode length | 1100 steps (22 s at 50 Hz) |
 | Stage 1 | Steps 0–(stage1_steps−1): stand-and-reach, pickup reward set. Set `stage1_steps=0` when using warm-start. |
 | Stage 2 | Steps stage1_steps to stage1_steps+999: PF-guided traversal + grasp-maintenance rewards |
@@ -23,14 +23,13 @@ This is **Phase 2** of a two-phase curriculum. It combines the pickup policy (Ph
 
 ## Action Space
 
-Same 23-joint PD position target space as G1Pickup:
+20-joint PD position target space (TEMP: all 3 waist joints dropped from CaTra's 23-joint set; waist yaw/roll/pitch are held at their default PD targets each step):
 
 ```
 left_hip_pitch_joint     left_hip_roll_joint      left_hip_yaw_joint
 left_knee_joint          left_ankle_pitch_joint   left_ankle_roll_joint
 right_hip_pitch_joint    right_hip_roll_joint     right_hip_yaw_joint
 right_knee_joint         right_ankle_pitch_joint  right_ankle_roll_joint
-waist_yaw_joint          waist_roll_joint         waist_pitch_joint
 left_shoulder_pitch_joint  left_shoulder_roll_joint  left_shoulder_yaw_joint
 left_elbow_joint
 right_shoulder_pitch_joint right_shoulder_roll_joint right_shoulder_yaw_joint
@@ -66,10 +65,10 @@ The PF subblock is **not additively noised** — only gyro/gvec/joint_angles/joi
 |-------|------|-------|
 | `gyro_pelvis` | 3 | Angular velocity from pelvis IMU `[+ noise]` |
 | `gvec_pelvis` | 3 | Gravity direction in pelvis frame `[+ noise]` |
-| `joint_angles` | 23 | Controlled joints, relative to default `[+ noise]` |
-| `joint_vel` | 23 | Controlled joint velocities `[+ noise]` |
-| `last_action` | 23 | Previous policy output |
-| `motor_targets` | 23 | Current PD targets for controlled joints |
+| `joint_angles` | 20 | Controlled joints, relative to default `[+ noise]` |
+| `joint_vel` | 20 | Controlled joint velocities `[+ noise]` |
+| `last_action` | 20 | Previous policy output |
+| `motor_targets` | 20 | Current PD targets for controlled joints |
 | `command` | 4 | Navigation command `[move_flag, vx, vy, yaw]`; zeros in Stage 1 |
 | `foot_height` | 1 | Target foot height for gait |
 | `gait_phase` | 4 | cos+sin of 2D gait clock (left + right) |
@@ -79,15 +78,15 @@ The PF subblock is **not additively noised** — only gyro/gvec/joint_angles/joi
 | `box_quat_local` | 4 | Box orientation in pelvis frame (wxyz) |
 | `box_size` | 3 | Box half-extents (hx, hy, hz) |
 | `stage_flag` | 1 | 0.0 in Stage 1, 1.0 in Stage 2 |
-| **Total** | **251** | |
+| **Total** | **239** | |
 
-### Privileged State (345-dim) — critic only during training
+### Privileged State (333-dim) — critic only during training
 
 Noiseless, world-frame version of the state block (without `box_pos_local`/`box_quat_local`) plus privileged extras. The PF block here uses non-delayed, world-frame samples for both body and box corners.
 
 | Field | Dims | Notes |
 |-------|------|-------|
-| Noiseless state block | 244 | Same structure as state but noiseless and world-frame; body_pf(77) + box_pf(56) = 133; box_pos/quat_local omitted |
+| Noiseless state block | 232 | Same structure as state but noiseless and world-frame; body_pf(77) + box_pf(56) = 133; box_pos/quat_local omitted |
 | `linvel_pelvis` | 3 | Pelvis linear velocity (world frame) |
 | `pelvis_pos` + `torso_pos` + `head_pos` | 9 | Absolute body positions |
 | `shlds_pos` + `hands_pos` + `knees_pos` + `feet_pos` | 24 | 2 sites × 4 body groups × 3 |
@@ -102,7 +101,7 @@ Noiseless, world-frame version of the state block (without `box_pos_local`/`box_
 | `rfi_lim_scale` | 29 | Per-joint random force injection scale |
 | `kp_scale` | 1 | PD gain DR scalar |
 | `kd_scale` | 1 | PD gain DR scalar |
-| **Total** | **345** | |
+| **Total** | **333** | |
 
 ---
 
@@ -159,7 +158,8 @@ Navigation rewards (from G1CatEnv):
 | `foot_far` | 0.0 | Foot overstep penalty (scaled off) |
 | `straight_knee_trav` | -30.0 | Discourage locked knees during locomotion |
 | `smoothness_action` | -1e-3 | Smooth action transitions |
-| `forward_progress` | 5.0 | Linear reward for velocity in the command direction; `clip(v·cmd_dir, 0, |cmd|)` — nonzero gradient from a dead stop, unlike the exp-based `tracking_root_field` |
+| `forward_progress` | 0.0 | Linear reward for velocity in the command direction; `clip(v·cmd_dir, 0, |cmd|)` — nonzero gradient from a dead stop, unlike the exp-based `tracking_root_field` (currently scaled off; previously 5.0) |
+| `upper_body_align` | 0.0 | Penalize XY drift of torso and head from pelvis: `||tors_xy − pelv_xy||² + ||head_xy − pelv_xy||²` (currently scaled off; previously −2.0) |
 | `headgf/handsgf/feetgf` | 0.0 | Body goal field tracking (scaled off) |
 | `headdf/handsdf/feetdf/kneesdf/shldsdf` | 0.0 | Body distance field penalties (scaled off) |
 | `boxdf` | 0.0 | Box-corner SDF collision penalty: `mean(softplus((0.05 − sdf) / 0.02))` over 8 corners; enable with `--box <scale>` |
@@ -268,6 +268,8 @@ MjxEnv (mujoco_playground)
 - **Box corner PF**: The obstacle fields (sdf, bf, gf) are sampled at all **8 corners** of the box each step and included in both the deployable state and privileged state (56 dims each: 8 corners × (gf:3 + bf:3 + sdf:1)). This lets the policy steer the box around obstacles rather than only routing its own body. Corners are computed from `data.xpos/xquat[box_body_id]` + `geom_size[box_geom_id]` via a rotation matrix. The same 5-step delay + nav-frame transform applied to body PF is applied to box corner PF in the deployable state. The `boxdf` reward (SDF softplus penalty averaged over 8 corners, same formula as body-part `*df` rewards) is registered with scale 0.0 by default; enable with `--box <scale>` (e.g. `--box 1.0`). Box-corner collision termination also fires when any corner's SDF < −`term_collision_threshold`, gated identically to body-part termination. The policy also receives `box_pos_local`, `box_quat_local`, and `box_size` directly; these are **noise-free** — noise should be added in a future iteration for better sim-to-real transfer.
 - **Box drop threshold**: Termination fires when `box_z < 0.3 m` (at or below pillar surface), allowing the box to move freely at any height above that during carries.
 - **SDF termination gating**: Body-obstacle collision termination is suppressed until step 150 (50 steps into Stage 2), giving the robot time to stabilize its carry before collision penalties apply.
+- **Navigation command sites**: `compute_cmd_from_rtf` builds the Stage 2 PF command (both primary and 5-step-delayed) from the pelvis + head + feet goal/body fields only. Hands were removed from this aggregation — they still appear in the observation PF subblock and are still affected by `handsdf`/`handsgf` rewards, but no longer steer the navigation command.
+- **Collision geometry updates**: `torso_collision` is a fatter capsule (`size=0.09`, shifted to `fromto="0.01 0 0.08 0.01 0 0.2"`) and `head_collision` is a larger sphere (`size=0.06`, `pos="0 0 0.43"`) — closer to the actual robot envelope so the box does not sink into the torso/head. A `pelvis_collision` ↔ `box_geom` contact pair is now declared in both the flat-terrain training scene and the mesh play scene, letting the box physically rest against the pelvis during carries.
 - **qpos/qvel layout**:
   ```
   qpos: [0:7] root | [7:36] robot joints (29) | [36:43] box freejoint | [43:50] support freejoint
@@ -348,13 +350,19 @@ python train_ppo_catra.py \
     --exp_name catra_v1 \
     --warmstart_states_path data/warmstart/catra_pickup_states.npz \
     --obs_path data/assets/TypiObs/bar0 \
-    --ground 1.0 \
-    --lateral 1.0 \
-    --overhead 1.0 \
+    --groundgf 1.0 --grounddf 1.0 \
+    --lateralgf 1.0 --lateraldf 0.4 \
+    --overheadgf 1.0 --overheaddf 1.0 \
     --box 1.0
 ```
 
-`--ground` scales `feetgf`/`feetdf`, `--lateral` scales `handsgf`/`handsdf`/`kneesdf`/`shldsdf`, `--overhead` scales `headgf`/`headdf`, `--box` scales `boxdf` (box-corner SDF penalty). All default to 0 (disabled).
+The `gf` (goal-field guidance) and `df` (SDF collision penalty) scales are split per body group:
+- `--groundgf` scales `feetgf`; `--grounddf` scales `feetdf`.
+- `--lateralgf` scales `handsgf`; `--lateraldf` scales `handsdf`/`kneesdf`/`shldsdf`.
+- `--overheadgf` scales `headgf`; `--overheaddf` scales `headdf`.
+- `--box` scales `boxdf` (box-corner SDF penalty).
+
+All default to 0 (disabled).
 
 ### Export to ONNX
 
@@ -385,7 +393,7 @@ key = jax.random.PRNGKey(0)
 state = jax.jit(env.reset)(key)
 step = jax.jit(env.step)
 for i in range(110):
-    state = step(state, jax.numpy.zeros(23))
+    state = step(state, jax.numpy.zeros(20))
     if i in (98, 99, 100, 101):
         print(f"step {i}: command={state.info['command']}, reach={state.metrics.get('reach', 0):.4f}, reach_carry={state.metrics.get('reach_carry', 0):.4f}")
 ```

@@ -55,6 +55,8 @@ def build_obstacles(scene, grids):
         return obs_double_knee_bars(X, Y, Z)
     elif scene == "bend":
         return obs_bend(X, Y, Z)
+    elif scene == "bend_long":
+        return obs_bend_long(X, Y, Z)
     elif scene == "lowcorner":
         return obs_low_corner(X, Y, Z)
     elif scene == "highcorner":
@@ -138,6 +140,15 @@ def obs_bend(X, Y, Z, *, x1=0.9, x2=1.3, thickness=0.24, y_cover=0.05, z0=0.5, z
     fin3 = _box(X, Y, Z, x0=x0 - thickness, x1=x0 + thickness, y0=-1.0, y1=-0.18, z0=0, z1=z0)
     return fin1 | fin2 | fin3
 
+def obs_bend_long(X, Y, Z, *, fin1_width=0.48, fin23_width=0.72, z0=0.5, z1=1.1):
+    # Same layout as obs_bend, but with thicker fins along X:
+    # fin1 (overhead beam) = 0.48 m deep; fin2/fin3 (low side blocks) = 0.72 m deep
+    x0 = 1.0
+    fin1 = _box(X, Y, Z, x0=x0 - fin1_width/2,  x1=x0 + fin1_width/2,  y0=-1.0, y1=0.1,  z0=z1, z1=2.0)
+    fin2 = _box(X, Y, Z, x0=x0 - fin23_width/2, x1=x0 + fin23_width/2, y0=0.18, y1=1.0,  z0=0,  z1=z0)
+    fin3 = _box(X, Y, Z, x0=x0 - fin23_width/2, x1=x0 + fin23_width/2, y0=-1.0, y1=-0.18, z0=0, z1=z0)
+    return fin1 | fin2 | fin3
+
 def obs_chest_2(X, Y, Z, *, x1=0.9, x2=1.3, thickness=0.12, y_cover=0.05, z0=0.4, z1=1.15):
     # A wall with an asymmetric opening — designed to require the robot to crouch or twist its torso, currently not used
     x0 = 1.0
@@ -175,7 +186,7 @@ if __name__ == "__main__":
         "Mceilbar0", "Mceilbar1",
         "Mbar0", "Mbar1",
         "Nbar0", "Nbar1",
-        "doubar", "bend",
+        "doubar", "bend", "bend_long",
         "lowcorner", "highcorner",
         "empty",
     ]

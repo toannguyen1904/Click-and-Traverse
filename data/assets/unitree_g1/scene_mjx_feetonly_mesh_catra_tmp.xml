@@ -26,7 +26,7 @@
         <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="60 60" reflectance="0.01" specular="0.25" shininess="0.35" />
         <texture name="tex_brick_cube" type="2d" file="texture.png" />
         <material name="mat_brick_cube" texture="tex_brick_cube" reflectance="0.10" specular="0.20" shininess="0.30" />
-        <mesh name="scene_mesh" file="../TypiObs/Mceilbar1/obs.obj" />
+        <mesh name="scene_mesh" file="../TypiObs/bend_long/obs.obj" />
     </asset>
 
     <worldbody>
@@ -62,6 +62,7 @@
         <pair geom1="right_shoulder_yaw_collision" geom2="box_geom" condim="3" friction="0.5 0.5 0.5" />
         <pair geom1="torso_collision" geom2="box_geom" condim="3" friction="0.5 0.5 0.5" />
         <pair geom1="head_collision" geom2="box_geom" condim="3" friction="0.5 0.5 0.5" />
+        <pair geom1="pelvis_collision" geom2="box_geom" condim="3" friction="0.5 0.5 0.5" />
 
         
         <pair geom1="left_shin" geom2="floor" condim="3" friction="0.5 0.5" />
