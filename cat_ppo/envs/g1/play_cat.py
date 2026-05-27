@@ -798,7 +798,7 @@ class PlayG1CaTraEnv(PlayG1CatEnv):
 
     Extends PlayG1CatEnv to:
     - Load the mesh_catra scene (robot + freejoint box).
-    - Use the 23-joint CATRA_ACTION_JOINT_NAMES action space.
+    - Use the 20-joint CATRA_ACTION_JOINT_NAMES action space (TEMP: no waist joints).
     - Fix PD slicing to exclude the box freejoint DOFs.
     - Initialise the box at the palm midpoint via FK each reset.
     - Append box HumanoidPF fields (boxgf, boxbf, boxdf) to the observation.
@@ -837,7 +837,7 @@ class PlayG1CaTraEnv(PlayG1CatEnv):
 
     def _post_init(self):
         super()._post_init()
-        # Override action joints to the 23-joint CaTra set.
+        # Override action joints to the 20-joint CaTra set (TEMP: no waist joints).
         self.action_joint_names = consts.CATRA_ACTION_JOINT_NAMES.copy()
         self.action_joint_ids = np.array(
             [self.mj_model.actuator(n).id for n in self.action_joint_names]

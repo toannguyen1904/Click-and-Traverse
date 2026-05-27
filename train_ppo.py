@@ -48,9 +48,12 @@ class Args:
     seed: int = 42   # random seed for training
     convert_onnx: bool = True   # convert the trained policy to ONNX format for deployment
     restore_name: str = "none"   # name of the checkpoint to restore from, used to resume training
-    ground: float = 0    # reward scale for feet body group: GF guidance alignment + SDF penalty vs ground-level obstacles
-    lateral: float = 0   # reward scale for hands/knees/shoulders body group: GF guidance alignment + SDF penalty vs side obstacles
-    overhead: float = 0  # reward scale for head body group: GF guidance alignment + SDF penalty vs overhead obstacles
+    groundgf: float = 0  # reward scale for feet GF guidance alignment (ground-level obstacles)
+    grounddf: float = 0  # reward scale for feet SDF penalty (ground-level obstacles)
+    lateralgf: float = 0 # reward scale for hands GF guidance alignment (side obstacles)
+    lateraldf: float = 0 # reward scale for hands/knees/shoulders SDF penalty (side obstacles)
+    overheadgf: float = 0  # reward scale for head GF guidance alignment (overhead obstacles)
+    overheaddf: float = 0  # reward scale for head SDF penalty (overhead obstacles)
     box: float = 0       # reward scale for box-corner SDF penalty (G1CaTra only): keeps the carried box clear of obstacles
     term_collision_threshold: float = 0.04  # SDF below -threshold triggers collision termination
     obs_path: str = 'data/assets/TypiObs/empty'  # path to the obstacle grid files: sdf.npy, bf.npy, gf.npy.
@@ -60,14 +63,23 @@ class Args:
         # generate a unique experiment name based on the task, difficulty, and seed
         exp_name_parts = [self.exp_name]
 
-        if self.ground != 0:
-            exp_name_parts.append('G'+str(self.ground).replace('.', ''))
+        if self.groundgf != 0:
+            exp_name_parts.append('Gg'+str(self.groundgf).replace('.', ''))
 
-        if self.lateral != 0:
-            exp_name_parts.append('L'+str(self.lateral).replace('.', ''))
+        if self.grounddf != 0:
+            exp_name_parts.append('Gd'+str(self.grounddf).replace('.', ''))
 
-        if self.overhead != 0:
-            exp_name_parts.append('O'+str(self.overhead).replace('.', ''))
+        if self.lateralgf != 0:
+            exp_name_parts.append('Lg'+str(self.lateralgf).replace('.', ''))
+
+        if self.lateraldf != 0:
+            exp_name_parts.append('Ld'+str(self.lateraldf).replace('.', ''))
+
+        if self.overheadgf != 0:
+            exp_name_parts.append('Og'+str(self.overheadgf).replace('.', ''))
+
+        if self.overheaddf != 0:
+            exp_name_parts.append('Od'+str(self.overheaddf).replace('.', ''))
 
         if self.box != 0:
             exp_name_parts.append('B'+str(self.box).replace('.', ''))
@@ -130,14 +142,14 @@ def _apply_args_to_config(args: Args, policy_cfg, env_config, debug: bool):
         # get the latest checkpoint from the log directory if resuming training
         from cat_ppo.constant import get_latest_ckpt
         policy_cfg.restore_checkpoint_path = str(get_latest_ckpt(args.restore_name))
-    env_config.reward_config.scales.feetgf = args.ground  # scale: align feet velocity with HumanoidPF guidance (ground)
-    env_config.reward_config.scales.feetdf = args.ground  # scale: SDF penalty for feet vs ground obstacles
-    env_config.reward_config.scales.headgf = args.overhead  # scale: align head motion with guidance (overhead)
-    env_config.reward_config.scales.headdf = args.overhead  # scale: SDF penalty for head vs overhead obstacles
-    env_config.reward_config.scales.handsgf = args.lateral  # scale: align hands with guidance (lateral / narrow)
-    env_config.reward_config.scales.handsdf = args.lateral  # scale: SDF penalty for hands vs side obstacles
-    env_config.reward_config.scales.kneesdf = args.lateral  # scale: SDF penalty for knees vs obstacles
-    env_config.reward_config.scales.shldsdf = args.lateral  # scale: SDF penalty for shoulders vs obstacles
+    env_config.reward_config.scales.feetgf = args.groundgf   # scale: align feet velocity with HumanoidPF guidance (ground)
+    env_config.reward_config.scales.feetdf = args.grounddf   # scale: SDF penalty for feet vs ground obstacles
+    env_config.reward_config.scales.headgf = args.overheadgf # scale: align head motion with guidance (overhead)
+    env_config.reward_config.scales.headdf = args.overheaddf # scale: SDF penalty for head vs overhead obstacles
+    env_config.reward_config.scales.handsgf = args.lateralgf # scale: align hands with guidance (lateral / narrow)
+    env_config.reward_config.scales.handsdf = args.lateraldf # scale: SDF penalty for hands vs side obstacles
+    env_config.reward_config.scales.kneesdf = args.lateraldf # scale: SDF penalty for knees vs obstacles
+    env_config.reward_config.scales.shldsdf = args.lateraldf # scale: SDF penalty for shoulders vs obstacles
     if "boxdf" in env_config.reward_config.scales:
         env_config.reward_config.scales.boxdf = args.box  # scale: SDF penalty for box corners vs obstacles (G1CaTra only)
     env_config.term_collision_threshold = args.term_collision_threshold  # SDF below -threshold triggers collision termination

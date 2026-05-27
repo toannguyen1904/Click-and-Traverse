@@ -292,8 +292,8 @@ class PlayG1CaTraEnv(BaseEnv):
         # PF-derived command (4-dim); gated to zero in stage 1
         cmd_pf = self._compute_cmd_4d(
             pelvgf.reshape(-1),
-            np.concatenate([headgf, feetgf, handsgf], axis=0),
-            np.concatenate([headbf, feetbf, handsbf], axis=0),
+            np.concatenate([headgf, feetgf], axis=0),
+            np.concatenate([headbf, feetbf], axis=0),
         )
         step = state.info["step"]
         command = np.zeros(4) if step < self._config.stage1_steps else cmd_pf
