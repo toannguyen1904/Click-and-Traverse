@@ -91,6 +91,7 @@
         <pair geom1="right_shoulder_yaw_collision"  geom2="box_geom" condim="3" friction="0.5 0.5 0.5"/>
         <pair geom1="torso_collision"               geom2="box_geom" condim="3" friction="0.5 0.5 0.5"/>
         <pair geom1="head_collision"                geom2="box_geom" condim="3" friction="0.5 0.5 0.5"/>
+        <pair geom1="pelvis_collision"              geom2="box_geom" condim="3" friction="0.5 0.5 0.5"/>
 
         <!-- Floor contacts for body parts that have no default floor collision -->
         <pair geom1="left_shin"            geom2="floor"      condim="3" friction="0.5 0.5"/>

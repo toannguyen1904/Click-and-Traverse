@@ -296,8 +296,8 @@ def g1_catra_task_config() -> config_dict.ConfigDict:
       Stage 2 (steps stage1_steps -> stage1_steps+999): PF-derived command, navigation + carry rewards.
 
     Observation dimensions:
-      num_obs = 251  (state, deployable; PF subblock delayed + nav-frame, not additively noised)
-      num_pri = 345  (privileged_state, noiseless + extras)
+      num_obs = 239  (state, deployable; PF subblock delayed + nav-frame, not additively noised)
+      num_pri = 333  (privileged_state, noiseless + extras)
     """
     env_config = config_dict.create(
         task_type="flat_terrain_catra",
@@ -308,9 +308,9 @@ def g1_catra_task_config() -> config_dict.ConfigDict:
         action_repeat=1,
         action_scale=0.5,
         history_len=15,
-        num_obs=251,
-        num_pri=345,
-        num_act=23,
+        num_obs=239,
+        num_pri=333,
+        num_act=20,
         restricted_joint_range=False,
         soft_joint_pos_limit_factor=0.95,
         gait_config=config_dict.create(
@@ -385,15 +385,16 @@ def g1_catra_task_config() -> config_dict.ConfigDict:
                 foot_far=0.0,
                 straight_knee_trav=-30.0,
                 smoothness_action=-1e-3,
-                forward_progress=5.0,
+                forward_progress=0.0,   #5.0,
+                upper_body_align=-0.0, #-2.0,
                 headgf=0.0,    # overwritten by --overhead in train_ppo.py
-                handsgf=0.0,   # overwritten by --lateral
-                feetgf=0.0,    # overwritten by --ground
+                handsgf=0.0,   # overwritten by --lateralgf
+                feetgf=0.0,    # overwritten by --groundgf
                 headdf=0.0,    # overwritten by --overhead
-                handsdf=0.0,   # overwritten by --lateral
-                feetdf=0.0,    # overwritten by --ground
-                kneesdf=0.0,   # overwritten by --lateral
-                shldsdf=0.0,   # overwritten by --lateral
+                handsdf=0.0,   # overwritten by --lateraldf
+                feetdf=0.0,    # overwritten by --grounddf
+                kneesdf=0.0,   # overwritten by --lateraldf
+                shldsdf=0.0,   # overwritten by --lateraldf
                 boxdf=0.0,     # box-corner SDF collision penalty (set non-zero to enable)
                 # --- Stage 2 only: carry maintenance (same scales as Pickup) ---
                 reach_carry=1.5,
@@ -506,9 +507,9 @@ class G1CaTraEnv(G1CatEnv):
     Stage 2 (steps stage1_steps -> stage1_steps+999): robot walks with box, uses CAT navigation rewards
     + 6 carry-maintenance terms.
 
-    Action space: 23 DOF (12 leg + 3 waist + 8 arm joints).
-    State:       195-dim (deployable, noisy).
-    Priv state:  289-dim (noiseless + extras, critic only).
+    Action space: 20 DOF (12 leg + 8 arm joints; TEMP: all 3 waist joints removed).
+    State:       239-dim (deployable, noisy).
+    Priv state:  333-dim (noiseless + extras, critic only).
     """
 
     def __init__(
@@ -525,7 +526,7 @@ class G1CaTraEnv(G1CatEnv):
         self._post_init_catra()
 
     def _post_init_catra(self) -> None:
-        """Set up 23-DOF action space, soft limits, init_q, and cached IDs for pickup rewards."""
+        """Set up 20-DOF action space, soft limits, init_q, and cached IDs for pickup rewards."""
         self.action_joint_names = consts.CATRA_ACTION_JOINT_NAMES.copy()
         self.action_joint_ids = jp.array([
             self.mj_model.actuator(name).id for name in self.action_joint_names
@@ -567,7 +568,7 @@ class G1CaTraEnv(G1CatEnv):
 
     @property
     def action_size(self) -> int:
-        return len(self.action_joint_names)  # 23
+        return len(self.action_joint_names)  # 20
 
     def reset(self, rng: jax.Array) -> mjx_env.State:
         """Reset: loads a pre-generated warm-start state if configured, else random init."""
@@ -935,8 +936,8 @@ class G1CaTraEnv(G1CatEnv):
         # PF-derived command (always computed; gated to zero in stage 1)
         cmd_pf = self.compute_cmd_from_rtf(
             pelvgf.reshape(-1),
-            jp.concat([headgf, feetgf, handsgf], axis=0),
-            jp.concat([headbf, feetbf, handsbf], axis=0),
+            jp.concat([headgf, feetgf], axis=0),
+            jp.concat([headbf, feetbf], axis=0),
         )
         state.info["command"] = jp.where(state.info["step"] < self._config.stage1_steps, jp.zeros(4), cmd_pf)
 
@@ -976,8 +977,8 @@ class G1CaTraEnv(G1CatEnv):
         boxbf_delay = boxbf_delay / (jp.linalg.norm(boxbf_delay, axis=-1, keepdims=True) + EPS)
         command_delay = self.compute_cmd_from_rtf(
             pelvgf_delay.reshape(-1),
-            jp.concat([headgf_delay, feetgf_delay, handsgf_delay], axis=0),
-            jp.concat([headbf_delay, feetbf_delay, handsbf_delay], axis=0),
+            jp.concat([headgf_delay, feetgf_delay], axis=0),
+            jp.concat([headbf_delay, feetbf_delay], axis=0),
         )
         # Gate delayed command same as primary command
         command_delay = jp.where(state.info["step"] < self._config.stage1_steps, jp.zeros(4), command_delay)
@@ -1409,6 +1410,8 @@ class G1CaTraEnv(G1CatEnv):
             "straight_knee_trav":  self._cost_straight_knee(data.qpos[jp.array(self._knee_indices) + 7]),
             "smoothness_action":   self._cost_smoothness_action(action, info["last_act"], info["last_last_act"]),
             "forward_progress":    self._reward_forward_progress(info["global_lin_vel"], cmd_vel),
+            "upper_body_align":    jp.sum(jp.square(info["tors_pos"][:2] - info["pelv_pos"][:2]))
+                                 + jp.sum(jp.square(info["head_pos"][:2] - info["pelv_pos"][:2])),
             "headgf": self._re_gf0(info["headgf"], info["head_vel"], info["headdf"],
                                     (move_flag[None] < 0.5) | (info["head_pos"][..., 0] > 1.5), tau=0.5),
             "feetgf": self._re_gf0(info["feetgf"], info["feet_vel"], info["feetdf"],

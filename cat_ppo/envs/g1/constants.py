@@ -194,7 +194,8 @@ OBS_JOINT_NAMES = [
 BOX_SITE = "box_center"
 BOX_GEOM = "box_geom"
 
-# 23-joint action space for CaTra: 12 legs + 3 waist + 8 arm (shoulder + elbow, no wrists)
+# TEMP: 20-joint action space for CaTra: 12 legs + 8 arms (all 3 waist joints dropped).
+# Waist yaw/roll/pitch remain held at their default PD targets each step.
 CATRA_ACTION_JOINT_NAMES = [
     # 12 leg joints (same as ACTION_JOINT_NAMES)
     "left_hip_pitch_joint",
@@ -209,10 +210,7 @@ CATRA_ACTION_JOINT_NAMES = [
     "right_knee_joint",
     "right_ankle_pitch_joint",
     "right_ankle_roll_joint",
-    # 3 waist joints
-    "waist_yaw_joint",
-    "waist_roll_joint",
-    "waist_pitch_joint",
+    # 0 waist joints (TEMP: yaw + roll + pitch all removed)
     # 8 arm joints (left then right, shoulder + elbow only; wrists stay at default)
     "left_shoulder_pitch_joint",
     "left_shoulder_roll_joint",
@@ -223,7 +221,7 @@ CATRA_ACTION_JOINT_NAMES = [
     "right_shoulder_yaw_joint",
     "right_elbow_joint",
 ]
-# num_act = 23
+# num_act = 20
 
 # Same resting pose as DEFAULT_QPOS — arms hang naturally, not in a carrying pose.
 # fmt: off
