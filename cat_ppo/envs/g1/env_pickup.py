@@ -187,7 +187,7 @@ def g1_pickup_task_config() -> config_dict.ConfigDict:
         task_type="flat_terrain_catra",
         ctrl_dt=0.02,
         sim_dt=0.002,
-        episode_length=200,
+        episode_length=1000,
         action_repeat=1,
         action_scale=0.2,
         num_obs=96,
@@ -238,18 +238,18 @@ def g1_pickup_task_config() -> config_dict.ConfigDict:
         ),
         reward_config=config_dict.create(
             scales=config_dict.create(
-                reach=1.5,
+                reach=3.0, #1.5,
                 lift=2.0,
                 hand_contact=2.0,
                 box_pillar_contact=-1.5,
                 grasp_symmetry=-2.0,
                 palm_orient=2.0,
                 hands_level=-1.0,
-                hold_stable=0.0,
+                hold_stable=0.5,
                 box_yaw_stable=0.0, # -2.0
                 box_centering=0.0,  # -2.0
                 box_vertical=-0.5,   # -5.0
-                box_upright=0.0,
+                box_upright=2.0,
                 upright=3.0,    # 1.0 in CAT
                 foot_contact=-0.5,
                 foot_slip=-0.1,
@@ -257,7 +257,7 @@ def g1_pickup_task_config() -> config_dict.ConfigDict:
                 joint_torque=-1e-4,
                 smoothness_joint=-1e-6,
                 smoothness=1e-3,
-                arm_smoothness=10,
+                arm_smoothness=0., #10,
                 joint_limits=-1.0,
                 base_height=1.0,
                 foot_balance=-30.0,
@@ -280,7 +280,7 @@ def g1_pickup_task_config() -> config_dict.ConfigDict:
         madrona_backend=False,
         augment_pixels=False,
         num_envs=32768,
-        episode_length=200,
+        episode_length=1000,
         action_repeat=1,
         wrap_env_fn=None,
         randomization_fn=domain_randomize_pickup,
@@ -714,10 +714,15 @@ class G1PickupEnv(G1CaTraEnv):
         box_xy_drift = jp.linalg.norm(box_pos[:2] - info["box_xy_init"])
         box_vertical = jp.where(both_hands, box_xy_drift ** 2, 0.0)
 
-        # Hold stable: penalize box tumbling and translation
+        # Hold stable: penalize box tumbling and translation, but only once the box is
+        # lifted ≥7 cm off the surface. Without this gate the reward is maximized by leaving
+        # the box resting (stationary) on the pillar — and it would actively punish the lift
+        # maneuver. Gating makes "box resting" worth 0 here while earning no lift reward, so
+        # it can only be improved by holding a lifted box steady.
         box_linvel = data.qvel[BOX_QVEL_START:BOX_QVEL_START + 3]
         box_angvel = data.qvel[BOX_QVEL_START + 3:BOX_QVEL_START + 6]
-        hold_stable = -(jp.linalg.norm(box_linvel) + jp.linalg.norm(box_angvel))
+        holding = lift_height >= 0.07
+        hold_stable = jp.where(holding, -(jp.linalg.norm(box_linvel) + jp.linalg.norm(box_angvel)), 0.0)
 
         # Box yaw stable: penalize yaw deviation from initial box yaw, gated on both hands touching.
         # Extracts current box yaw from quaternion via atan2 and compares to reset yaw.
