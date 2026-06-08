@@ -288,6 +288,60 @@ def make_warmstart_domain_randomize_catra(states_path: str):
     return _make_domain_randomize_catra_warmstart(ws_box_mass, ws_box_size)
 
 
+def _make_warmstart_only_catra(ws_box_mass: "jax.Array", ws_box_size: "jax.Array"):
+    """Factory: warm-start without robot DR.
+
+    Same as _make_domain_randomize_catra_warmstart but drops the robot-param randomization
+    (frictionloss, armature, body CoM/mass, qpos0 joint-pose noise). Keeps the two pieces
+    that warm-start needs: per-env box mass/size from the saved file, and the qpos0[0]
+    index encoding so reset() can decode which warm-start state to load.
+
+    Use this for teacher policies (G1CaTraPri) where we want clean nominal dynamics for
+    distillation but still want to skip the pickup stage via warm-start.
+    """
+    _mj = mujoco.MjModel.from_xml_path(str(consts.CATRA_FLAT_TERRAIN_XML))
+    _box_geom_id = _mj.geom("box_geom").id
+    _box_body_id = _mj.body("carried_box").id
+    del _mj
+
+    def warmstart_only_catra(model: mjx.Model, rng: jax.Array):
+        @functools.partial(jax.vmap, in_axes=(0,))
+        def assign(idx):
+            geom_size = model.geom_size.at[_box_geom_id].set(ws_box_size[idx])
+            body_mass = model.body_mass.at[_box_body_id].set(ws_box_mass[idx])
+            qpos0 = model.qpos0.at[0].set(idx.astype(jp.float32))
+            return geom_size, body_mass, qpos0
+
+        num_envs = rng.shape[0]
+        indices = jp.arange(num_envs)
+        geom_size, body_mass, qpos0 = assign(indices)
+
+        in_axes = jax.tree_util.tree_map(lambda x: None, model)
+        in_axes = in_axes.tree_replace({
+            "geom_size": 0,
+            "body_mass": 0,
+            "qpos0": 0,
+        })
+
+        model = model.tree_replace({
+            "geom_size": geom_size,
+            "body_mass": body_mass,
+            "qpos0": qpos0,
+        })
+
+        return model, in_axes
+
+    return warmstart_only_catra
+
+
+def make_warmstart_only_catra(states_path: str):
+    """Load states_path and return a DR-free warm-start fn (box mass/size + index dispatch only)."""
+    npz = np.load(states_path)
+    ws_box_mass = jp.array(npz["box_mass"])   # (N,)
+    ws_box_size = jp.array(npz["box_size"])   # (N, 3)
+    return _make_warmstart_only_catra(ws_box_mass, ws_box_size)
+
+
 def g1_catra_task_config() -> config_dict.ConfigDict:
     """Config for two-stage G1CaTra.
 
@@ -384,8 +438,9 @@ def g1_catra_task_config() -> config_dict.ConfigDict:
                 foot_balance_trav=-30.0,
                 foot_far=0.0,
                 straight_knee_trav=-30.0,
+                feet_rotation=1.0,           # reward clean knee+ankle alignment with nav frame; indirect anti-crouch (ported from G1CatPri)
                 smoothness_action=-1e-3,
-                forward_progress=0.0,   #5.0,
+                forward_progress=20.0,   #5.0,
                 upper_body_align=-0.0, #-2.0,
                 headgf=0.0,    # overwritten by --overhead in train_ppo.py
                 handsgf=0.0,   # overwritten by --lateralgf
@@ -397,12 +452,13 @@ def g1_catra_task_config() -> config_dict.ConfigDict:
                 shldsdf=0.0,   # overwritten by --lateraldf
                 boxdf=0.0,     # box-corner SDF collision penalty (set non-zero to enable)
                 # --- Stage 2 only: carry maintenance (same scales as Pickup) ---
-                reach_carry=1.5,
+                reach_carry=3.0,
                 lift_carry=0.0, #2.0,
                 hand_contact_carry=2.0,
                 grasp_symmetry_carry=-2.0,
                 palm_orient_carry=2.0,
                 hands_level_carry=-1.0,
+                box_upright_carry=2.0,
                 # # CHANGED
                 # reach_carry=0.0,
                 # lift_carry=0.0,
@@ -1408,16 +1464,17 @@ class G1CaTraEnv(G1CatEnv):
             "foot_balance_trav":   self._cost_foot_balance(data, info["navi2world_pose"], move_flag),
             "foot_far":            self._cost_foot_far(data),
             "straight_knee_trav":  self._cost_straight_knee(data.qpos[jp.array(self._knee_indices) + 7]),
+            "feet_rotation":       self._reward_feet_rotation(data, info["navi2world_rot"]),
             "smoothness_action":   self._cost_smoothness_action(action, info["last_act"], info["last_last_act"]),
             "forward_progress":    self._reward_forward_progress(info["global_lin_vel"], cmd_vel),
             "upper_body_align":    jp.sum(jp.square(info["tors_pos"][:2] - info["pelv_pos"][:2]))
                                  + jp.sum(jp.square(info["head_pos"][:2] - info["pelv_pos"][:2])),
             "headgf": self._re_gf0(info["headgf"], info["head_vel"], info["headdf"],
-                                    (move_flag[None] < 0.5) | (info["head_pos"][..., 0] > 1.5), tau=0.5),
+                                    (move_flag[None] < 0.5) | (info["head_pos"][..., 0] > 1.5), tau=1.5),
             "feetgf": self._re_gf0(info["feetgf"], info["feet_vel"], info["feetdf"],
-                                    (move_flag[None] < 0.5) | (info["gait_mask"] == 1) | (info["feet_pos"][..., 0] > 1.5), tau=0.3),
+                                    (move_flag[None] < 0.5) | (info["gait_mask"] == 1) | (info["feet_pos"][..., 0] > 1.5), tau=1.5),
             "handsgf": self._re_gf0(info["handsgf"], info["hands_vel"], info["handsdf"],
-                                     (move_flag[None] < 0.5) | (info["hands_pos"][..., 0] > 1.5), tau=0.5),
+                                     (move_flag[None] < 0.5) | (info["hands_pos"][..., 0] > 1.5), tau=1.5),
             "headdf":  self._re_sdf(info["headdf"]),
             "feetdf":  self._re_sdf(info["feetdf"]),
             "handsdf": self._re_sdf(info["handsdf"]),
@@ -1431,6 +1488,7 @@ class G1CaTraEnv(G1CatEnv):
             "grasp_symmetry_carry": grasp_symmetry,
             "palm_orient_carry":    palm_orient,
             "hands_level_carry":    hands_level,
+            "box_upright_carry":    jp.exp(-box_tilt_angle ** 2),
         }
 
         # -----------------------------------------------------------------------
@@ -1460,6 +1518,36 @@ class G1CaTraEnv(G1CatEnv):
         cmd_dir = cmd_xy / cmd_norm
         v_along_cmd = jp.dot(global_lin_vel[:2], cmd_dir)
         return jp.clip(v_along_cmd, 0.0, cmd_norm)
+
+    def _reward_feet_rotation(self, data: mjx.Data, navi2world_rot: jax.Array) -> jax.Array:
+        """Reward clean knee + ankle alignment with the navigation frame.
+        Ported verbatim from G1CatPriEnv._reward_feet_rotation (env_cat_pri.py:890).
+        Five off-axis terms (knee roll/yaw, ankle roll/pitch/yaw) summed inside exp(-.).
+        Peaks at 1.0 when legs are vertical with feet flat and toes pointing forward;
+        falls off as any element drifts. Indirectly penalizes deep crouching because
+        deep knee bend forces ankle pitch compensation to keep feet flat.
+        """
+        knees2world_rot = jp.concat([
+            data.xmat[self.body_id_knee_l][None],
+            data.xmat[self.body_id_knee_r][None],
+        ])
+        knees2navi_rot = navi2world_rot.T[None] @ knees2world_rot
+        ankles2world_rot = jp.concat([
+            data.xmat[self.body_id_ankle_l][None],
+            data.xmat[self.body_id_ankle_r][None],
+        ])
+        ankles2navi_rot = navi2world_rot.T[None] @ ankles2world_rot
+
+        knees_roll_err  = jp.sum(jp.abs(knees2navi_rot[:, 2, 1]))
+        knees_yaw_err   = jp.sum(jp.abs(knees2navi_rot[:, 0, 1]))
+        ankles_roll_err = jp.sum(jp.abs(ankles2navi_rot[:, 1, 2]))
+        ankles_pitch_err = jp.sum(jp.abs(ankles2navi_rot[:, 0, 2]))
+        ankles_yaw_err  = jp.sum(jp.square(ankles2navi_rot[:, 0, 1]))
+
+        return jp.exp(-1.0 * (
+            knees_roll_err + knees_yaw_err
+            + ankles_roll_err + ankles_pitch_err + ankles_yaw_err
+        ))
 
 
 @cat_ppo.registry.register("G1CaTra", "command_to_reference_fn")

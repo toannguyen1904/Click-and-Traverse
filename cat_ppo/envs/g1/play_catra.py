@@ -28,6 +28,7 @@ from cat_ppo.envs.g1.play_cat import (
     world_to_navi_vel,
     delay_body_pos,
     noisy_rootpose,
+    geoms_colliding,
     EPS,
 )
 
@@ -53,8 +54,9 @@ _BOX_CORNER_SIGNS = np.array([
 
 
 @cat_ppo.registry.register("G1CaTra", "play_env_class")
+@cat_ppo.registry.register("G1CaTraPri", "play_env_class")
 class PlayG1CaTraEnv(BaseEnv):
-    """CPU inference env for two-stage G1CaTra (251-dim state)."""
+    """CPU inference env for two-stage G1CaTra. Set self.pri=True to use the G1CaTraPri actor obs."""
 
     def __init__(
         self,
@@ -64,6 +66,7 @@ class PlayG1CaTraEnv(BaseEnv):
         sim_dt: float = 0.002,
         headless: bool = False,
     ):
+        self.pri = False
         xml_path = consts.CATRA_MESH_XML
         tmp_xml = set_scene_for_xml(xml_path, config.pf_config.path)
         self.mj_model = mujoco.MjModel.from_xml_path(tmp_xml)
@@ -365,6 +368,65 @@ class PlayG1CaTraEnv(BaseEnv):
 
         stage_flag = np.array([1.0]) if info["step"] >= self._config.stage1_steps else np.array([0.0])
 
+        gait_phase = np.hstack([np.cos(info["phase"]), np.sin(info["phase"])])
+        ids = self.action_joint_ids
+
+        if self.pri:
+            # G1CaTraPri actor obs: noiseless world-frame state + body pos/vel + box world pose/vel,
+            # minus the trailing 31 DR dims (rfi_lim_scale + kp_scale + kd_scale). Total 302 dims.
+            # PF block uses the stored (delayed, normalized) info values — same approximation as the
+            # G1CatPri play branch in play_cat.py.
+            pf_noiseless = np.hstack([
+                info["headgf"].reshape(-1), info["headbf"].reshape(-1), info["headdf"].reshape(-1),
+                info["pelvgf"].reshape(-1), info["pelvbf"].reshape(-1), info["pelvdf"].reshape(-1),
+                info["torsgf"].reshape(-1), info["torsbf"].reshape(-1), info["torsdf"].reshape(-1),
+                info["feetgf"].reshape(-1), info["feetbf"].reshape(-1), info["feetdf"].reshape(-1),
+                info["handsgf"].reshape(-1), info["handsbf"].reshape(-1), info["handsdf"].reshape(-1),
+                info["kneesgf"].reshape(-1), info["kneesbf"].reshape(-1), info["kneesdf"].reshape(-1),
+                info["shldsgf"].reshape(-1), info["shldsbf"].reshape(-1), info["shldsdf"].reshape(-1),
+                info["boxgf"].reshape(-1), info["boxbf"].reshape(-1), info["boxdf"].reshape(-1),
+            ])
+
+            linvel_pelvis = self.get_local_linvel("pelvis")
+            pelv_pos  = self.mj_data.site_xpos[self._pelvis_imu_site_id]
+            tors_pos  = self.mj_data.site_xpos[self._torso_imu_site_id]
+            shlds_pos = self.mj_data.site_xpos[self._shlds_site_id]
+            knees_pos = self.mj_data.site_xpos[self._knees_site_id]
+
+            box_linvel = self.mj_data.qvel[BOX_QVEL_START:BOX_QVEL_START + 3]
+            box_angvel = self.mj_data.qvel[BOX_QVEL_START + 3:BOX_QVEL_START + 6]
+
+            torso_xmat = self.mj_data.site_xmat[self._torso_imu_site_id].reshape(3, 3)
+            navi2world_rot = base2navi_transform(pelvis_xmat)
+            torso2navi_rot = navi2world_rot.T @ torso_xmat
+            navi_torso_rpy = R.from_matrix(torso2navi_rot).as_euler("xyz", degrees=False)
+
+            feet_contact = np.array(
+                [float(geoms_colliding(self.mj_data, g, self._floor_geom_id)) for g in self._feet_geom_id]
+            )
+
+            state_pri = np.concatenate([
+                # noiseless proprio block (matches env_catra.py L1113-1122, minus box_pos_local/quat_local)
+                gyro_pelvis, gvec_pelvis,
+                (joint_angles - self._default_qpos)[ids],
+                joint_vel[ids],
+                info["last_act"],
+                info["motor_targets"][ids],
+                info["command"], np.array([info["foot_height"]]), gait_phase,
+                pf_noiseless,
+                box_size,
+                stage_flag,
+                # privileged extras (matches env_catra.py L1124-1130; DR dims dropped)
+                linvel_pelvis,
+                pelv_pos.reshape(-1), tors_pos.reshape(-1), info["head_pos"].reshape(-1),
+                shlds_pos.reshape(-1), info["hands_pos"].reshape(-1),
+                knees_pos.reshape(-1), info["feet_pos"].reshape(-1),
+                info["head_vel"].reshape(-1), info["hands_vel"].reshape(-1), info["feet_vel"].reshape(-1),
+                box_pos_world, box_quat_world, box_linvel, box_angvel,
+                navi_torso_rpy[:2], info["gait_mask"], feet_contact,
+            ])
+            return {"state": np.nan_to_num(state_pri)}
+
         # Nav-frame transform
         navi2world_rot  = base2navi_transform(pelvis_xmat)
         navi2world_pose = np.eye(4)
@@ -406,9 +468,6 @@ class PlayG1CaTraEnv(BaseEnv):
         boxbf_n = world_to_navi_vel(navi2world_pose, info["boxbf"].reshape(-1, 3))
         boxbf_n = boxbf_n * (info["boxdf"] < 0.5)
         boxdf_c = np.clip(info["boxdf"], -1.0, 0.5)
-
-        gait_phase = np.hstack([np.cos(info["phase"]), np.sin(info["phase"])])
-        ids = self.action_joint_ids
 
         pf = np.hstack([
             headgf.reshape(-1), headbf.reshape(-1), headdf.reshape(-1),

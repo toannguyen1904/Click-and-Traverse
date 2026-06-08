@@ -159,9 +159,15 @@ def _apply_args_to_config(args: Args, policy_cfg, env_config, debug: bool):
         env_config.warmstart_states_path = args.warmstart_states_path
         if args.stage1_steps < 0:
             env_config.stage1_steps = 0
-        # Swap in a warmstart-aware DR function that carries box mass/size from the state file
-        from cat_ppo.envs.g1.env_catra import make_warmstart_domain_randomize_catra
-        policy_cfg.randomization_fn = make_warmstart_domain_randomize_catra(args.warmstart_states_path)
+        # If the task config opted out of DR (e.g. G1CaTraPri teacher), keep DR off and
+        # use a stripped-down warm-start fn that only handles box mass/size + index dispatch.
+        # Otherwise use the full DR-on warm-start fn (existing G1CaTra behavior).
+        if policy_cfg.randomization_fn is None:
+            from cat_ppo.envs.g1.env_catra import make_warmstart_only_catra
+            policy_cfg.randomization_fn = make_warmstart_only_catra(args.warmstart_states_path)
+        else:
+            from cat_ppo.envs.g1.env_catra import make_warmstart_domain_randomize_catra
+            policy_cfg.randomization_fn = make_warmstart_domain_randomize_catra(args.warmstart_states_path)
     env_config.pf_config.path = args.obs_path  # directory with sdf.npy, bf.npy, gf.npy for HumanoidPF
 
 def _prepare_training_params(cfg, ckpt_path: Path):
