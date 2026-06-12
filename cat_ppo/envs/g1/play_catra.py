@@ -55,8 +55,14 @@ _BOX_CORNER_SIGNS = np.array([
 
 @cat_ppo.registry.register("G1CaTra", "play_env_class")
 @cat_ppo.registry.register("G1CaTraPri", "play_env_class")
+@cat_ppo.registry.register("G1CaTra2A", "play_env_class")
+@cat_ppo.registry.register("G1CaTra2APri", "play_env_class")
 class PlayG1CaTraEnv(BaseEnv):
-    """CPU inference env for two-stage G1CaTra. Set self.pri=True to use the G1CaTraPri actor obs."""
+    """CPU inference env for two-stage G1CaTra. Set self.pri=True to use the privileged actor obs.
+
+    Shared by single-agent (G1CaTra/G1CaTraPri) and two-agent (G1CaTra2A/G1CaTra2APri) tasks:
+    the actor observation is identical; the two-agent case just runs two policies and
+    concatenates their actions before calling step() (handled by the player, not this env)."""
 
     def __init__(
         self,

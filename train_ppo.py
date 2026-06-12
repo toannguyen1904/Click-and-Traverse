@@ -18,7 +18,11 @@ import cat_ppo
 from cat_ppo import update_file_handler
 from cat_ppo.constant import PATH_LOG
 from cat_ppo.learning.policy.ppo import train as ppo # brax.training.agents.ppo
+from cat_ppo.learning.policy.ppo import train_2a as ppo_2a  # two-agent (upper/lower) PPO
 from cat_ppo.learning.train.pf_utils import wrap_for_brax_training_reset
+
+# Tasks that use the two-agent (separate upper/lower actor+critic) PPO stack.
+TWO_AGENT_TASKS = ("G1CaTra2A", "G1CaTra2APri")
 
 if os.environ.get("SWANLAB_SYNC_WANDB", "").strip().lower() in ("1", "true", "yes"):
     import swanlab
@@ -259,11 +263,24 @@ def train(args: Args):
     task_cfg.env_config = env_cfg
     policy_params = _prepare_training_params(policy_cfg, ckpt_path)
 
+    # Two-agent tasks: swap in the 2A trainer and a network factory that builds
+    # separate upper/lower actor+critic networks (action sizes bound here).
+    is_2a = args.task in TWO_AGENT_TASKS
+    if is_2a:
+        from cat_ppo.learning.policy.ppo.networks_2a import make_ppo_networks_2a
+        policy_params["network_factory"] = functools.partial(
+            make_ppo_networks_2a,
+            action_size_lower=env_cfg.num_act_lower,
+            action_size_upper=env_cfg.num_act_upper,
+            **task_cfg.policy_config.network_factory,
+        )
+    trainer = ppo_2a.train if is_2a else ppo.train
+
     # initialize wandb
     if not debug_mode:
         _init_wandb(args, exp_name, env_class, task_cfg, ckpt_path)
 
-    train_fn = functools.partial(ppo.train, **policy_params)    # prefill arguments in policy_params. functols.partial(func, **kwargs) returns a new function with the arguments prefilled in the original function func.
+    train_fn = functools.partial(trainer, **policy_params)    # prefill arguments in policy_params. functols.partial(func, **kwargs) returns a new function with the arguments prefilled in the original function func.
     times = [time.monotonic()]
 
     env = env_class(task_type=env_cfg.task_type, config=env_cfg)
@@ -285,7 +302,25 @@ def train(args: Args):
 
     logging.info(f"Run {exp_name} Train done.")
 
-    if args.convert_onnx:
+    if args.convert_onnx and is_2a:
+        try:
+            from cat_ppo.eval.brax2onnx import export_2a_onnx, get_latest_ckpt
+
+            ckpt_dir = get_latest_ckpt(ckpt_path)
+            obs_size = {
+                'privileged_state': (env_cfg.num_pri,),
+                'state': (env_cfg.num_obs,),
+            }
+            export_2a_onnx(
+                ckpt_dir, params, obs_size,
+                env_cfg.num_act_lower, env_cfg.num_act_upper,
+                policy_cfg.network_factory,
+            )
+        except ImportError:
+            logging.warning(
+                "TensorFlow is not installed. Please install TensorFlow to use ONNX conversion."
+            )
+    if args.convert_onnx and not is_2a:
         try:
             from cat_ppo.eval.brax2onnx import convert_jax2onnx, get_latest_ckpt
 

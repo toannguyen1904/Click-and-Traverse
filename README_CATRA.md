@@ -4,10 +4,12 @@ Two-stage end-to-end task for the Unitree G1 humanoid: the robot first reaches f
 
 This is **Phase 2** of a two-phase curriculum. It combines the pickup policy (Phase 1) with the collision-aware traversal policy (CAT, [arXiv:2601.16035](https://arxiv.org/abs/2601.16035)) into a single end-to-end task.
 
-Two task variants share the same environment dynamics, action space, rewards, and termination:
+Four task variants share the same environment dynamics, action space, termination, and (almost the same) rewards:
 
-- **`G1CaTra`** — deployable policy. Actor sees noisy, delayed, navigation-frame observations.
-- **`G1CaTraPri`** — privileged-actor variant (teacher for distillation). Actor sees noiseless world-frame observations directly. Domain randomization is disabled. Same critic obs as `G1CaTra`. This is the analogue of `G1CatPri` for the carry-and-traverse setting.
+- **`G1CaTra`** — deployable single-agent policy. Actor sees noisy, delayed, navigation-frame observations.
+- **`G1CaTraPri`** — privileged-actor single-agent variant (teacher for distillation). Actor sees noiseless world-frame observations directly. Domain randomization is disabled. Same critic obs as `G1CaTra`. The analogue of `G1CatPri` for carry-and-traverse.
+- **`G1CaTra2A`** — **two-agent** version: the lower body (legs) and upper body (arms) use **separate actor + critic networks** (4 networks total). Deployable actor obs. See [Two-Agent Variants](#two-agent-variants-g1catra2a--g1catra2apri).
+- **`G1CaTra2APri`** — two-agent + privileged actor + DR off (two-agent teacher).
 
 ---
 
@@ -24,10 +26,14 @@ Two task variants share the same environment dynamics, action space, rewards, an
 | Box placement | 0.3 m in front of robot on a support pillar (default), or loaded from warm-start file |
 | Success criterion | Box lifted ≥ 10 cm in Stage 1 AND box still held + robot reaches PF target by Stage 2 end |
 
-| Task | Actor obs | Critic obs | Domain rand | Deployable |
-|---|---:|---:|---|---|
-| `G1CaTra` | 239 | 333 | on (`domain_randomize_catra`) | yes |
-| `G1CaTraPri` | 302 | 333 | **off** | no (uses ground-truth signals) |
+| Task | Agents | Actor obs | Critic obs | Action | Domain rand | Deployable |
+|---|---|---:|---:|---|---|---|
+| `G1CaTra` | 1 | 239 | 333 | 20 | on (`domain_randomize_catra`) | yes |
+| `G1CaTraPri` | 1 | 302 | 333 | 20 | **off** | no (ground-truth signals) |
+| `G1CaTra2A` | 2 (legs / arms) | 239 | 333 | 12 + 8 | on | yes |
+| `G1CaTra2APri` | 2 (legs / arms) | 302 | 333 | 12 + 8 | **off** | no |
+
+> Action space is currently **20 DOF** (12 legs + 8 arms; 3 waist joints temporarily held at default). The two-agent split is lower = 12 legs, upper = 8 arms.
 
 ---
 
@@ -150,6 +156,7 @@ All rewards are multiplied by `dt`. The reward set is identical for `G1CaTra` an
 | `joint_torque` | -1e-4 | Penalize high motor torque |
 | `smoothness_joint` | -1e-6 | Penalize jerky joint motion |
 | `joint_limits` | -1.0 | Penalize joint limit violations |
+| `hip_yaw_lim` | -2.0 | Penalize hip-yaw joints outside [-0.5, 0.5] rad (linear out-of-range) |
 
 ### Stage 1 — Pickup Rewards (active when step < stage1_steps)
 
@@ -186,16 +193,17 @@ Navigation rewards (from `G1CatEnv`):
 | `tracking_orientation` | 2.0 | Match commanded yaw orientation |
 | `tracking_root_field` | 1.0 | Follow PF velocity command |
 | `body_motion` | -0.5 | Penalize undesired body translation |
-| `body_rotation` | 1.0 | Reward upright body alignment |
+| `body_rotation` | 3.0 | Reward leg alignment with the navigation/forward axis |
 | `foot_contact_trav` | -1.0 | Gait-consistent foot contact |
 | `foot_clearance` | -15.0 | Penalize foot scuffing |
 | `foot_slip_trav` | -0.5 | Penalize stance foot slip |
 | `foot_balance_trav` | -30.0 | Foot/COM balance |
-| `foot_far` | 0.0 | Foot overstep penalty (scaled off) |
+| `foot_far` | 0.0 | Penalize feet too **close** (< 0.35 m) — scaled off |
+| `feet_apart` | -2.0 | Penalize feet too **far apart** (> 0.5 m): `clip(dist − 0.5, 0, ∞)` |
 | `straight_knee_trav` | -30.0 | Discourage locked knees during locomotion |
 | `feet_rotation` | 1.0 | Reward clean knee+ankle alignment with nav frame (knee roll/yaw, ankle roll/pitch/yaw → 0). Indirect anti-crouch; peaks at +1.0 in a tall, forward-aligned stance. Ported from `G1CatPri`. |
 | `smoothness_action` | -1e-3 | Smooth action transitions |
-| `forward_progress` | 20.0 | Linear reward for velocity in the command direction: `clip(v·cmd_dir, 0, ‖cmd‖)`. Gives nonzero gradient from a dead stop, unlike the exp-based `tracking_root_field`. |
+| `forward_progress` | 5.0 | Linear reward for velocity in the command direction: `clip(v·cmd_dir, 0, ‖cmd‖)`. Gives nonzero gradient from a dead stop, unlike the exp-based `tracking_root_field`. |
 | `upper_body_align` | -0.0 | Penalize XY drift of torso and head from pelvis (scaled off; previously −2.0) |
 | `headgf/handsgf/feetgf` | 0.0 | Body goal field tracking; set via `--overheadgf` / `--lateralgf` / `--groundgf` |
 | `headdf/handsdf/feetdf/kneesdf/shldsdf` | 0.0 | Body distance field penalties; set via `--overheaddf` / `--lateraldf` / `--grounddf` |
@@ -288,8 +296,10 @@ MjxEnv (mujoco_playground)
   └─ G1Env
        └─ G1LocoEnv
             └─ G1CatEnv
-                 └─ G1CaTraEnv          ← deployable task
-                      ├─ G1CaTraPriEnv  ← privileged-actor variant (overrides _get_obs only)
+                 └─ G1CaTraEnv             ← deployable single-agent task
+                      ├─ G1CaTraPriEnv     ← privileged-actor variant (overrides _get_obs only)
+                      ├─ G1CaTra2AEnv      ← two-agent (reward split + per-agent info)
+                      │    └─ G1CaTra2APriEnv  ← two-agent + privileged actor
                       └─ G1PickupEnv
 ```
 
@@ -321,7 +331,12 @@ MjxEnv (mujoco_playground)
 |------|---------|
 | [cat_ppo/envs/g1/env_catra.py](cat_ppo/envs/g1/env_catra.py) | Main training environment, config, DR functions (default + warm-start + warm-start-only) |
 | [cat_ppo/envs/g1/env_catra_pri.py](cat_ppo/envs/g1/env_catra_pri.py) | `G1CaTraPriEnv` subclass and `g1_catra_pri_task_config` |
-| [cat_ppo/envs/g1/play_catra.py](cat_ppo/envs/g1/play_catra.py) | CPU inference env for ONNX playback. Dual-registered for both tasks; toggles between actor obs styles via `env.pri` (set by `--pri` in `mj_onnx_play`) |
+| [cat_ppo/envs/g1/env_catra_2a.py](cat_ppo/envs/g1/env_catra_2a.py) | `G1CaTra2AEnv` / `G1CaTra2APriEnv`, reward grouping (lower/upper/shared), per-group regularizer split, 2A configs |
+| [cat_ppo/learning/policy/ppo/networks_2a.py](cat_ppo/learning/policy/ppo/networks_2a.py) | `make_ppo_networks_2a` (4 nets), `make_inference_fn_2a` (combined policy that concatenates `[a_lower, a_upper]`) |
+| [cat_ppo/learning/policy/ppo/losses_2a.py](cat_ppo/learning/policy/ppo/losses_2a.py) | `PPONetworkParams2A`, `compute_ppo_loss_2a` (per-agent GAE on each reward stream, summed loss) |
+| [cat_ppo/learning/policy/ppo/train_2a.py](cat_ppo/learning/policy/ppo/train_2a.py) | Forked PPO trainer for the two-agent stack |
+| [train_ppo_catra_2a.py](train_ppo_catra_2a.py) | Two-agent training entry point |
+| [cat_ppo/envs/g1/play_catra.py](cat_ppo/envs/g1/play_catra.py) | CPU inference env for ONNX playback. Registered for all four tasks; toggles actor obs style via `env.pri` (`--pri` in `mj_onnx_play`) |
 | [cat_ppo/envs/g1/pickup_warmstart.py](cat_ppo/envs/g1/pickup_warmstart.py) | `load_pickup_inference_fn`, `pickup_obs_from_data` (used by warm-start generation) |
 | [cat_ppo/eval/warmstart_generation.py](cat_ppo/eval/warmstart_generation.py) | Offline warm-start state generation implementation |
 | [generate_warmstart_states.py](generate_warmstart_states.py) | CLI entry point for generating warm-start states |
@@ -330,6 +345,42 @@ MjxEnv (mujoco_playground)
 | [check_catra.py](check_catra.py) | CPU-based visualization (static initial state) |
 | [data/assets/unitree_g1/scene_mjx_feetonly_flat_terrain_catra.xml](data/assets/unitree_g1/scene_mjx_feetonly_flat_terrain_catra.xml) | MJX training scene |
 | [data/assets/unitree_g1/scene_mjx_feetonly_mesh_catra.xml](data/assets/unitree_g1/scene_mjx_feetonly_mesh_catra.xml) | CPU play/eval scene |
+
+---
+
+## Two-Agent Variants (G1CaTra2A / G1CaTra2APri)
+
+The two-agent family splits the single 20-DOF policy into **two cooperating agents** so the lower body (locomotion/balance) and upper body (carry/grasp) — whose primary goals differ — can be learned by separate networks.
+
+### Architecture
+
+```
+Two actors:  π_lower(state) → a_legs(12)    π_upper(state) → a_arms(8)
+Two critics: V_lower(priv) → v_lower         V_upper(priv) → v_upper
+Action to env:  a = concat([a_legs, a_arms])     # 20-dim, matches action ordering (legs then arms)
+Reward:         per-agent streams r_lower, r_upper  (carried in info; see below)
+```
+
+- **4 networks total.** Both actors read the same actor obs (`state`); both critics read the same privileged obs (`privileged_state`). Each agent runs its own GAE on its own reward stream with its own value baseline; the two losses are **summed** into a single Adam step (shared hyperparameters).
+- **`G1CaTra2A`** = deployable actor obs (239). **`G1CaTra2APri`** = privileged actor obs (302, the `priv[:-31]` slice) with DR off — the two-agent teacher, exactly the `CaTra → CaTraPri` relationship applied to the two-agent base.
+- `G1CaTra2APriEnv` subclasses `G1CaTra2AEnv` and overrides only `_get_obs` (same privileged slice as `G1CaTraPri`).
+
+### Reward grouping
+
+The reward set is identical to single-agent CaTra; the env just routes each scaled term to one or both agents. SHARED terms feed **both** agents:
+
+- **SHARED** (box grasp + carry that needs hands *and* whole-body): `lift`, `lift_carry`, `box_pillar_contact`, `box_vertical`, `hold_stable`, `box_yaw_stable`, `box_centering`, `box_upright`, `box_upright_carry`, `boxdf`, plus `handsgf` / `handsdf` / `shldsdf` (hand/shoulder world position depends on both arm articulation and torso pose).
+- **LOWER-only** (legs + locomotion): all `foot_*` / `feet_*` / `knee*` / `straight_knee*` terms, `body_rotation`, `feet_rotation`, `feet_apart`, `hip_yaw_lim`, `headgf` / `headdf` (head is driven by torso/pelvis, not arms), and the root/locomotion terms `tracking_root_field`, `tracking_orientation`, `body_motion`, `forward_progress`, `base_height`, `upright`.
+- **UPPER-only** (arms/grasp): `reach(_carry)`, `hand_contact(_carry)`, `grasp_symmetry(_carry)`, `palm_orient(_carry)`, `hands_level(_carry)`, `upper_body_align`.
+- **Per-group regularizers**: the four whole-joint terms `joint_torque`, `joint_limits`, `smoothness_joint`, `smoothness`, `smoothness_action` are each replaced by `*_lower` / `*_upper` variants (same scale) so each agent only pays for its own joints / action dims.
+
+`G1CaTra2AEnv._post_init_catra` builds the lower/upper key sets from the actual config scale keys and **asserts every key is classified** — adding a new reward to CaTra requires classifying it in `_LOWER_KEYS` / `_UPPER_KEYS` / `_SHARED_KEYS` in [env_catra_2a.py](cat_ppo/envs/g1/env_catra_2a.py) or the 2A env raises at construction.
+
+### Key implementation details
+
+- **Scalar `state.reward` + per-agent info.** Brax's `EpisodeWrapper` / `EvalWrapper` assume a scalar reward, so the env sets `state.reward = r_lower + r_upper` (for the wrappers/metrics) and carries `reward_lower` / `reward_upper` in `state.info`. The trainer pulls them via `generate_unroll(extra_fields=…)` and the loss consumes them per-agent. (`_assemble_reward` / `_record_agent_rewards` / `_extra_reward_info` hooks on `G1CaTraEnv`; no-ops for single-agent.)
+- **Action ordering.** `CATRA_ACTION_JOINT_NAMES` is legs then arms, so the combined policy concatenates lower-first `[a_lower, a_upper]`; reward index 0 = lower throughout.
+- **Checkpoints** save the 5-tuple `(normalizer, policy_lower, policy_upper, value_lower, value_upper)`.
 
 ---
 
@@ -412,7 +463,25 @@ python train_ppo_catra.py \
     --box 1.0
 ```
 
-### Per-body-group reward scales (apply to both tasks)
+### Train two-agent (G1CaTra2A / G1CaTra2APri)
+
+Same CLI and args; the entry point routes the two 2A tasks to the two-agent trainer ([train_2a.py](cat_ppo/learning/policy/ppo/train_2a.py)) and builds the 4-network factory automatically. For `G1CaTra2APri`, DR is off and `--warmstart_states_path` installs the DR-free warm-start fn.
+
+```bash
+python train_ppo_catra_2a.py \
+    --task G1CaTra2APri \
+    --exp_name catra2a_v1 \
+    --warmstart_states_path data/warmstart/catra_pickup_states.npz \
+    --obs_path data/assets/TypiObs/bar0 \
+    --groundgf 1.0 --grounddf 1.0 \
+    --lateralgf 1.0 --lateraldf 0.4 \
+    --overheadgf 1.0 --overheaddf 1.0 \
+    --box 1.0
+```
+
+Per-agent losses are logged under `training/lower/*` and `training/upper/*`. ONNX is auto-exported on completion (two files — see below).
+
+### Per-body-group reward scales (apply to all tasks)
 
 - `--groundgf` / `--grounddf` → `feetgf` / `feetdf`
 - `--lateralgf` / `--lateraldf` → `handsgf` / `handsdf` / `kneesdf` / `shldsdf`
@@ -424,11 +493,15 @@ All default to 0 (disabled).
 ### Export to ONNX
 
 ```bash
+# Single-agent: writes one policy.onnx into the latest checkpoint dir
 python -m cat_ppo.eval.brax2onnx --task G1CaTra    --exp_name <full_exp_name>
 python -m cat_ppo.eval.brax2onnx --task G1CaTraPri --exp_name <full_exp_name>
+
+# Two-agent: writes policy_lower.onnx (12-dim) and policy_upper.onnx (8-dim)
+python -m cat_ppo.eval.brax2onnx --task G1CaTra2APri --exp_name <full_exp_name>
 ```
 
-ONNX export auto-detects the actor obs size from the task config (`policy_obs_key="state"` → 239 for `G1CaTra`, 302 for `G1CaTraPri`).
+ONNX export auto-detects the actor obs size from the task config (`policy_obs_key="state"` → 239 for `G1CaTra`/`G1CaTra2A`, 302 for the `*Pri` variants). Two-agent export writes **two** ONNX files and validates each actor against its JAX output. Training auto-exports on completion for all tasks.
 
 ### Play in MuJoCo Viewer
 
@@ -439,13 +512,16 @@ python -m cat_ppo.eval.mj_onnx_play --task G1CaTra --exp_name <full_exp_name>
 # G1CaTraPri: privileged-actor policy, --pri flips the play env to build the 302-dim state
 python -m cat_ppo.eval.mj_onnx_play --task G1CaTraPri --pri --exp_name <full_exp_name>
 
-# Warm-start (either task): robot starts already holding the box, Stage 2 only
+# Two-agent: loads policy_lower.onnx + policy_upper.onnx and concatenates the actions
+python -m cat_ppo.eval.mj_onnx_play --task G1CaTra2APri --pri --exp_name <full_exp_name>
+
+# Warm-start (any task): robot starts already holding the box, Stage 2 only
 python -m cat_ppo.eval.mj_onnx_play --task G1CaTra --exp_name <full_exp_name> \
     --warmstart_states_path data/warmstart/catra_pickup_states.npz
 # Use --warmstart_idx <N> to load a specific state instead of random
 ```
 
-The play env (`PlayG1CaTraEnv`) is dual-registered for both tasks. The `--pri` flag sets `env.pri = True`, which switches `get_obs` between the deployable (239-dim) and privileged (302-dim) state builders.
+The play env (`PlayG1CaTraEnv`) is registered for all four tasks. `--pri` sets `env.pri = True` (switches between the deployable 239-dim and privileged 302-dim state builders). For two-agent tasks the player auto-detects `num_act_lower` in the config, loads both ONNX files, and concatenates `[a_lower, a_upper]` each step.
 
 ### Smoke Test (stage transition verification)
 

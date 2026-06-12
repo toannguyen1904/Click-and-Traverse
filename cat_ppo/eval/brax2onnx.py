@@ -164,6 +164,108 @@ def convert_jax2onnx(
         tf_model, input_signature=spec, opset=11, output_path=output_path
     )
 
+_TWO_AGENT_TASKS = ("G1CaTra2A", "G1CaTra2APri")
+
+
+def _validate_onnx(onnx_path, infer, obs_size, policy_obs_key, atol=1e-4):
+    """Check the exported ONNX actor matches the JAX actor's deterministic action."""
+    sess = rt.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+    obs = {
+        "state": np.random.randn(1, obs_size["state"][0]).astype(np.float32),
+        "privileged_state": np.random.randn(1, obs_size["privileged_state"][0]).astype(np.float32),
+    }
+    onnx_out = sess.run(["continuous_actions"], {"obs": obs[policy_obs_key]})[0][0]
+    jax_out = np.array(infer(obs, jax.random.PRNGKey(0))[0][0])
+    max_err = float(np.max(np.abs(onnx_out - jax_out)))
+    if max_err > atol:
+        raise AssertionError(f"ONNX/JAX mismatch for {onnx_path}: max abs err {max_err:.3e}")
+    logging.info(f"ONNX matches JAX for {onnx_path} (max abs err {max_err:.2e})")
+
+
+def export_2a_onnx(ckpt_dir, params, obs_size, num_act_lower, num_act_upper, network_factory_cfg):
+    """Export the two actors of a two-agent policy to policy_lower.onnx / policy_upper.onnx.
+
+    Works from in-memory params (the 5-tuple returned by train_2a:
+    (normalizer, policy_lower, policy_upper, value_lower, value_upper)) — no checkpoint reload.
+    `network_factory_cfg` is the task's policy_config.network_factory (policy/value obs keys +
+    hidden sizes). Each exported actor is validated against its JAX counterpart.
+    """
+    from cat_ppo.learning.policy.ppo.networks_2a import make_ppo_networks_2a
+
+    net_cfg = dict(network_factory_cfg)
+    policy_obs_key = net_cfg["policy_obs_key"]
+    hidden = net_cfg["policy_hidden_layer_sizes"]
+    normalizer, pl, pu = params[0], params[1], params[2]
+
+    net = make_ppo_networks_2a(
+        obs_size,
+        action_size_lower=num_act_lower,
+        action_size_upper=num_act_upper,
+        preprocess_observations_fn=lambda x, y: x,
+        **net_cfg,
+    )
+
+    def _infer(net_apply, dist, p):
+        def f(obs, key):
+            return dist.mode(net_apply(normalizer, p, obs)), {}
+        return f
+
+    agents = [
+        ("policy_lower.onnx", num_act_lower, pl,
+         net.policy_network_lower.apply, net.parametric_action_distribution_lower),
+        ("policy_upper.onnx", num_act_upper, pu,
+         net.policy_network_upper.apply, net.parametric_action_distribution_upper),
+    ]
+    for fname, act_size, pol_params, net_apply, dist in agents:
+        out_path = f"{ckpt_dir}/{fname}"
+        infer = _infer(net_apply, dist, pol_params)
+        convert_jax2onnx(
+            ckpt_dir=ckpt_dir,
+            output_path=out_path,
+            inference_fn=infer,
+            hidden_layer_sizes=hidden,
+            obs_size=obs_size,
+            action_size=act_size,
+            policy_obs_key=policy_obs_key,
+            jax_params=(normalizer, pol_params),
+            activation="swish",
+        )
+        _validate_onnx(out_path, infer, obs_size, policy_obs_key)
+        logging.info(f"Exported {out_path}")
+
+
+def main_2a(args, latest_ckpt, env, task_cfg):
+    """Restore a two-agent checkpoint and export both actor ONNX files."""
+    from mujoco_playground import wrapper
+    from cat_ppo.learning.policy.ppo import train_2a as ppo_2a
+    from cat_ppo.learning.policy.ppo.networks_2a import make_ppo_networks_2a
+
+    env_cfg = task_cfg.env_config
+    policy_config = task_cfg.policy_config
+
+    net_factory = functools.partial(
+        make_ppo_networks_2a,
+        action_size_lower=env_cfg.num_act_lower,
+        action_size_upper=env_cfg.num_act_upper,
+        **policy_config.network_factory,
+    )
+    train_fn = functools.partial(
+        ppo_2a.train,
+        num_timesteps=0,
+        episode_length=policy_config.episode_length,
+        normalize_observations=False,
+        restore_checkpoint_path=latest_ckpt,
+        network_factory=net_factory,
+        wrap_env_fn=wrapper.wrap_for_brax_training,
+        num_envs=jax.device_count(),
+    )
+    _, params, _ = train_fn(environment=env)
+    export_2a_onnx(
+        latest_ckpt, params, env.observation_size,
+        env_cfg.num_act_lower, env_cfg.num_act_upper, policy_config.network_factory,
+    )
+
+
 # --- CLI args ---
 @dataclass
 class Args:
@@ -192,6 +294,10 @@ def main(args: Args):
     env_cfg = task_cfg.env_config
     policy_config = task_cfg.policy_config
     env = env_class(task_type=env_cfg.task_type, config=env_cfg)
+
+    if args.task in _TWO_AGENT_TASKS:
+        main_2a(args, latest_ckpt, env, task_cfg)
+        return
 
     policy_obs_key = policy_config.network_factory.policy_obs_key
 

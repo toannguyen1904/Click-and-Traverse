@@ -15,6 +15,6 @@
 
 from cat_ppo.envs.g1 import env_loco, env_cat_pri, env_cat
 from cat_ppo.envs.g1 import play_cat
-from cat_ppo.envs.g1 import env_catra, env_catra_pri
+from cat_ppo.envs.g1 import env_catra, env_catra_pri, env_catra_2a
 from cat_ppo.envs.g1 import env_pickup, play_pickup
 from cat_ppo.envs.g1 import play_catra

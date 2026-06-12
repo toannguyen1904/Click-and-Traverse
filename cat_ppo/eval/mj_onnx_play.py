@@ -70,13 +70,20 @@ def play(args: Args):
     if args.box_mass is not None:
         env.mj_model.body_mass[env._box_body_id] = args.box_mass
 
-    if args.onnx_path is not None:
-        onnx_path = args.onnx_path
-    else:
-        ckpt_path = cat_ppo.get_latest_ckpt(args.exp_name)
-        onnx_path = ckpt_path / "policy.onnx"
     output_names = ["continuous_actions"]
-    policy = rt.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+    # Two-agent tasks load two policies (lower=legs, upper=arms) and concatenate actions.
+    is_2a = hasattr(env_cfg, "num_act_lower")
+    if is_2a:
+        ckpt_path = cat_ppo.get_latest_ckpt(args.exp_name)
+        policy_lower = rt.InferenceSession(str(ckpt_path / "policy_lower.onnx"), providers=["CPUExecutionProvider"])
+        policy_upper = rt.InferenceSession(str(ckpt_path / "policy_upper.onnx"), providers=["CPUExecutionProvider"])
+    else:
+        if args.onnx_path is not None:
+            onnx_path = args.onnx_path
+        else:
+            ckpt_path = cat_ppo.get_latest_ckpt(args.exp_name)
+            onnx_path = ckpt_path / "policy.onnx"
+        policy = rt.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
 
     # Set up video recorder if requested
     renderer = None
@@ -110,9 +117,12 @@ def play(args: Args):
     try:
         while True:
             obs = state.obs["state"].reshape(1, -1).astype(np.float32)
-            onnx_input = {"obs": obs}
-            action = policy.run(output_names, onnx_input)[0]
-            action = action[0]
+            if is_2a:
+                a_lower = policy_lower.run(output_names, {"obs": obs})[0][0]
+                a_upper = policy_upper.run(output_names, {"obs": obs})[0][0]
+                action = np.concatenate([a_lower, a_upper])  # lower-first, matches action ordering
+            else:
+                action = policy.run(output_names, {"obs": obs})[0][0]
             state = env.step(state, action)
 
             if renderer is not None:

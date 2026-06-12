@@ -70,6 +70,12 @@ def torque_step_catra(
         n_substeps: int = 1,
 ) -> tuple[jax.Array, mjx.Data]:
     """Like torque_step but slices only robot joints from qpos/qvel (ignoring box freejoint)."""
+    # Sanitize the action-derived target: a NaN/Inf policy output would otherwise
+    # produce NaN torques that wedge mjx.step's solver in a non-terminating loop
+    # (GPU pins at 100% forever). nan_to_num maps NaN->0, +/-Inf->finite extremes,
+    # which the per-substep torque clip below then bounds to the actuator limits.
+    qpos_des = jp.nan_to_num(qpos_des)
+
     def single_step(carry, _):
         rng, data = carry
         rng, rng_rfi = jax.random.split(rng, 2)
@@ -80,6 +86,9 @@ def torque_step_catra(
 
         rfi_noise = rfi_lim_scale * jax.random.uniform(rng_rfi, shape=torque.shape, minval=-1.0, maxval=1.0)
         torque += rfi_noise
+        # nan_to_num before clip: clip alone passes NaN through (NaN compares False),
+        # so a NaN here (e.g. from already-diverged qpos/qvel) would still reach ctrl.
+        torque = jp.nan_to_num(torque)
         torque = jp.clip(torque, -torque_limit, torque_limit)
 
         data = data.replace(ctrl=torque)
@@ -362,9 +371,9 @@ def g1_catra_task_config() -> config_dict.ConfigDict:
         action_repeat=1,
         action_scale=0.5,
         history_len=15,
-        num_obs=239,
-        num_pri=333,
-        num_act=20,
+        num_obs=239,    # TEMP 20-DOF (no waist); 23-DOF (waist) would be 251 (+3 joints x 4 obs fields)
+        num_pri=333,    # TEMP 20-DOF; 23-DOF would be 345
+        num_act=20,     # TEMP: 12 legs + 8 arms (3 waist removed)
         restricted_joint_range=False,
         soft_joint_pos_limit_factor=0.95,
         gait_config=config_dict.create(
@@ -397,6 +406,7 @@ def g1_catra_task_config() -> config_dict.ConfigDict:
                 joint_torque=-1e-4,
                 smoothness_joint=-1e-6,
                 joint_limits=-1.0,
+                hip_yaw_lim=-2.0,    # penalize hip-yaw joints outside [-0.5, 0.5] rad
                 # --- Stage 1 only: Pickup rewards ---
                 # reach=1.5,
                 # lift=2.0,
@@ -431,16 +441,17 @@ def g1_catra_task_config() -> config_dict.ConfigDict:
                 tracking_orientation=2.0,
                 tracking_root_field=1.0,
                 body_motion=-0.5,
-                body_rotation=1.0,
+                body_rotation=3.0,
                 foot_contact_trav=-1.0,
                 foot_clearance=-15.0,
                 foot_slip_trav=-0.5,
                 foot_balance_trav=-30.0,
                 foot_far=0.0,
+                feet_apart=-2.0,    # penalize feet farther than 0.5 m apart
                 straight_knee_trav=-30.0,
                 feet_rotation=1.0,           # reward clean knee+ankle alignment with nav frame; indirect anti-crouch (ported from G1CatPri)
                 smoothness_action=-1e-3,
-                forward_progress=20.0,   #5.0,
+                forward_progress=5.0,   #5.0,
                 upper_body_align=-0.0, #-2.0,
                 headgf=0.0,    # overwritten by --overhead in train_ppo.py
                 handsgf=0.0,   # overwritten by --lateralgf
@@ -609,6 +620,12 @@ class G1CaTraEnv(G1CatEnv):
         self._hand_geom_ids     = np.array([
             self._mj_model.geom("left_hand_collision").id,
             self._mj_model.geom("right_hand_collision").id,
+        ])
+
+        # Hip-yaw joint qpos indices (offset to drop into qpos[7:] via +7), for hip_yaw_lim reward.
+        self._hip_yaw_indices = jp.array([
+            self._mj_model.joint(f"{side}_hip_yaw_joint").qposadr - 7
+            for side in ["left", "right"]
         ])
 
         # Warm-start: load pre-generated states from file if configured
@@ -870,6 +887,7 @@ class G1CaTraEnv(G1CatEnv):
             "box_xy_init": box_xy,
             "box_yaw_init": box_yaw,
         }
+        info.update(self._extra_reward_info())
 
         metrics = {}
         for k in self._config.reward_config.scales.keys():
@@ -877,7 +895,8 @@ class G1CaTraEnv(G1CatEnv):
 
         feet_contact = jp.array([geoms_colliding(data, geom_id, self._floor_geom_id) for geom_id in self._feet_geom_id])
         obs = self._get_obs(data, info, feet_contact)
-        reward, done = jp.zeros(2)
+        reward = self._initial_reward()
+        done = jp.zeros(())
         return mjx_env.State(data, obs, reward, done, metrics, info)
 
     def step(self, state: mjx_env.State, action: jax.Array) -> mjx_env.State:
@@ -1076,11 +1095,9 @@ class G1CaTraEnv(G1CatEnv):
         rewards = {k: v * self._config.reward_config.scales[k] for k, v in rewards.items()}
 
         # Clip reward for stage 2, just like in CAT
-        raw_reward = sum(rewards.values()) * self.dt
         in_stage2 = state.info["step"] >= self._config.stage1_steps
-        reward = jp.where(in_stage2, jp.clip(raw_reward, 0.0, 10000.0), raw_reward)
-
-        # reward = sum(rewards.values()) * self.dt
+        reward = self._assemble_reward(rewards, in_stage2)
+        self._record_agent_rewards(state.info, rewards, in_stage2)
 
         timeout = state.info["step"] >= self._config.episode_length
         state.info["step"] = jp.where(done | timeout, 0, state.info["step"])
@@ -1096,6 +1113,27 @@ class G1CaTraEnv(G1CatEnv):
         done = done.astype(reward.dtype)
         state = state.replace(data=data, obs=obs, reward=reward, done=done)
         return state
+
+    def _initial_reward(self) -> jax.Array:
+        """Scalar reward placed in State at reset."""
+        return jp.zeros(())
+
+    def _assemble_reward(self, rewards: dict[str, jax.Array], in_stage2: jax.Array) -> jax.Array:
+        """Collapse the scaled per-term reward dict into the scalar env reward.
+        Stage-2 reward is clipped to [0, 1e4] exactly as in CAT. The two-agent env
+        overrides this to return the (lower + upper) sum so the brax wrappers still see a
+        scalar; the per-agent split is carried in info via `_record_agent_rewards`."""
+        raw_reward = sum(rewards.values()) * self.dt
+        return jp.where(in_stage2, jp.clip(raw_reward, 0.0, 10000.0), raw_reward)
+
+    def _extra_reward_info(self) -> dict[str, jax.Array]:
+        """Extra info keys (e.g. per-agent rewards) added at reset. Empty for the
+        single-agent env; the two-agent env adds 'reward_lower' / 'reward_upper'."""
+        return {}
+
+    def _record_agent_rewards(self, info: dict, rewards: dict[str, jax.Array], in_stage2: jax.Array) -> None:
+        """Hook to stash per-agent rewards into info during step. No-op for single agent."""
+        pass
 
     def _box_corners_world(self, data: mjx.Data, box_size: jax.Array) -> jax.Array:
         # Returns (8, 3) world positions of the box's corners. box_size is the (hx, hy, hz) half-extents.
@@ -1312,6 +1350,7 @@ class G1CaTraEnv(G1CatEnv):
         joint_torque   = self._cost_torque(data.actuator_force)
         smoothness_joint = self._cost_smoothness_joint(data, info["last_joint_vel"])
         joint_limits   = self._cost_joint_pos_limits(data.qpos[7:7 + NUM_ROBOT_JOINTS])
+        hip_yaw_lim    = self._cost_hip_yaw(data.qpos[self._hip_yaw_indices + 7])
 
         # -----------------------------------------------------------------------
         # Stage 1: Pickup reward computation
@@ -1463,6 +1502,7 @@ class G1CaTraEnv(G1CatEnv):
             "foot_slip_trav":      self._cost_foot_slip(data, info["gait_mask"]),
             "foot_balance_trav":   self._cost_foot_balance(data, info["navi2world_pose"], move_flag),
             "foot_far":            self._cost_foot_far(data),
+            "feet_apart":          self._cost_feet_apart(data),
             "straight_knee_trav":  self._cost_straight_knee(data.qpos[jp.array(self._knee_indices) + 7]),
             "feet_rotation":       self._reward_feet_rotation(data, info["navi2world_rot"]),
             "smoothness_action":   self._cost_smoothness_action(action, info["last_act"], info["last_last_act"]),
@@ -1498,6 +1538,7 @@ class G1CaTraEnv(G1CatEnv):
             "joint_torque":    joint_torque,
             "smoothness_joint": smoothness_joint,
             "joint_limits":    joint_limits,
+            "hip_yaw_lim":     hip_yaw_lim,
         }
         for k, v in stage1_dict.items():
             rewards[k] = jp.where(stage1_active, v, 0.0)
@@ -1507,6 +1548,26 @@ class G1CaTraEnv(G1CatEnv):
         for k, v in rewards.items():
             rewards[k] = jp.where(jp.isnan(v), 0.0, v)
         return rewards
+
+    def _cost_feet_apart(self, data: mjx.Data) -> jax.Array:
+        """Penalize the two feet being more than 0.5 m apart (over-wide stance).
+        Linear: 0 when feet are within 0.5 m, grows with the excess distance.
+        Complements _cost_foot_far, which penalizes feet too CLOSE (< 0.35 m).
+        returns: scalar >= 0.
+        """
+        foot_pos = data.site_xpos[self._feet_site_id]              # (2, 3) world positions of both feet
+        foot_distance = jp.linalg.norm(foot_pos[0] - foot_pos[1])  # scalar 3D distance
+        return jp.clip(foot_distance - 0.5, 0.0, None)
+
+    def _cost_hip_yaw(self, hip_yaw_pos: jax.Array) -> jax.Array:
+        """Penalize the two hip-yaw joints leaving the [-0.5, 0.5] rad range.
+        Linear out-of-range violation (same shape as _cost_joint_pos_limits), summed over both hips:
+        positive below -0.5 or above +0.5, zero inside.
+        hip_yaw_pos: (2,) hip-yaw joint angles [left, right].
+        returns: scalar >= 0.
+        """
+        out = jp.clip(-1.5 - hip_yaw_pos, 0.0, None) + jp.clip(hip_yaw_pos - 1.5, 0.0, None)
+        return jp.sum(out)
 
     def _reward_forward_progress(self, global_lin_vel: jax.Array, cmd_vel: jax.Array) -> jax.Array:
         """Reward velocity in the commanded direction, linear and always non-negative.

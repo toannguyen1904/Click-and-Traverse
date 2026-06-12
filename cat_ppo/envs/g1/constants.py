@@ -194,8 +194,10 @@ OBS_JOINT_NAMES = [
 BOX_SITE = "box_center"
 BOX_GEOM = "box_geom"
 
-# TEMP: 20-joint action space for CaTra: 12 legs + 8 arms (all 3 waist joints dropped).
-# Waist yaw/roll/pitch remain held at their default PD targets each step.
+# TEMP: 20-joint action space for CaTra: 12 legs + 8 arms (3 waist joints temporarily removed).
+# Waist yaw/roll/pitch held at default PD targets. Re-enable by uncommenting the 3 waist joints
+# below (ordering keeps lower=legs+waist contiguous before arms for the 2A split) and setting
+# num_act=23 / num_obs=251 / num_pri=345 in env_catra.py and num_act_lower=15 in env_catra_2a.py.
 CATRA_ACTION_JOINT_NAMES = [
     # 12 leg joints (same as ACTION_JOINT_NAMES)
     "left_hip_pitch_joint",
@@ -210,7 +212,10 @@ CATRA_ACTION_JOINT_NAMES = [
     "right_knee_joint",
     "right_ankle_pitch_joint",
     "right_ankle_roll_joint",
-    # 0 waist joints (TEMP: yaw + roll + pitch all removed)
+    # 3 waist joints (yaw, roll, pitch) — TEMP removed
+    # "waist_yaw_joint",
+    # "waist_roll_joint",
+    # "waist_pitch_joint",
     # 8 arm joints (left then right, shoulder + elbow only; wrists stay at default)
     "left_shoulder_pitch_joint",
     "left_shoulder_roll_joint",
@@ -221,7 +226,7 @@ CATRA_ACTION_JOINT_NAMES = [
     "right_shoulder_yaw_joint",
     "right_elbow_joint",
 ]
-# num_act = 20
+# num_act = 23
 
 # Same resting pose as DEFAULT_QPOS — arms hang naturally, not in a carrying pose.
 # fmt: off
