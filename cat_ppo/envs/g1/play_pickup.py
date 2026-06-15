@@ -12,7 +12,14 @@ from scipy.spatial.transform import Rotation as R
 
 import cat_ppo
 from cat_ppo.envs.g1 import constants as consts
-from cat_ppo.envs.g1.env_pickup import PICKUP_ACTION_JOINT_NAMES, STAND_ACTION_JOINT_NAMES
+from cat_ppo.envs.g1.env_pickup import (
+    PICKUP_ACTION_JOINT_NAMES,
+    STAND_ACTION_JOINT_NAMES,
+    BOX_HALF_X_RANGE,
+    BOX_HALF_Y_RANGE,
+    BOX_HALF_Z_RANGE,
+    BOX_MASS_RANGE,
+)
 from cat_ppo.envs.g1.env_catra import SUPPORT_QPOS_START
 from cat_ppo.envs.g1.play_cat import BaseEnv, State, set_scene_for_xml
 
@@ -72,6 +79,11 @@ class PlayG1PickupEnv(BaseEnv):
         self._box_geom_id = self.mj_model.geom("box_geom").id
         self._box_support_geom_id = self.mj_model.geom("box_support_col").id
 
+        # Nominal (XML) box half-extents — the DR maxima. reset() places the box
+        # using the nominal half_z so DR'd (smaller) boxes are never embedded in
+        # the pillar, matching training (env_pickup.domain_randomize_pickup).
+        self._box_half_nominal = self.mj_model.geom_size[self._box_geom_id].copy()
+
         lowers, uppers = self.mj_model.jnt_range[1:1 + NUM_ROBOT_JOINTS].T
         c = (lowers + uppers) / 2
         r = uppers - lowers
@@ -96,9 +108,19 @@ class PlayG1PickupEnv(BaseEnv):
             lo, hi = self._config.box_surface_height_range
             surface_z = float(np.random.uniform(lo, hi))
 
-        box_half_z = float(self.mj_model.geom_size[self._box_geom_id][2])
+        # Randomize box half-extents and mass per reset, matching training DR
+        # (env_pickup.domain_randomize_pickup). DR'd sizes are <= XML nominal.
+        self.mj_model.geom_size[self._box_geom_id] = [
+            np.random.uniform(*BOX_HALF_X_RANGE),
+            np.random.uniform(*BOX_HALF_Y_RANGE),
+            np.random.uniform(*BOX_HALF_Z_RANGE),
+        ]
+        self.mj_model.body_mass[self._box_body_id] = np.random.uniform(*BOX_MASS_RANGE)
+
+        # Place box using the nominal (XML max) half_z so a smaller DR'd box rests
+        # at or slightly above the pillar top — never embedded (matches training).
         support_half_z = float(self.mj_model.geom_size[self._box_support_geom_id][2])
-        box_z = surface_z + support_half_z + box_half_z
+        box_z = surface_z + support_half_z + float(self._box_half_nominal[2])
 
         # Place box 0.3 m in front of robot
         root_qpos = qpos[:7]

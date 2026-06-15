@@ -66,6 +66,15 @@ PICKUP_ACTION_JOINT_NAMES = [
 # Arm joints occupy the last 8 entries of PICKUP_ACTION_JOINT_NAMES (indices 12–19).
 _ARM_ACTION_SLICE = slice(12, 20)
 
+# Box domain-randomization ranges, shared by training DR (domain_randomize_pickup)
+# and eval playback (PlayG1PickupEnv.reset). Half-extent maxima equal the XML
+# nominal size (0.15, 0.20, 0.15), so DR'd boxes are never larger than nominal —
+# keeps the precomputed collision rbound valid and box placement non-embedding.
+BOX_HALF_X_RANGE = (0.10, 0.15)
+BOX_HALF_Y_RANGE = (0.10, 0.20)
+BOX_HALF_Z_RANGE = (0.10, 0.15)
+BOX_MASS_RANGE = (1.0, 4.0)
+
 
 # ---------------------------------------------------------------------------
 # Domain randomization
@@ -125,18 +134,18 @@ def _make_domain_randomize_pickup():
             # reset() uses the nominal half_z (0.15 m, the XML max) to compute box_z, so
             # DR'd boxes are always placed at or slightly above the pillar top — never embedded.
             rng, key = jax.random.split(rng)
-            box_half_x = jax.random.uniform(key, minval=0.10, maxval=0.15)
+            box_half_x = jax.random.uniform(key, minval=BOX_HALF_X_RANGE[0], maxval=BOX_HALF_X_RANGE[1])
             rng, key = jax.random.split(rng)
-            box_half_y = jax.random.uniform(key, minval=0.10, maxval=0.20)
+            box_half_y = jax.random.uniform(key, minval=BOX_HALF_Y_RANGE[0], maxval=BOX_HALF_Y_RANGE[1])
             rng, key = jax.random.split(rng)
-            box_half_z = jax.random.uniform(key, minval=0.10, maxval=0.15)
+            box_half_z = jax.random.uniform(key, minval=BOX_HALF_Z_RANGE[0], maxval=BOX_HALF_Z_RANGE[1])
             geom_size = model.geom_size.at[_box_geom_id].set(
                 jp.array([box_half_x, box_half_y, box_half_z])
             )
 
             # Box mass: override the globally-scaled value
             rng, key = jax.random.split(rng)
-            box_mass = jax.random.uniform(key, minval=1.0, maxval=2.0)
+            box_mass = jax.random.uniform(key, minval=BOX_MASS_RANGE[0], maxval=BOX_MASS_RANGE[1])
             body_mass = body_mass.at[_box_body_id].set(box_mass)
 
             return (pair_friction, dof_frictionloss, dof_armature, body_ipos, body_mass, qpos0, geom_size)
@@ -414,7 +423,7 @@ class G1PickupEnv(G1CaTraEnv):
 
         # Random root xy spawn (small offset)
         rng, key = jax.random.split(rng)
-        dxy = jax.random.uniform(key, (2,), minval=-0.5, maxval=0.5)
+        dxy = jax.random.uniform(key, (2,), minval=-1.0, maxval=1.0)
         qpos = qpos.at[0:2].set(qpos[0:2] + dxy)
         qpos = qpos.at[2].set(0.8)
 
