@@ -462,6 +462,7 @@ def g1_catra_task_config() -> config_dict.ConfigDict:
                 kneesdf=0.0,   # overwritten by --lateraldf
                 shldsdf=0.0,   # overwritten by --lateraldf
                 boxdf=0.0,     # box-corner SDF collision penalty (set non-zero to enable)
+                boxgf=0.0,     # box-corner inflation-GF alignment (set via --boxgf)
                 # --- Stage 2 only: carry maintenance (same scales as Pickup) ---
                 reach_carry=3.0,
                 lift_carry=0.0, #2.0,
@@ -483,6 +484,8 @@ def g1_catra_task_config() -> config_dict.ConfigDict:
         ),
         term_collision_threshold=0.04,
         box_drop_threshold=0.3,
+        box_use_inflation=True,   # boxgf reward: True -> sample gf_inflation.npy (anticipatory), False -> regular gf.npy
+
         box_surface_height_range=[0.3, 0.3],   # fixed: support body centre at 0.3 m
         # Warm-start: when set, reset() loads robot+box state from a pre-generated file
         warmstart_states_path=None,
@@ -611,6 +614,15 @@ class G1CaTraEnv(G1CatEnv):
         box_default     = np.array([0.35, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
         support_default = np.array([0.35, 0.0, 0.5, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
         self._init_q = jp.array(np.concatenate([consts.DEFAULT_QPOS_CATRA, box_default, support_default]))
+
+        # Guidance field used by the carried box's boxgf reward. With box_use_inflation, use the
+        # anticipatory inflated-obstacle field (gf_inflation.npy, fails fast if absent); otherwise
+        # reuse the regular gf. Same grid/shape as self.gf (loaded in G1CatEnv.__init__).
+        if self._config.box_use_inflation:
+            pf_path = self._config.pf_config.path
+            self.gf_box = jp.array(np.load(f"{pf_path}/gf_inflation.npy"))  # (Nx,Ny,Nz,3)
+        else:
+            self.gf_box = self.gf
 
         # IDs needed for Pickup reward computation
         self._pelvis_body_id    = self._mj_model.body("pelvis").id
@@ -782,6 +794,9 @@ class G1CaTraEnv(G1CatEnv):
         boxgf = self.sample_field(self.gf, box_corners)
         boxbf = self.sample_field(self.bf, box_corners)
         boxdf = self.sample_field(self.sdf, box_corners)
+        # Inflated-obstacle GF + per-corner velocity for the boxgf reward
+        boxgf_inf = self.sample_field(self.gf_box, box_corners)
+        box_corners_vel = jp.zeros_like(box_corners)
 
         # Stage 1 command is always zero; stage 2 command is PF-derived (computed in step())
         command = jp.zeros(4)
@@ -877,6 +892,8 @@ class G1CaTraEnv(G1CatEnv):
             # Box corner HumanoidPF (8 corners): current world frame and delayed
             "boxgf": boxgf.copy(), "boxbf": boxbf.copy(), "boxdf": boxdf.copy(),
             "boxgf_delay": boxgf.copy(), "boxbf_delay": boxbf.copy(), "boxdf_delay": boxdf.copy(),
+            # Box inflation-GF + corner kinematics (boxgf reward)
+            "boxgf_inf": boxgf_inf.copy(), "box_corners": box_corners.copy(), "box_corners_vel": box_corners_vel.copy(),
             # Box state
             "box_pos": box_pos_init.copy(),
             # Box metadata (for reward computation)
@@ -1007,6 +1024,9 @@ class G1CaTraEnv(G1CatEnv):
         boxgf = self.sample_field(self.gf, box_corners)
         boxbf = self.sample_field(self.bf, box_corners)
         boxdf = self.sample_field(self.sdf, box_corners)
+        # Inflated-obstacle GF + per-corner velocity for the boxgf reward
+        boxgf_inf = self.sample_field(self.gf_box, box_corners)
+        box_corners_vel = (box_corners - state.info["box_corners"]) / self.dt
 
         # PF-derived command (always computed; gated to zero in stage 1)
         cmd_pf = self.compute_cmd_from_rtf(
@@ -1077,6 +1097,7 @@ class G1CaTraEnv(G1CatEnv):
         state.info["shldsgf"] = shldsgf.copy(); state.info["shldsbf"] = shldsbf.copy(); state.info["shldsdf"] = shldsdf.copy()
         state.info["boxgf"] = boxgf.copy(); state.info["boxbf"] = boxbf.copy(); state.info["boxdf"] = boxdf.copy()
         state.info["boxgf_delay"] = boxgf_delay.copy(); state.info["boxbf_delay"] = boxbf_delay.copy(); state.info["boxdf_delay"] = boxdf_delay.copy()
+        state.info["boxgf_inf"] = boxgf_inf.copy(); state.info["box_corners"] = box_corners.copy(); state.info["box_corners_vel"] = box_corners_vel.copy()
         state.info["head_pos"] = head_pos.copy(); state.info["head_vel"] = head_vel.copy()
         state.info["pelv_pos"] = pelv_pos.copy(); state.info["tors_pos"] = tors_pos.copy()
         state.info["feet_pos"] = feet_pos.copy(); state.info["feet_vel"] = feet_vel.copy()
@@ -1146,6 +1167,28 @@ class G1CaTraEnv(G1CatEnv):
         R = math.quat_to_mat(box_quat)
         local_corners = corner_signs * box_size
         return box_pos + local_corners @ R.T
+
+    def _re_boxgf(self, gf_vel: jax.Array, lin_vel: jax.Array, sdf: jax.Array,
+                  crossed: jax.Array, cmd_vel: jax.Array, tau: float = 1.5) -> jax.Array:
+        """boxgf reward: identical to _re_gf0 (proximity-gated cosine alignment over the box
+        corners against the inflated guidance field), but the component along the commanded
+        travel direction is first removed from BOTH the guidance vector and the corner
+        velocity. This way the box is rewarded only for obstacle-driven lateral/vertical
+        motion and cannot pull the robot's locomotion forward.
+
+        gf_vel:  (8, 3) — inflated-obstacle guidance field at the 8 box corners
+        lin_vel: (8, 3) — world-frame velocity of each box corner
+        sdf:     (8, 1) — signed distance from each corner to the nearest obstacle
+        crossed: (8,) bool — fallback mask (robot stopped or corner past obstacle zone)
+        cmd_vel: (3,) — [vx, vy, yaw], the same command vector forward_progress uses
+        tau:     float — proximity activation radius (m)
+        """
+        eps = 1e-6
+        cmd_dir = cmd_vel[:2] / (jp.linalg.norm(cmd_vel[:2]) + eps)  # (2,) commanded planar direction
+        # Remove the along-command component in the XY plane only (Z motion preserved)
+        gf_perp = gf_vel.at[:, :2].add(-jp.sum(gf_vel[:, :2] * cmd_dir, axis=-1, keepdims=True) * cmd_dir)
+        v_perp  = lin_vel.at[:, :2].add(-jp.sum(lin_vel[:, :2] * cmd_dir, axis=-1, keepdims=True) * cmd_dir)
+        return self._re_gf0(gf_perp, v_perp, sdf, crossed, tau=tau)
 
     def _get_obs(self, data: mjx.Data, info: dict[str, Any], feet_contact: jax.Array) -> mjx_env.Observation:
         """251-dim state (deployable; PF subblock delayed + nav-frame, not additively noised) and 345-dim privileged_state.
@@ -1521,6 +1564,10 @@ class G1CaTraEnv(G1CatEnv):
             "kneesdf": self._re_sdf(info["kneesdf"]),
             "shldsdf": self._re_sdf(info["shldsdf"]),
             "boxdf":   self._re_sdf(info["boxdf"]),
+            "boxgf":   self._re_boxgf(
+                info["boxgf_inf"], info["box_corners_vel"], info["boxdf"],
+                (move_flag[None] < 0.5) | (info["box_corners"][..., 0] > 1.5),
+                cmd_vel, tau=1.5),
             # Carry maintenance (reuse computed Pickup values)
             "reach_carry":          reach,
             "lift_carry":           lift,

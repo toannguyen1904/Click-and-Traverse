@@ -50,7 +50,7 @@ _SPLIT_REGULARIZERS = ("joint_torque", "joint_limits", "smoothness_joint", "smoo
 # SHARED terms go to BOTH agents; LOWER/UPPER terms go to the corresponding agent only.
 _SHARED_KEYS = frozenset({
     "lift", "lift_carry", "box_pillar_contact", "box_vertical", "hold_stable",
-    "box_yaw_stable", "box_centering", "box_upright", "box_upright_carry", "boxdf",
+    "box_yaw_stable", "box_centering", "box_upright", "box_upright_carry", "boxdf", "boxgf",
     # hands/shoulders are articulated by the arms (upper) but their world position also
     # depends on torso/pelvis pose driven by the legs (lower) -> obstacle terms are shared.
     "handsgf", "handsdf", "shldsdf",

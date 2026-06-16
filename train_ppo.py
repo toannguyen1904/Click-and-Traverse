@@ -58,7 +58,9 @@ class Args:
     lateraldf: float = 0 # reward scale for hands/knees/shoulders SDF penalty (side obstacles)
     overheadgf: float = 0  # reward scale for head GF guidance alignment (overhead obstacles)
     overheaddf: float = 0  # reward scale for head SDF penalty (overhead obstacles)
-    box: float = 0       # reward scale for box-corner SDF penalty (G1CaTra only): keeps the carried box clear of obstacles
+    boxdf: float = 0     # reward scale for box-corner SDF penalty (G1CaTra only): keeps the carried box clear of obstacles
+    boxgf: float = 0     # reward scale for box-corner inflation-GF alignment (G1CaTra only): steers the box along the anticipatory field
+    box_inflation: bool = True  # G1CaTra only: boxgf reward uses gf_inflation.npy (True) or regular gf.npy (False) for the box
     term_collision_threshold: float = 0.04  # SDF below -threshold triggers collision termination
     obs_path: str = 'data/assets/TypiObs/empty'  # path to the obstacle grid files: sdf.npy, bf.npy, gf.npy.
     stage1_steps: int = -1  # for G1CaTra: number of steps in stage 1 (pickup); -1 = use task default
@@ -85,8 +87,13 @@ class Args:
         if self.overheaddf != 0:
             exp_name_parts.append('Od'+str(self.overheaddf).replace('.', ''))
 
-        if self.box != 0:
-            exp_name_parts.append('B'+str(self.box).replace('.', ''))
+        if self.boxdf != 0:
+            exp_name_parts.append('B'+str(self.boxdf).replace('.', ''))
+
+        if self.boxgf != 0:
+            exp_name_parts.append('Bg'+str(self.boxgf).replace('.', ''))
+            if not self.box_inflation:
+                exp_name_parts.append('noinf')
 
         exp_name_parts.append(f"T{str(self.term_collision_threshold).replace('.', '')}")
 
@@ -155,7 +162,11 @@ def _apply_args_to_config(args: Args, policy_cfg, env_config, debug: bool):
     env_config.reward_config.scales.kneesdf = args.lateraldf # scale: SDF penalty for knees vs obstacles
     env_config.reward_config.scales.shldsdf = args.lateraldf # scale: SDF penalty for shoulders vs obstacles
     if "boxdf" in env_config.reward_config.scales:
-        env_config.reward_config.scales.boxdf = args.box  # scale: SDF penalty for box corners vs obstacles (G1CaTra only)
+        env_config.reward_config.scales.boxdf = args.boxdf  # scale: SDF penalty for box corners vs obstacles (G1CaTra only)
+    if "boxgf" in env_config.reward_config.scales:
+        env_config.reward_config.scales.boxgf = args.boxgf  # scale: inflation-GF alignment for box corners (G1CaTra only)
+    if hasattr(env_config, "box_use_inflation"):
+        env_config.box_use_inflation = args.box_inflation  # boxgf: use gf_inflation.npy (True) vs regular gf.npy (False)
     env_config.term_collision_threshold = args.term_collision_threshold  # SDF below -threshold triggers collision termination
     if args.stage1_steps >= 0 and hasattr(env_config, "stage1_steps"):
         env_config.stage1_steps = args.stage1_steps  # override stage 1 length (G1CaTra only)
