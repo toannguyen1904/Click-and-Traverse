@@ -10,7 +10,7 @@ def build_obstacles(scene, grids):
     elif scene == "narrow1":
         return obs_narrow(X, Y, Z, gap_width=0.25)
     elif scene == "narrow0_low":
-        return obs_narrow(X, Y, Z, z_high=1.0)
+        return obs_narrow(X, Y, Z, z_high=0.7)
     elif scene == "narrow1_low":
         return obs_narrow(X, Y, Z, gap_width=0.25, z_high=0.7)
     elif scene == "bar0":

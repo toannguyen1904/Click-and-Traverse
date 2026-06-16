@@ -133,7 +133,7 @@ def _make_domain_randomize_pickup():
 
             # Box mass: override the globally-scaled value
             rng, key = jax.random.split(rng)
-            box_mass = jax.random.uniform(key, minval=1.0, maxval=2.0)
+            box_mass = jax.random.uniform(key, minval=1.0, maxval=4.0)
             body_mass = body_mass.at[_box_body_id].set(box_mass)
 
             return (pair_friction, dof_frictionloss, dof_armature, body_ipos, body_mass, qpos0, geom_size)
@@ -410,7 +410,7 @@ class G1PickupEnv(G1CaTraEnv):
 
         # Random root xy spawn (small offset)
         rng, key = jax.random.split(rng)
-        dxy = jax.random.uniform(key, (2,), minval=-0.5, maxval=0.5)
+        dxy = jax.random.uniform(key, (2,), minval=-1.0, maxval=1.0)
         qpos = qpos.at[0:2].set(qpos[0:2] + dxy)
         qpos = qpos.at[2].set(0.8)
 

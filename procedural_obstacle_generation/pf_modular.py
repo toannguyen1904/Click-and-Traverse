@@ -22,6 +22,11 @@ class PFConfig:
     k_decay: float = 0.6        # decay radius near goal (m), defined but not used
     goal_seed_r: float = 0.12   # goal negative region radius (m), for the fmm
 
+    # Option-B (SDF-offset) obstacle inflation radius (m) for the *anticipatory*
+    # box guidance field. Sized as: box circumscribed radius + braking/turning margin.
+    # Larger -> earlier/farther standoff, but too large seals narrow corridors.
+    box_inflation_margin: float = 0.06
+
 def world_to_local(p_w, cfg: PFConfig):
     return p_w - cfg.origin_w
 
@@ -61,14 +66,17 @@ def make_raw_guidance_field(cfg, grids, obs_mask, goal_local, r_proj=None): # no
 
 def make_guidance_field_progressive(cfg, grids, obs_mask, goal_local, bf, sdf, r_proj=None):
     """
-    cfg      : PFConfig voxel, v_max, k_decay
-    obs_mask : bool ndarray, True=inside obstacle
-    bf       : (...,3) normal field (recommended to use SDF outward normal)
-    sdf      : np.ndarray, signed distance to obstacles (positive outside, negative inside). If None, constructed from obs_mask
-    r_proj   : radius of influence for normal projection (m). If None, defaults to 2*voxel ~ 3*voxel
+    cfg       : PFConfig — uses voxel, v_max, goal_seed_r
+    grids     : tuple (X, Y, Z), each (Nx,Ny,Nz), world-space coords of every voxel
+                (from np.meshgrid(xv, yv, zv, indexing='ij'))
+    obs_mask  : bool ndarray (Nx,Ny,Nz), True=inside obstacle
+    goal_local: (3,) goal position in world/local coords; seeds the geodesic solve
+    bf        : (Nx,Ny,Nz,3) normal field (recommended to use SDF outward normal)
+    sdf       : (Nx,Ny,Nz) signed distance to obstacles (positive outside, negative inside)
+    r_proj    : radius of influence for normal projection (m). If None, defaults to 5*voxel
     returns:
-      T: Geodesic distance field (to the goal)
-      gf: HumanoidPF guidance field
+      T : (Nx,Ny,Nz) geodesic distance field to the goal
+      gf: (Nx,Ny,Nz,3) HumanoidPF guidance field (unit direction * speed)
     """
     voxel = cfg.voxel
     eps = 1e-9
@@ -86,46 +94,57 @@ def make_guidance_field_progressive(cfg, grids, obs_mask, goal_local, bf, sdf, r
     T_ma = skfmm.distance(phi, dx=cfg.voxel)
     T_free_max = np.max(T_ma[~T_ma.mask]) if np.any(~T_ma.mask) else 0.0
     T = T_ma.filled(T_free_max).astype(np.float32)
-    # 2) -∇T
+    # -∇T
     dTx, dTy, dTz = np.gradient(T, voxel, voxel, voxel, edge_order=2)
-    g = np.stack([-dTx, -dTy, -dTz], axis=-1).astype(np.float32)     # (...,3)
+    g = np.stack([-dTx, -dTy, -dTz], axis=-1).astype(np.float32)     # (...,3), g is the negative gradient of U_att in the paper (without eta, or eta=1.0)
 
-    # 3) b̂ norm
+
+    # 3) b̂: normalize the SDF gradient to a unit outward-normal direction (which way is "straight out of the wall")
     bnorm = np.linalg.norm(bf, axis=-1, keepdims=True)
     bunit = np.zeros_like(bf, dtype=np.float32)
     valid_b = bnorm[..., 0] > eps
     bunit[valid_b] = bf[valid_b] / bnorm[valid_b]
 
-    # 4) g_perp = g - (g·b̂) b̂
-    proj = np.sum(g * bunit, axis=-1, keepdims=True)
-    # proj = np.clip(proj, -1.0, 0.0)
-    g_perp = g - proj * bunit
 
-    # 5) distance weight w(d): d>=0 outside distance; w=1 (close to edge) -> w=0 (far away)
+    # 4) g_perp: strip the wall-normal part out of g, leaving only flow that slides *along* the surface
+    proj = np.sum(g * bunit, axis=-1, keepdims=True)  # g·b̂: how much of g points into/out of the wall
+    # proj = np.clip(proj, -1.0, 0.0)
+    g_perp = g - proj * bunit  # remove that component → tangential (wall-following) direction
+
+
+    # 5) distance weight w ∈ [0,1]: a per-voxel "how close am I to a wall?" knob.
+    #    Based on d_out = distance outside the obstacle (0 inside). w=1 at the surface -> w=0 at/beyond r_proj.
+    #    smoothstep gives a smooth (no-kink) ramp instead of a linear one.
     d_out = np.maximum(sdf, 0.0)
     t = np.clip(d_out / (r_proj + eps), 0.0, 1.0)
     smooth = t * t * (3.0 - 2.0 * t)
     w = (1.0 - smooth)[..., None]  # (...,1)
 
-    # 6) combine: more "tangential" near edges, original navigation farther away
+
+    # 6) blend the two directions using w: near a wall (w->1) use the wall-following g_perp;
+    #    far from obstacles (w->0) use the straight-to-goal g. In between, smoothly mix the two.
     g_mix = (1.0 - w) * g + w * g_perp
     # g_mix[g_mix[...,0]<0] *= -1
 
-    # 7) inside obstacles: use normal (usually outward normal to push field away; use -bunit to point inward)
+    # 7) never forget inside obstacles: use normal (usually outward normal to push field away; use -bunit to point inward)
     # from scipy.ndimage import binary_dilation
     # obs_mask = binary_dilation(obs_mask, iterations=1)
     g_mix[obs_mask] = bunit[obs_mask]
+
 
     # 8) normalize (final step) + speed scalar
     mag = np.linalg.norm(g_mix, axis=-1, keepdims=True)
     dir_unit = np.zeros_like(g_mix, dtype=np.float32)
     nz = (mag[..., 0] > eps)
-    dir_unit[nz] = g_mix[nz] / mag[nz]
+    dir_unit[nz] = g_mix[nz] / mag[nz] # Throws away g_mix's length, keeping only its direction as unit vectors dir_unit.
 
+
+    # A simple speed schedule: move at full speed v_max everywhere,
+    # except within 0.3 m of the goal (in xy),
+    # where speed ramps smoothly down to 0 with a cubic falloff. 
     T_thresh = 0.3
     p = 3.0 
     goal_dist = (((X - goal_local[0])**2 + (Y - goal_local[1])**2))**0.5
-
     speed = np.where(
         goal_dist > T_thresh,
         cfg.v_max,
@@ -135,7 +154,36 @@ def make_guidance_field_progressive(cfg, grids, obs_mask, goal_local, bf, sdf, r
 
 
     gf = (dir_unit * speed).astype(np.float32)
-    return T, gf
+    return T, gf    # gf is not a unit-vector field, its lengths are specified by speed
+
+def make_inflated_guidance_field(cfg, grids, sdf, bf, goal_local, margin=None, r_proj=None):
+    """
+    Anticipatory guidance field via Option-B (SDF-offset) obstacle inflation — meant
+    for a large/heavy *carried box*, not the robot's own body. Inflating obstacles by
+    a Euclidean `margin` makes -∇T curve away earlier and with standoff, so when the
+    field is queried at the box location it already reads an avoidance direction before
+    the box reaches the true obstacle surface.
+
+    Exact for a true signed distance field: subtracting a constant shifts the zero-level
+    (the obstacle surface) outward by `margin`, and the gradient (surface normals `bf`)
+    is invariant under a constant offset. So we only re-threshold the mask and re-run the
+    geodesic solve on the fattened obstacles — bf is reused unchanged, nothing is recomputed.
+
+    cfg, grids, goal_local : as in make_guidance_field_progressive
+    sdf    : (Nx,Ny,Nz) signed distance of the ORIGINAL (un-inflated) obstacles
+    bf     : (Nx,Ny,Nz,3) ∇sdf normals of the original obstacles (reused as-is)
+    margin : inflation radius (m). If None, uses cfg.box_inflation_margin
+    r_proj : wall-following blend radius (m) for the inflated surface; None -> 5*voxel
+    returns:
+      T_inf  : (Nx,Ny,Nz) geodesic distance over the inflated obstacles
+      gf_inf : (Nx,Ny,Nz,3) anticipatory guidance field
+    """
+    if margin is None:
+        margin = cfg.box_inflation_margin
+    sdf_inf = (sdf - margin).astype(np.float32)   # surface moves outward by `margin`
+    obs_inf = sdf_inf <= 0.0                        # == (sdf <= margin): Euclidean Minkowski grow
+    # bf == ∇sdf, and ∇(sdf - const) == ∇sdf, so the original normals are still correct.
+    return make_guidance_field_progressive(cfg, grids, obs_inf, goal_local, bf, sdf_inf, r_proj=r_proj)
 
 def save_all(cfg: PFConfig, sdf, bf, gf, obs_mask, meta_extra=None):    # currently not being used
     outdir = Path(cfg.outdir)

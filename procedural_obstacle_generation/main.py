@@ -3,7 +3,7 @@ from typical_obstacle import build_obstacles
 import os
 import shutil
 from pathlib import Path
-from pf_modular import make_sdf, make_guidance_field_progressive, grad3, PFConfig, visualize_all
+from pf_modular import make_sdf, make_guidance_field_progressive, make_inflated_guidance_field, grad3, PFConfig, visualize_all
 import numpy as np
 from utills import marching_cubes_mesh, occupancy_to_points, preview_matplotlib, combine_meshes
 import itertools
@@ -67,6 +67,9 @@ def generate_random_obstacle(difficulty, seed, n_rect_R, n_rect_F, n_rect_C):
     np.save(out_dir / "bf.npy",  bf)
     np.save(out_dir / "gf.npy",  gf)
     np.save(out_dir / "obs.npy", obs_mask.astype(np.uint8))
+    # Anticipatory inflated field for the carried box (Option-B SDF-offset).
+    _, gf_inf = make_inflated_guidance_field(cfg, (X, Y, Z), sdf, bf, cfg.goal_w)
+    np.save(out_dir / "gf_inflation.npy", gf_inf)  # shape (Nx, Ny, Nz, 3)
     # sur = extract_surface_voxels(obs_mask)
     # np.save(out_dir / "sur.npy", sur.astype(np.uint8))
     # pts = occupancy_to_points(sur, voxel_size=obstacle_cfg.voxel)
@@ -114,6 +117,9 @@ def generate_typical_obstacle(scene_type):
     np.save(out_dir / "bf.npy",  bf)   # shape (Nx, Ny, Nz, 3)
     np.save(out_dir / "gf.npy",  gf)   # shape (Nx, Ny, Nz, 3)
     np.save(out_dir / "obs.npy", obs_mask.astype(np.uint8))  # shape (Nx, Ny, Nz), dtype uint8
+    # Anticipatory inflated field for the carried box (Option-B SDF-offset).
+    _, gf_inf = make_inflated_guidance_field(cfg, (X, Y, Z), sdf, bf, cfg.goal_w)
+    np.save(out_dir / "gf_inflation.npy", gf_inf)  # shape (Nx, Ny, Nz, 3)
     # sur = extract_surface_voxels(obs_mask)
     # np.save(out_dir / "sur.npy", sur.astype(np.uint8))
     # ground_idx, ceil_idx = get_elevation(obs_mask)
@@ -171,6 +177,9 @@ def generate_pf(scene_type, pc_path):   # used in deployment to generate PF from
     np.save(out_dir / "bf.npy",  bf)   # shape (Nx, Ny, Nz, 3)
     np.save(out_dir / "gf.npy",  gf)   # shape (Nx, Ny, Nz, 3)
     np.save(out_dir / "obs.npy", obs_mask.astype(np.uint8))  # shape (Nx, Ny, Nz), dtype uint8
+    # Anticipatory inflated field for the carried box (Option-B SDF-offset).
+    _, gf_inf = make_inflated_guidance_field(cfg, (X, Y, Z), sdf, bf, cfg.goal_w)
+    np.save(out_dir / "gf_inflation.npy", gf_inf)  # shape (Nx, Ny, Nz, 3)
     # sur = extract_surface_voxels(obs_mask)
     # np.save(out_dir / "sur.npy", sur.astype(np.uint8))
     # 可视化
