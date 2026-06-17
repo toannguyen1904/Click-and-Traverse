@@ -5,6 +5,7 @@ xla_flags += " --xla_gpu_triton_gemm_any=true"
 os.environ["XLA_FLAGS"] = xla_flags
 os.environ["MUJOCO_GL"] = "egl"
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,6 +26,7 @@ class Args:
     onnx_path: str = None
     pri: bool = False
     obs_path: str = 'data/assets/TypiObs/empty'
+    box_inflation: bool = True  # G1CaTra: box observes gf_inflation.npy (True) or regular gf.npy (False). Read from the checkpoint's config.json when available; this is only a fallback.
     yaw: float = 0.0          # initial robot yaw in degrees (0 = default forward direction)
     box_size: str = None      # box half-extents as "x,y,z" in metres (e.g. "0.15,0.20,0.15")
     box_mass: float = None    # box mass in kg (e.g. 1.5)
@@ -48,11 +50,31 @@ class State:
     obs: dict
 
 
+def _read_box_use_inflation(exp_name, fallback):
+    """Read env_config.box_use_inflation from the checkpoint's config.json so playback
+    matches training. Falls back to the given value if the file/key is unavailable."""
+    if not exp_name:
+        return fallback
+    cfg_path = cat_ppo.get_path_log(exp_name) / "checkpoints" / "config.json"
+    if not cfg_path.exists():
+        print(f"[mj_onnx_play] config.json not found at {cfg_path}; using --box_inflation={fallback}")
+        return fallback
+    try:
+        saved = json.loads(cfg_path.read_text())
+        return bool(saved["env_config"]["box_use_inflation"])
+    except (KeyError, ValueError):
+        print(f"[mj_onnx_play] box_use_inflation absent from {cfg_path}; using --box_inflation={fallback}")
+        return fallback
+
+
 def play(args: Args):
     env_class = cat_ppo.registry.get(args.task, "play_env_class")
     task_cfg = cat_ppo.registry.get(args.task, "config")
     env_cfg = task_cfg.env_config
     env_cfg.pf_config.path = args.obs_path
+    if hasattr(env_cfg, "box_use_inflation"):
+        env_cfg.box_use_inflation = _read_box_use_inflation(args.exp_name, args.box_inflation)
+        print(f"[mj_onnx_play] box_use_inflation = {env_cfg.box_use_inflation}")
     if args.stage1_steps >= 0 and hasattr(env_cfg, "stage1_steps"):
         env_cfg.stage1_steps = args.stage1_steps
     if args.warmstart_states_path and hasattr(env_cfg, "warmstart_states_path"):
