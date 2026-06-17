@@ -91,6 +91,11 @@ class PlayG1CaTraEnv(BaseEnv):
         self.sdf = np.load(f"{pf_path}/sdf.npy")[..., None]
         self.bf  = np.load(f"{pf_path}/bf.npy")
         self.gf  = np.load(f"{pf_path}/gf.npy")
+        # Field observed/scored for the carried box (must match training's box_use_inflation)
+        if getattr(config, "box_use_inflation", True):
+            self.gf_box = np.load(f"{pf_path}/gf_inflation.npy")
+        else:
+            self.gf_box = self.gf
         self.pf_origin = np.array(config.pf_config.origin, dtype=np.float32)
         self.Nx, self.Ny, self.Nz, _ = self.sdf.shape
 
@@ -158,6 +163,9 @@ class PlayG1CaTraEnv(BaseEnv):
             self.mj_model.body_mass[self._box_body_id] = self._ws_box_mass[idx]
             self.mj_data.qpos[:] = self._ws_qpos[idx]
             self.mj_data.qvel[:] = self._ws_qvel[idx]
+            bs = self._ws_box_size[idx]
+            print(f"[PlayG1CaTraEnv] warm-start idx={idx} | box half-size (hx,hy,hz)="
+                  f"({bs[0]:.3f}, {bs[1]:.3f}, {bs[2]:.3f}) m | box mass={float(self._ws_box_mass[idx]):.3f} kg")
         else:
             # --- Default path: robot standing, box on pillar ---
             qpos = np.array(consts.DEFAULT_QPOS_CATRA, dtype=np.float64)
@@ -206,7 +214,7 @@ class PlayG1CaTraEnv(BaseEnv):
 
         box_size = self.mj_model.geom_size[self._box_geom_id].copy()
         box_corners = self._box_corners_world(box_size)
-        boxgf = self.sample_field(self.gf,  box_corners)
+        boxgf = self.sample_field(self.gf_box, box_corners)
         boxbf = self.sample_field(self.bf,  box_corners)
         boxdf = self.sample_field(self.sdf, box_corners)
 
@@ -319,7 +327,7 @@ class PlayG1CaTraEnv(BaseEnv):
         # Box corner PF (delayed, then move_flag-normalized)
         box_corners = self._box_corners_world(state.info["box_size"])
         box_corners_delay = delay_body_pos(p_gt, q_gt, p_odom, q_odom, box_corners)
-        boxgf = self.sample_field(self.gf,  box_corners_delay)
+        boxgf = self.sample_field(self.gf_box, box_corners_delay)
         boxbf = self.sample_field(self.bf,  box_corners_delay)
         boxdf = self.sample_field(self.sdf, box_corners_delay)
         boxgf = boxgf * (move_flag_val > 0.5) / (np.linalg.norm(boxgf, axis=-1, keepdims=True) + EPS)

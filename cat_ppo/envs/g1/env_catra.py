@@ -790,13 +790,13 @@ class G1CaTraEnv(G1CatEnv):
         headdf, pelvdf, torsdf, feetdf, handsdf, kneesdf, shldsdf = jp.split(all_df, [1, 2, 3, 5, 7, 9], axis=0)
 
         # Box corner HumanoidPF: 8 corners x {gf:3, bf:3, sdf:1}
+        # boxgf is sampled from self.gf_box (inflation field if box_use_inflation, else regular gf):
+        # the box observes and is rewarded against the same field.
         box_corners = self._box_corners_world(data, box_size)
-        boxgf = self.sample_field(self.gf, box_corners)
+        boxgf = self.sample_field(self.gf_box, box_corners)
         boxbf = self.sample_field(self.bf, box_corners)
         boxdf = self.sample_field(self.sdf, box_corners)
-        # Inflated-obstacle GF + per-corner velocity for the boxgf reward
-        boxgf_inf = self.sample_field(self.gf_box, box_corners)
-        box_corners_vel = jp.zeros_like(box_corners)
+        box_corners_vel = jp.zeros_like(box_corners)  # per-corner velocity for the boxgf reward
 
         # Stage 1 command is always zero; stage 2 command is PF-derived (computed in step())
         command = jp.zeros(4)
@@ -892,8 +892,8 @@ class G1CaTraEnv(G1CatEnv):
             # Box corner HumanoidPF (8 corners): current world frame and delayed
             "boxgf": boxgf.copy(), "boxbf": boxbf.copy(), "boxdf": boxdf.copy(),
             "boxgf_delay": boxgf.copy(), "boxbf_delay": boxbf.copy(), "boxdf_delay": boxdf.copy(),
-            # Box inflation-GF + corner kinematics (boxgf reward)
-            "boxgf_inf": boxgf_inf.copy(), "box_corners": box_corners.copy(), "box_corners_vel": box_corners_vel.copy(),
+            # Box corner kinematics (boxgf reward)
+            "box_corners": box_corners.copy(), "box_corners_vel": box_corners_vel.copy(),
             # Box state
             "box_pos": box_pos_init.copy(),
             # Box metadata (for reward computation)
@@ -1021,12 +1021,10 @@ class G1CaTraEnv(G1CatEnv):
         headdf, pelvdf, torsdf, feetdf, handsdf, kneesdf, shldsdf = jp.split(all_df, [1, 2, 3, 5, 7, 9], axis=0)
 
         box_corners = self._box_corners_world(data, state.info["box_size"])
-        boxgf = self.sample_field(self.gf, box_corners)
+        boxgf = self.sample_field(self.gf_box, box_corners)  # inflation field if box_use_inflation, else regular gf
         boxbf = self.sample_field(self.bf, box_corners)
         boxdf = self.sample_field(self.sdf, box_corners)
-        # Inflated-obstacle GF + per-corner velocity for the boxgf reward
-        boxgf_inf = self.sample_field(self.gf_box, box_corners)
-        box_corners_vel = (box_corners - state.info["box_corners"]) / self.dt
+        box_corners_vel = (box_corners - state.info["box_corners"]) / self.dt  # per-corner velocity for the boxgf reward
 
         # PF-derived command (always computed; gated to zero in stage 1)
         cmd_pf = self.compute_cmd_from_rtf(
@@ -1048,7 +1046,7 @@ class G1CaTraEnv(G1CatEnv):
         all_df_delay = self.sample_field(self.sdf, all_poses_delay)
 
         box_corners_delay = delay_body_pos(p_gt, q_gt, p_odom, q_odom, box_corners)
-        boxgf_delay = self.sample_field(self.gf, box_corners_delay)
+        boxgf_delay = self.sample_field(self.gf_box, box_corners_delay)
         boxbf_delay = self.sample_field(self.bf, box_corners_delay)
         boxdf_delay = self.sample_field(self.sdf, box_corners_delay)
 
@@ -1097,7 +1095,7 @@ class G1CaTraEnv(G1CatEnv):
         state.info["shldsgf"] = shldsgf.copy(); state.info["shldsbf"] = shldsbf.copy(); state.info["shldsdf"] = shldsdf.copy()
         state.info["boxgf"] = boxgf.copy(); state.info["boxbf"] = boxbf.copy(); state.info["boxdf"] = boxdf.copy()
         state.info["boxgf_delay"] = boxgf_delay.copy(); state.info["boxbf_delay"] = boxbf_delay.copy(); state.info["boxdf_delay"] = boxdf_delay.copy()
-        state.info["boxgf_inf"] = boxgf_inf.copy(); state.info["box_corners"] = box_corners.copy(); state.info["box_corners_vel"] = box_corners_vel.copy()
+        state.info["box_corners"] = box_corners.copy(); state.info["box_corners_vel"] = box_corners_vel.copy()
         state.info["head_pos"] = head_pos.copy(); state.info["head_vel"] = head_vel.copy()
         state.info["pelv_pos"] = pelv_pos.copy(); state.info["tors_pos"] = tors_pos.copy()
         state.info["feet_pos"] = feet_pos.copy(); state.info["feet_vel"] = feet_vel.copy()
@@ -1565,7 +1563,7 @@ class G1CaTraEnv(G1CatEnv):
             "shldsdf": self._re_sdf(info["shldsdf"]),
             "boxdf":   self._re_sdf(info["boxdf"]),
             "boxgf":   self._re_boxgf(
-                info["boxgf_inf"], info["box_corners_vel"], info["boxdf"],
+                info["boxgf"], info["box_corners_vel"], info["boxdf"],
                 (move_flag[None] < 0.5) | (info["box_corners"][..., 0] > 1.5),
                 cmd_vel, tau=1.5),
             # Carry maintenance (reuse computed Pickup values)
