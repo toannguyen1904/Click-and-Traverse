@@ -164,7 +164,7 @@ def convert_jax2onnx(
         tf_model, input_signature=spec, opset=11, output_path=output_path
     )
 
-_TWO_AGENT_TASKS = ("G1CaTra2A", "G1CaTra2APri")
+_TWO_AGENT_TASKS = ("G1CaTra2A", "G1CaTra2APri", "G1CaTra2ADagger")
 
 
 def _validate_onnx(onnx_path, infer, obs_size, policy_obs_key, atol=1e-4):
@@ -234,35 +234,28 @@ def export_2a_onnx(ckpt_dir, params, obs_size, num_act_lower, num_act_upper, net
         logging.info(f"Exported {out_path}")
 
 
-def main_2a(args, latest_ckpt, env, task_cfg):
-    """Restore a two-agent checkpoint and export both actor ONNX files."""
-    from mujoco_playground import wrapper
-    from cat_ppo.learning.policy.ppo import train_2a as ppo_2a
-    from cat_ppo.learning.policy.ppo.networks_2a import make_ppo_networks_2a
+def _obs_size_from_config(env_cfg):
+    """Actor/critic obs shapes straight from config — no env construction needed.
+
+    Conversion only needs the network input sizes + checkpoint weights; the
+    exported ONNX is scene-independent, so we never load any PF/scene files.
+    """
+    return {
+        "state": (env_cfg.num_obs,),
+        "privileged_state": (env_cfg.num_pri,),
+    }
+
+
+def main_2a(latest_ckpt, task_cfg):
+    """Restore a two-agent checkpoint and export both actor ONNX files (no env)."""
+    from brax.training.agents.ppo import checkpoint as ppo_checkpoint
 
     env_cfg = task_cfg.env_config
-    policy_config = task_cfg.policy_config
-
-    net_factory = functools.partial(
-        make_ppo_networks_2a,
-        action_size_lower=env_cfg.num_act_lower,
-        action_size_upper=env_cfg.num_act_upper,
-        **policy_config.network_factory,
-    )
-    train_fn = functools.partial(
-        ppo_2a.train,
-        num_timesteps=0,
-        episode_length=policy_config.episode_length,
-        normalize_observations=False,
-        restore_checkpoint_path=latest_ckpt,
-        network_factory=net_factory,
-        wrap_env_fn=wrapper.wrap_for_brax_training,
-        num_envs=jax.device_count(),
-    )
-    _, params, _ = train_fn(environment=env)
+    params = ppo_checkpoint.load(latest_ckpt)
     export_2a_onnx(
-        latest_ckpt, params, env.observation_size,
-        env_cfg.num_act_lower, env_cfg.num_act_upper, policy_config.network_factory,
+        latest_ckpt, params, _obs_size_from_config(env_cfg),
+        env_cfg.num_act_lower, env_cfg.num_act_upper,
+        task_cfg.policy_config.network_factory,
     )
 
 
@@ -271,12 +264,15 @@ def main_2a(args, latest_ckpt, env, task_cfg):
 class Args:
     task: str
     exp_name: str
+    # Deprecated / ignored: conversion no longer constructs the env, so no scene
+    # (PF) files are read. Kept only so existing scripts passing --obs_path don't break.
+    obs_path: str = ''
 
 
 # --- Main entry point ---
 def main(args: Args):
-    import brax.training.agents.ppo.train as ppo
-    from brax.training.agents.ppo.networks import make_ppo_networks
+    from brax.training.agents.ppo import checkpoint as ppo_checkpoint
+    from brax.training.agents.ppo.networks import make_ppo_networks, make_inference_fn
 
     import cat_ppo
 
@@ -289,37 +285,26 @@ def main(args: Args):
     logging.info(f"Using checkpoint: {latest_ckpt}")
     output_path = f"{latest_ckpt}/policy.onnx"
 
-    env_class = cat_ppo.registry.get(args.task, "train_env_class")
     task_cfg = cat_ppo.registry.get(args.task, "config")
     env_cfg = task_cfg.env_config
     policy_config = task_cfg.policy_config
-    env = env_class(task_type=env_cfg.task_type, config=env_cfg)
 
     if args.task in _TWO_AGENT_TASKS:
-        main_2a(args, latest_ckpt, env, task_cfg)
+        main_2a(latest_ckpt, task_cfg)
         return
 
+    # Single-agent actor: build the network + inference fn directly from config and
+    # the loaded checkpoint params (normalize_observations=False -> identity preprocess,
+    # matching training). No env, no scene files, no device-count constraints.
+    obs_size = _obs_size_from_config(env_cfg)
     policy_obs_key = policy_config.network_factory.policy_obs_key
-
-    network_factory = functools.partial(
-        make_ppo_networks, **policy_config.network_factory
+    params = ppo_checkpoint.load(latest_ckpt)
+    ppo_network = make_ppo_networks(
+        obs_size, env_cfg.num_act,
+        preprocess_observations_fn=lambda x, y: x,
+        **policy_config.network_factory,
     )
-    train_fn = functools.partial(
-        ppo.train,
-        num_timesteps=0,
-        episode_length=policy_config.episode_length,
-        normalize_observations=False,
-        restore_checkpoint_path=latest_ckpt,
-        network_factory=network_factory,
-        wrap_env_fn=wrapper.wrap_for_brax_training,
-        num_envs=jax.device_count(),  # must be divisible by device_count
-    )
-
-    make_inference_fn, params, _ = train_fn(environment=env)
-    inference_fn = make_inference_fn(params, deterministic=True)
-
-    obs_size = env.observation_size
-    act_size = env.action_size
+    inference_fn = make_inference_fn(ppo_network)(params, deterministic=True)
 
     convert_jax2onnx(
         ckpt_dir=latest_ckpt,
@@ -327,7 +312,7 @@ def main(args: Args):
         inference_fn=inference_fn,
         hidden_layer_sizes=policy_config.network_factory.policy_hidden_layer_sizes,
         obs_size=obs_size,
-        action_size=act_size,
+        action_size=env_cfg.num_act,
         policy_obs_key=policy_obs_key,
         jax_params=params,
         activation="swish",

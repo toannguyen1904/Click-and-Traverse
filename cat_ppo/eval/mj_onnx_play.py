@@ -33,6 +33,8 @@ class Args:
     stage1_steps: int = -1    # for G1CaTra: override stage 1 length; -1 = use task default
     warmstart_states_path: str = None  # path to .npz warm-start file; starts episode in Stage 2
     warmstart_idx: int = -1   # which saved state to load (-1 = random)
+    init_pos_offset: float = 0.0  # G1CaTra: random xy offset (m) for robot+box init pose in [-v, v]; 0 disables
+    init_ang_offset: float = 0.0  # G1CaTra: random yaw offset (deg) for robot+box init pose in [-v, v]; 0 disables
     record: bool = False      # save rollout video to disk
     video_path: str = None    # output video path; defaults to <exp_name>/rollout.mp4
     video_width: int = 640
@@ -81,7 +83,7 @@ def play(args: Args):
         env_cfg.warmstart_states_path = args.warmstart_states_path
         if args.stage1_steps < 0 and hasattr(env_cfg, "stage1_steps"):
             env_cfg.stage1_steps = 0
-    env = env_class(task_type=env_cfg.task_type, config=env_cfg)
+    env = env_class(task_type=env_cfg.task_type, config=env_cfg, headless=args.record)
     env.pri = args.pri
 
     # Override box geometry in the MuJoCo model before reset
@@ -129,7 +131,14 @@ def play(args: Args):
         writer = imageio.get_writer(video_path, fps=args.video_fps)
         print(f"Recording video to: {video_path}")
 
-    state = env.reset(warmstart_idx=args.warmstart_idx) if hasattr(env, '_ws_qpos') else env.reset()
+    if hasattr(env, '_ws_qpos'):
+        state = env.reset(
+            warmstart_idx=args.warmstart_idx,
+            pos_offset=args.init_pos_offset,
+            ang_offset_deg=args.init_ang_offset,
+        )
+    else:
+        state = env.reset()
     if args.yaw != 0.0:
         angle = np.deg2rad(args.yaw)
         env.mj_data.qpos[3:7] = [np.cos(angle/2), 0, 0, np.sin(angle/2)]  # wxyz pure yaw quaternion

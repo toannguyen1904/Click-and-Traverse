@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Two-stage CaTra environment: stage 1 pickup (steps 0 -> stage1_steps-1) + stage 2 carry & traverse (steps stage1_steps -> stage1_steps+999)."""
+"""Two-stage CaTra environment: stage 1 pickup (steps 0 -> stage1_steps-1) + stage 2 carry & traverse (steps stage1_steps -> stage1_steps+499)."""
 
 from typing import Any, Dict, Optional, Union
 
@@ -354,9 +354,9 @@ def make_warmstart_only_catra(states_path: str):
 def g1_catra_task_config() -> config_dict.ConfigDict:
     """Config for two-stage G1CaTra.
 
-    Episode: 1100 steps (22 s @ 50 Hz).
+    Episode: 600 steps (12 s @ 50 Hz).
       Stage 1 (steps   0 –> stage1_steps-1): zero command, pickup rewards (22 terms).
-      Stage 2 (steps stage1_steps -> stage1_steps+999): PF-derived command, navigation + carry rewards.
+      Stage 2 (steps stage1_steps -> stage1_steps+499): PF-derived command, navigation + carry rewards.
 
     Observation dimensions:
       num_obs = 239  (state, deployable; PF subblock delayed + nav-frame, not additively noised)
@@ -366,13 +366,13 @@ def g1_catra_task_config() -> config_dict.ConfigDict:
         task_type="flat_terrain_catra",
         ctrl_dt=0.02,
         sim_dt=0.002,
-        episode_length=1100,
+        episode_length=600,
         stage1_steps=100,
         action_repeat=1,
         action_scale=0.5,
         history_len=15,
-        num_obs=239,    # TEMP 20-DOF (no waist); 23-DOF (waist) would be 251 (+3 joints x 4 obs fields)
-        num_pri=333,    # TEMP 20-DOF; 23-DOF would be 345
+        num_obs=239,    # TEMP 20-DOF (no waist) + box_mass(1), no stage_flag; 23-DOF (waist) would be 251 (+3 joints x 4 obs fields)
+        num_pri=333,    # TEMP 20-DOF + box_mass(1), no stage_flag; 23-DOF would be 345
         num_act=20,     # TEMP: 12 legs + 8 arms (3 waist removed)
         restricted_joint_range=False,
         soft_joint_pos_limit_factor=0.95,
@@ -516,7 +516,7 @@ def g1_catra_task_config() -> config_dict.ConfigDict:
         madrona_backend=False,
         augment_pixels=False,
         num_envs=32768,
-        episode_length=1100,
+        episode_length=600,
         action_repeat=1,
         wrap_env_fn=None,
         randomization_fn=domain_randomize_catra,
@@ -574,7 +574,7 @@ class G1CaTraEnv(G1CatEnv):
     """Two-stage G1 humanoid: stage 1 pickup, stage 2 carry & traverse.
 
     Stage 1 (steps 0 -> stage1_steps-1): robot stands, uses Pickup rewards (22 terms).
-    Stage 2 (steps stage1_steps -> stage1_steps+999): robot walks with box, uses CAT navigation rewards
+    Stage 2 (steps stage1_steps -> stage1_steps+499): robot walks with box, uses CAT navigation rewards
     + 6 carry-maintenance terms.
 
     Action space: 20 DOF (12 leg + 8 arm joints; TEMP: all 3 waist joints removed).
@@ -633,6 +633,11 @@ class G1CaTraEnv(G1CatEnv):
             self._mj_model.geom("left_hand_collision").id,
             self._mj_model.geom("right_hand_collision").id,
         ])
+        self._thigh_geom_ids    = np.array([
+            self._mj_model.geom("left_thigh").id,
+            self._mj_model.geom("right_thigh").id,
+        ])
+        self._head_geom_id      = self._mj_model.geom("head_collision").id
 
         # Hip-yaw joint qpos indices (offset to drop into qpos[7:] via +7), for hip_yaw_lim reward.
         self._hip_yaw_indices = jp.array([
@@ -783,6 +788,9 @@ class G1CaTraEnv(G1CatEnv):
             feet_pos, hands_pos, knees_pos, shlds_pos,
         ], axis=0)
         all_gf = self.sample_field(self.gf, all_poses)
+        if self._config.box_use_inflation:
+            # Hands are the box's actuator, so they follow the same (inflation) field as the box (rows 5:7 = hands).
+            all_gf = all_gf.at[5:7].set(self.sample_field(self.gf_box, hands_pos))
         all_bf = self.sample_field(self.bf, all_poses)
         all_df = self.sample_field(self.sdf, all_poses)
         headgf, pelvgf, torsgf, feetgf, handsgf, kneesgf, shldsgf = jp.split(all_gf, [1, 2, 3, 5, 7, 9], axis=0)
@@ -1014,6 +1022,9 @@ class G1CaTraEnv(G1CatEnv):
             feet_pos, hands_pos, knees_pos, shlds_pos,
         ], axis=0)
         all_gf = self.sample_field(self.gf, all_poses)
+        if self._config.box_use_inflation:
+            # Hands are the box's actuator, so they follow the same (inflation) field as the box (rows 5:7 = hands).
+            all_gf = all_gf.at[5:7].set(self.sample_field(self.gf_box, hands_pos))
         all_bf = self.sample_field(self.bf, all_poses)
         all_df = self.sample_field(self.sdf, all_poses)
         headgf, pelvgf, torsgf, feetgf, handsgf, kneesgf, shldsgf = jp.split(all_gf, [1, 2, 3, 5, 7, 9], axis=0)
@@ -1042,6 +1053,9 @@ class G1CaTraEnv(G1CatEnv):
         p_odom = odom_delay[:3]; q_odom = odom_delay[3:7]
         all_poses_delay = delay_body_pos(p_gt, q_gt, p_odom, q_odom, all_poses)
         all_gf_delay = self.sample_field(self.gf, all_poses_delay)
+        if self._config.box_use_inflation:
+            # Hands follow the box's (inflation) field (rows 5:7 = hands).
+            all_gf_delay = all_gf_delay.at[5:7].set(self.sample_field(self.gf_box, all_poses_delay[5:7]))
         all_bf_delay = self.sample_field(self.bf, all_poses_delay)
         all_df_delay = self.sample_field(self.sdf, all_poses_delay)
 
@@ -1197,10 +1211,11 @@ class G1CaTraEnv(G1CatEnv):
             last_act(23), motor_targets[action_ids](23),
             command(4), foot_height(1), gait_phase(4),
             body_pf_delayed_nav(77) + box_pf_delayed_nav(56) = 133,
-            box_pos_local(3), box_quat_local(4), box_size(3), stage_flag(1)
+            box_pos_local(3), box_quat_local(4), box_size(3), box_mass(1)
 
         Privileged (345 = 244 noiseless-state-block + 101 extras):
             [same fields, noiseless, world-frame PF (body 77 + box 56 = 133), no box_pos_local/quat_local]
+            box_size(3), box_mass(1),
             + linvel_pelvis(3), body_positions(33), body_velocities(15),
               box_pos_world(3), box_quat_world(4), box_linvel(3), box_angvel(3),
               navi_torso_rpy[:2](2)+gait_mask(2)+feet_contact(2),
@@ -1227,8 +1242,6 @@ class G1CaTraEnv(G1CatEnv):
         box_linvel_world = data.qvel[BOX_QVEL_START:BOX_QVEL_START + 3]
         box_angvel_world = data.qvel[BOX_QVEL_START + 3:BOX_QVEL_START + 6]
 
-        stage_flag = jp.where(info["step"] >= self._config.stage1_steps, jp.array(1.0), jp.array(0.0))
-
         navi2world_pose = info["navi2world_pose"]
 
         # --- Build noiseless PF block (77 body + 56 box = 133 dims, world frame, non-delayed) ---
@@ -1254,7 +1267,7 @@ class G1CaTraEnv(G1CatEnv):
             info["command"], info["foot_height"], gait_phase,
             pf_noiseless,
             info["box_size"],
-            stage_flag.reshape(1),
+            info["box_mass"].reshape(1),
             # Privileged extras (101 dims)
             linvel_pelvis,
             info["pelv_pos"].reshape(-1), info["tors_pos"].reshape(-1), info["head_pos"].reshape(-1),
@@ -1337,7 +1350,7 @@ class G1CaTraEnv(G1CatEnv):
             command, info["foot_height"], gait_phase,
             pf,
             box_pos_local, box_quat_local, info["box_size"],
-            stage_flag.reshape(1),
+            info["box_mass"].reshape(1),
         ])
 
         return {
@@ -1367,10 +1380,17 @@ class G1CaTraEnv(G1CatEnv):
         # Body-obstacle SDF collision active only after step 150 (allow pickup phase to settle)
         contact_termination &= (info["step"] >= self._config.stage1_steps + 50)
 
+        # Box–thigh collision (box bumps into the upper legs while carried)
+        box_thigh_termination = collision.geoms_colliding(data, self._box_geom_id, self._thigh_geom_ids[0])
+        box_thigh_termination |= collision.geoms_colliding(data, self._box_geom_id, self._thigh_geom_ids[1])
+
+        # Box–head collision (box bumps into the head while carried)
+        box_head_termination = collision.geoms_colliding(data, self._box_geom_id, self._head_geom_id)
+
         # Box dropped — active throughout the full episode
         box_drop_termination = info['box_pos'][2] < self._config.box_drop_threshold
 
-        return fall_termination | contact_termination | box_drop_termination | jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any()
+        return fall_termination | contact_termination | box_thigh_termination | box_head_termination | box_drop_termination | jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any()
         # return fall_termination | contact_termination | jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any()   # CHANGED
 
 

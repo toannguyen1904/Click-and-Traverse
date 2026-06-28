@@ -185,6 +185,263 @@ def _remove_pixels(
     return {k: v for k, v in obs.items() if not k.startswith("pixels/")}
 
 
+# --------------------------------------------------------------------------- #
+# DAgger x RL distillation helpers                                            #
+#                                                                             #
+# Distill multiple privileged specialists (G1CaTraPri single-agent, or        #
+# G1CaTra2APri two-agent) into a single generalist G1CaTra student. The       #
+# student rollout env (G1CaTraDagger) routes each episode's potential fields  #
+# to one scene and tags it with `pf_id`; the matching specialist supervises   #
+# that env. Schedule is two-phase: KL imitation for the first                 #
+# `dagger_timesteps` env steps, then standard PPO.                            #
+# --------------------------------------------------------------------------- #
+
+
+def _cfg_get(config: Optional[Any], name: str, default: Any = None) -> Any:
+    if config is None:
+        return default
+    if isinstance(config, Mapping):
+        return config.get(name, default)
+    return getattr(config, name, default)
+
+
+def _stack_trees(trees):
+    return jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=0), *trees)
+
+
+def _teacher_observation(
+    observation: Any,
+    teacher_obs_key: Optional[str],
+    teacher_privileged_obs_key: Optional[str],
+) -> Any:
+    """Remap the student rollout observation into a teacher policy observation."""
+    if teacher_obs_key is None:
+        return observation
+    if not isinstance(observation, Mapping):
+        raise ValueError("teacher_obs_key requires dict observations")
+    if teacher_obs_key not in observation:
+        raise ValueError(f"Missing DAgger teacher obs key: {teacher_obs_key}")
+
+    teacher_obs = {"state": observation[teacher_obs_key]}
+    if teacher_privileged_obs_key is not None:
+        if teacher_privileged_obs_key not in observation:
+            raise ValueError(
+                f"Missing DAgger teacher privileged obs key: {teacher_privileged_obs_key}"
+            )
+        teacher_obs["privileged_state"] = observation[teacher_privileged_obs_key]
+    elif "privileged_state" in observation:
+        teacher_obs["privileged_state"] = observation["privileged_state"]
+    return teacher_obs
+
+
+def _uint64_lt(value: types.UInt64, other: int) -> jnp.ndarray:
+    other_hi = jnp.uint32(other >> 32)
+    other_lo = jnp.uint32(other & 0xFFFFFFFF)
+    return (value.hi < other_hi) | ((value.hi == other_hi) & (value.lo < other_lo))
+
+
+def _teacher_logits_all(
+    teacher_kind: str,
+    teacher_observation: Any,
+    student_policy_apply: Callable,
+    teacher_normalizer_params: Any,
+    teacher_policy_params: Any,
+    teacher_policy_apply_lower: Optional[Callable],
+    teacher_policy_apply_upper: Optional[Callable],
+) -> jnp.ndarray:
+    """Per-teacher action logits in the student's distribution layout.
+
+    Single-agent teachers reuse the student's 20-dim policy apply directly.
+    Two-agent teachers run their lower (12) + upper (8) policy nets and
+    reassemble the two NormalTanh param vectors into the student's
+    `[loc(20), scale(20)]` layout (lower-first, matching the env action order).
+    """
+    if teacher_kind == "2a":
+        policy_lower, policy_upper = teacher_policy_params
+
+        def teacher_apply(norm, p_lower, p_upper):
+            logits_l = teacher_policy_apply_lower(norm, p_lower, teacher_observation)
+            logits_u = teacher_policy_apply_upper(norm, p_upper, teacher_observation)
+            loc_l, scale_l = jnp.split(logits_l, 2, axis=-1)
+            loc_u, scale_u = jnp.split(logits_u, 2, axis=-1)
+            return jnp.concatenate([loc_l, loc_u, scale_l, scale_u], axis=-1)
+
+        return jax.vmap(teacher_apply)(
+            teacher_normalizer_params, policy_lower, policy_upper
+        )
+
+    def teacher_apply(norm, policy):
+        return student_policy_apply(norm, policy, teacher_observation)
+
+    return jax.vmap(teacher_apply)(teacher_normalizer_params, teacher_policy_params)
+
+
+def compute_dagger_loss(
+    params: ppo_losses.PPONetworkParams,
+    normalizer_params: Any,
+    data: types.Transition,
+    rng: jnp.ndarray,
+    ppo_network: ppo_networks.PPONetworks,
+    teacher_normalizer_params: Any,
+    teacher_policy_params: Any,
+    num_teachers: int,
+    teacher_kind: str = "single",
+    teacher_policy_apply_lower: Optional[Callable] = None,
+    teacher_policy_apply_upper: Optional[Callable] = None,
+    kl_eps: float = 1e-5,
+    discounting: float = 0.9,
+    reward_scaling: float = 1.0,
+    gae_lambda: float = 0.95,
+    actor_loss_scale: float = 1.0,
+    value_loss_scale: float = 1.0,
+    teacher_obs_key: Optional[str] = None,
+    teacher_privileged_obs_key: Optional[str] = None,
+) -> Tuple[jnp.ndarray, types.Metrics]:
+    """KL-imitation loss toward the per-env selected teacher + a value loss."""
+    del rng
+    policy_apply = ppo_network.policy_network.apply
+    value_apply = ppo_network.value_network.apply
+    parametric_action_distribution = ppo_network.parametric_action_distribution
+
+    data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), data)
+    student_logits = policy_apply(normalizer_params, params.policy, data.observation)
+    baseline = value_apply(normalizer_params, params.value, data.observation)
+    terminal_obs = jax.tree_util.tree_map(lambda x: x[-1], data.next_observation)
+    bootstrap_value = value_apply(normalizer_params, params.value, terminal_obs)
+
+    teacher_observation = _teacher_observation(
+        data.observation, teacher_obs_key, teacher_privileged_obs_key
+    )
+
+    teacher_logits_all = _teacher_logits_all(
+        teacher_kind,
+        teacher_observation,
+        policy_apply,
+        teacher_normalizer_params,
+        teacher_policy_params,
+        teacher_policy_apply_lower,
+        teacher_policy_apply_upper,
+    )
+    pf_id = data.extras["state_extras"]["pf_id"].astype(jnp.int32)
+    pf_id = jnp.clip(pf_id, 0, num_teachers - 1)
+    teacher_weight = jax.nn.one_hot(pf_id, num_teachers, dtype=student_logits.dtype)
+    teacher_logits = jnp.einsum("tbn,ntba->tba", teacher_weight, teacher_logits_all)
+
+    student_dist = parametric_action_distribution.create_dist(student_logits)
+    teacher_dist = parametric_action_distribution.create_dist(teacher_logits)
+    student_std = jnp.maximum(student_dist.scale, kl_eps)
+    teacher_std = jnp.maximum(teacher_dist.scale, kl_eps)
+    log_term = jnp.log(teacher_std / student_std + kl_eps)
+    numerator = jnp.square(student_std) + jnp.square(student_dist.loc - teacher_dist.loc)
+    denominator = 2.0 * jnp.square(teacher_std)
+    dagger_kl = jnp.sum(log_term + numerator / denominator - 0.5, axis=-1)
+    dagger_kl = jnp.mean(dagger_kl)
+
+    rewards = data.reward * reward_scaling
+    truncation = data.extras["state_extras"]["truncation"]
+    termination = (1 - data.discount) * (1 - truncation)
+    vs, _ = ppo_losses.compute_gae(
+        truncation=truncation,
+        termination=termination,
+        rewards=rewards,
+        values=baseline,
+        bootstrap_value=bootstrap_value,
+        lambda_=gae_lambda,
+        discount=discounting,
+    )
+    v_loss = jnp.mean(jnp.square(vs - baseline)) * 0.5 * 0.5
+
+    actor_loss = actor_loss_scale * dagger_kl
+    value_loss = value_loss_scale * v_loss
+    total_loss = actor_loss + value_loss
+    return total_loss, {
+        "total_loss": total_loss,
+        "policy_loss": actor_loss,
+        "v_loss": value_loss,
+        "entropy_loss": jnp.zeros_like(total_loss),
+        "dagger_kl": dagger_kl,
+        "student_std": jnp.mean(student_std),
+        "teacher_std": jnp.mean(teacher_std),
+        "loss_mode": jnp.ones_like(total_loss),
+    }
+
+
+def compute_dagger_then_ppo_loss(
+    params: ppo_losses.PPONetworkParams,
+    normalizer_params: Any,
+    data: types.Transition,
+    rng: jnp.ndarray,
+    dagger_phase: jnp.ndarray,
+    ppo_network: ppo_networks.PPONetworks,
+    teacher_normalizer_params: Any,
+    teacher_policy_params: Any,
+    num_teachers: int,
+    teacher_kind: str = "single",
+    teacher_policy_apply_lower: Optional[Callable] = None,
+    teacher_policy_apply_upper: Optional[Callable] = None,
+    kl_eps: float = 1e-5,
+    entropy_cost: float = 1e-4,
+    discounting: float = 0.9,
+    reward_scaling: float = 1.0,
+    gae_lambda: float = 0.95,
+    clipping_epsilon: float = 0.3,
+    normalize_advantage: bool = True,
+    actor_loss_scale: float = 1.0,
+    value_loss_scale: float = 1.0,
+    teacher_obs_key: Optional[str] = None,
+    teacher_privileged_obs_key: Optional[str] = None,
+) -> Tuple[jnp.ndarray, types.Metrics]:
+    """Switch between DAgger KL imitation and PPO based on `dagger_phase`."""
+
+    def dagger_loss(_):
+        return compute_dagger_loss(
+            params,
+            normalizer_params,
+            data,
+            rng,
+            ppo_network=ppo_network,
+            teacher_normalizer_params=teacher_normalizer_params,
+            teacher_policy_params=teacher_policy_params,
+            num_teachers=num_teachers,
+            teacher_kind=teacher_kind,
+            teacher_policy_apply_lower=teacher_policy_apply_lower,
+            teacher_policy_apply_upper=teacher_policy_apply_upper,
+            kl_eps=kl_eps,
+            discounting=discounting,
+            reward_scaling=reward_scaling,
+            gae_lambda=gae_lambda,
+            actor_loss_scale=actor_loss_scale,
+            value_loss_scale=value_loss_scale,
+            teacher_obs_key=teacher_obs_key,
+            teacher_privileged_obs_key=teacher_privileged_obs_key,
+        )
+
+    def ppo_loss(_):
+        total_loss, metrics = ppo_losses.compute_ppo_loss(
+            params,
+            normalizer_params,
+            data,
+            rng,
+            ppo_network=ppo_network,
+            entropy_cost=entropy_cost,
+            discounting=discounting,
+            reward_scaling=reward_scaling,
+            gae_lambda=gae_lambda,
+            clipping_epsilon=clipping_epsilon,
+            normalize_advantage=normalize_advantage,
+        )
+        metrics = {
+            **metrics,
+            "dagger_kl": jnp.zeros_like(total_loss),
+            "student_std": jnp.zeros_like(total_loss),
+            "teacher_std": jnp.zeros_like(total_loss),
+            "loss_mode": jnp.zeros_like(total_loss),
+        }
+        return total_loss, metrics
+
+    return jax.lax.cond(dagger_phase, dagger_loss, ppo_loss, operand=None)
+
+
 def train(
     environment: envs.Env,
     num_timesteps: int,
@@ -237,6 +494,7 @@ def train(
     restore_checkpoint_path: Optional[str] = None,
     restore_params: Optional[Any] = None,
     restore_value_fn: bool = False,
+    dagger_config: Optional[Any] = None,
 ):
     """PPO training.
 
@@ -388,6 +646,53 @@ def train(
     )
     make_policy = ppo_networks.make_inference_fn(ppo_network)
 
+    # ---- DAgger distillation setup (load + stack teacher specialists) ----
+    use_dagger = bool(_cfg_get(dagger_config, "enable", False))
+    teacher_checkpoint_paths = list(_cfg_get(dagger_config, "teacher_checkpoint_paths", []))
+    dagger_timesteps = int(_cfg_get(dagger_config, "dagger_timesteps", 0))
+    teacher_kind = str(_cfg_get(dagger_config, "teacher_kind", "single"))
+    teacher_normalizer_params = None
+    teacher_policy_params = None
+    teacher_policy_apply_lower = None
+    teacher_policy_apply_upper = None
+    if use_dagger:
+        loss_name = _cfg_get(dagger_config, "loss", "kl")
+        if loss_name != "kl":
+            raise ValueError(f"Unsupported DAgger loss: {loss_name!r}; only 'kl' is implemented")
+        if teacher_kind not in ("single", "2a"):
+            raise ValueError(f"Unsupported dagger teacher_kind: {teacher_kind!r}")
+        if not teacher_checkpoint_paths:
+            raise ValueError("dagger_config.enable=True requires teacher_checkpoint_paths")
+        teacher_params = tuple(checkpoint.load(path) for path in teacher_checkpoint_paths)
+        teacher_normalizer_params = _stack_trees([p[0] for p in teacher_params])
+        if teacher_kind == "2a":
+            # Two-agent checkpoint layout:
+            # (normalizer, policy_lower, policy_upper, value_lower, value_upper).
+            from cat_ppo.learning.policy.ppo import networks_2a
+
+            action_size_lower = int(_cfg_get(dagger_config, "teacher_action_size_lower", 12))
+            action_size_upper = int(_cfg_get(dagger_config, "teacher_action_size_upper", 8))
+            teacher_hidden = tuple(
+                _cfg_get(dagger_config, "teacher_policy_hidden_layer_sizes", []) or (256, 128, 64)
+            )
+            teacher_2a_net = networks_2a.make_ppo_networks_2a(
+                obs_shape,
+                action_size_lower=action_size_lower,
+                action_size_upper=action_size_upper,
+                preprocess_observations_fn=normalize,
+                policy_hidden_layer_sizes=teacher_hidden,
+                # teacher_observation is remapped to {"state": <302-dim>, ...}.
+                policy_obs_key="state",
+            )
+            teacher_policy_apply_lower = teacher_2a_net.policy_network_lower.apply
+            teacher_policy_apply_upper = teacher_2a_net.policy_network_upper.apply
+            teacher_policy_params = (
+                _stack_trees([p[1] for p in teacher_params]),
+                _stack_trees([p[2] for p in teacher_params]),
+            )
+        else:
+            teacher_policy_params = _stack_trees([p[1] for p in teacher_params])
+
     optimizer = optax.adam(learning_rate=learning_rate)
     if max_grad_norm is not None:
         optimizer = optax.chain(
@@ -395,16 +700,39 @@ def train(
             optax.adam(learning_rate=learning_rate),
         )
 
-    loss_fn = functools.partial(
-        ppo_losses.compute_ppo_loss,
-        ppo_network=ppo_network,
-        entropy_cost=entropy_cost,
-        discounting=discounting,
-        reward_scaling=reward_scaling,
-        gae_lambda=gae_lambda,
-        clipping_epsilon=clipping_epsilon,
-        normalize_advantage=normalize_advantage,
-    )
+    if use_dagger:
+        loss_fn = functools.partial(
+            compute_dagger_then_ppo_loss,
+            ppo_network=ppo_network,
+            teacher_normalizer_params=teacher_normalizer_params,
+            teacher_policy_params=teacher_policy_params,
+            num_teachers=len(teacher_checkpoint_paths),
+            teacher_kind=teacher_kind,
+            teacher_policy_apply_lower=teacher_policy_apply_lower,
+            teacher_policy_apply_upper=teacher_policy_apply_upper,
+            kl_eps=_cfg_get(dagger_config, "kl_eps", 1e-5),
+            teacher_obs_key=_cfg_get(dagger_config, "teacher_obs_key", None),
+            teacher_privileged_obs_key=_cfg_get(dagger_config, "teacher_privileged_obs_key", None),
+            entropy_cost=entropy_cost,
+            discounting=discounting,
+            reward_scaling=reward_scaling,
+            gae_lambda=gae_lambda,
+            clipping_epsilon=clipping_epsilon,
+            normalize_advantage=normalize_advantage,
+            actor_loss_scale=_cfg_get(dagger_config, "actor_loss_scale", 1.0),
+            value_loss_scale=_cfg_get(dagger_config, "value_loss_scale", 1.0),
+        )
+    else:
+        loss_fn = functools.partial(
+            ppo_losses.compute_ppo_loss,
+            ppo_network=ppo_network,
+            entropy_cost=entropy_cost,
+            discounting=discounting,
+            reward_scaling=reward_scaling,
+            gae_lambda=gae_lambda,
+            clipping_epsilon=clipping_epsilon,
+            normalize_advantage=normalize_advantage,
+        )
 
     gradient_update_fn = gradients.gradient_update_fn(
         loss_fn, optimizer, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True
@@ -427,16 +755,27 @@ def train(
         carry,
         data: types.Transition,
         normalizer_params: running_statistics.RunningStatisticsState,
+        dagger_phase: jnp.ndarray,
     ):
         optimizer_state, params, key = carry
         key, key_loss = jax.random.split(key)
-        (_, metrics), params, optimizer_state = gradient_update_fn(
-            params,
-            normalizer_params,
-            data,
-            key_loss,
-            optimizer_state=optimizer_state,
-        )
+        if use_dagger:
+            (_, metrics), params, optimizer_state = gradient_update_fn(
+                params,
+                normalizer_params,
+                data,
+                key_loss,
+                dagger_phase,
+                optimizer_state=optimizer_state,
+            )
+        else:
+            (_, metrics), params, optimizer_state = gradient_update_fn(
+                params,
+                normalizer_params,
+                data,
+                key_loss,
+                optimizer_state=optimizer_state,
+            )
 
         return (optimizer_state, params, key), metrics
 
@@ -445,6 +784,7 @@ def train(
         unused_t,
         data: types.Transition,
         normalizer_params: running_statistics.RunningStatisticsState,
+        dagger_phase: jnp.ndarray,
     ):
         optimizer_state, params, key = carry
         key, key_perm, key_grad = jax.random.split(key, 3)
@@ -468,7 +808,11 @@ def train(
 
         shuffled_data = jax.tree_util.tree_map(convert_data, data)
         (optimizer_state, params, _), metrics = jax.lax.scan(
-            functools.partial(minibatch_step, normalizer_params=normalizer_params),
+            functools.partial(
+                minibatch_step,
+                normalizer_params=normalizer_params,
+                dagger_phase=dagger_phase,
+            ),
             (optimizer_state, params, key_grad),
             shuffled_data,
             length=num_minibatches,
@@ -476,7 +820,7 @@ def train(
         return (optimizer_state, params, key), metrics
 
     def training_step(
-        carry: Tuple[TrainingState, envs.State, PRNGKey], unused_t
+        carry: Tuple[TrainingState, envs.State, PRNGKey], unused_t, *, enable_metrics: bool
     ) -> Tuple[Tuple[TrainingState, envs.State, PRNGKey], Metrics]:
         training_state, state, key = carry
         key_sgd, key_generate_unroll, new_key = jax.random.split(key, 3)
@@ -489,6 +833,10 @@ def train(
             )
         )
 
+        extra_fields = ("truncation", "episode_metrics", "episode_done")
+        if use_dagger:
+            extra_fields = extra_fields + ("pf_id",)
+
         def f(carry, unused_t):
             current_state, current_key = carry
             current_key, next_key = jax.random.split(current_key)
@@ -498,7 +846,7 @@ def train(
                 policy,
                 current_key,
                 unroll_length,
-                extra_fields=("truncation", "episode_metrics", "episode_done"),
+                extra_fields=extra_fields,
             )
             return (next_state, next_key), data
 
@@ -515,7 +863,7 @@ def train(
         )
         assert data.discount.shape[1:] == (unroll_length,)
 
-        if log_training_metrics:  # log unroll metrics
+        if enable_metrics:  # log unroll metrics
             jax.debug.callback(
                 metrics_aggregator.update_episode_metrics,
                 data.extras["state_extras"]["episode_metrics"],
@@ -528,9 +876,16 @@ def train(
             _remove_pixels(data.observation),
             pmap_axis_name=_PMAP_AXIS_NAME,
         )
+        # DAgger phase: imitate teachers while env_steps < dagger_timesteps, then PPO.
+        dagger_phase = _uint64_lt(training_state.env_steps, dagger_timesteps)
 
         (optimizer_state, params, _), metrics = jax.lax.scan(
-            functools.partial(sgd_step, data=data, normalizer_params=normalizer_params),
+            functools.partial(
+                sgd_step,
+                data=data,
+                normalizer_params=normalizer_params,
+                dagger_phase=dagger_phase,
+            ),
             (training_state.optimizer_state, training_state.params, key_sgd),
             (),
             length=num_updates_per_batch,
@@ -545,10 +900,10 @@ def train(
         return (new_training_state, state, new_key), metrics
 
     def training_epoch(
-        training_state: TrainingState, state: envs.State, key: PRNGKey
+        training_state: TrainingState, state: envs.State, key: PRNGKey, *, enable_metrics: bool
     ) -> Tuple[TrainingState, envs.State, Metrics]:
         (training_state, state, _), loss_metrics = jax.lax.scan(
-            training_step,
+            functools.partial(training_step, enable_metrics=enable_metrics),
             (training_state, state, key),
             (),
             length=num_training_steps_per_epoch,
@@ -556,16 +911,26 @@ def train(
         loss_metrics = jax.tree_util.tree_map(jnp.mean, loss_metrics)
         return training_state, state, loss_metrics
 
-    training_epoch = jax.pmap(training_epoch, axis_name=_PMAP_AXIS_NAME)
+    training_epoch_with_metrics = jax.pmap(
+        functools.partial(training_epoch, enable_metrics=log_training_metrics),
+        axis_name=_PMAP_AXIS_NAME,
+    )
+    training_epoch_without_metrics = jax.pmap(
+        functools.partial(training_epoch, enable_metrics=False),
+        axis_name=_PMAP_AXIS_NAME,
+    )
 
     # Note that this is NOT a pure jittable method.
     def training_epoch_with_timing(
-        training_state: TrainingState, env_state: envs.State, key: PRNGKey
+        training_state: TrainingState,
+        env_state: envs.State,
+        key: PRNGKey,
+        pmapped_training_epoch: Callable[[TrainingState, envs.State, PRNGKey], Tuple[TrainingState, envs.State, Metrics]],
     ) -> Tuple[TrainingState, envs.State, Metrics]:
         nonlocal training_walltime
         t = time.time()
         training_state, env_state = _strip_weak_type((training_state, env_state))
-        result = training_epoch(training_state, env_state, key)
+        result = pmapped_training_epoch(training_state, env_state, key)
         training_state, env_state, metrics = _strip_weak_type(result)
 
         metrics = jax.tree_util.tree_map(jnp.mean, metrics)
@@ -679,6 +1044,7 @@ def train(
     training_metrics = {}
     training_walltime = 0
     current_step = 0
+    disable_metrics_after_checkpoint = 4
     for it in range(num_evals_after_init):
         logging.info("starting iteration %s %s", it, time.time() - xt)
 
@@ -686,8 +1052,24 @@ def train(
             # optimization
             epoch_key, local_key = jax.random.split(local_key)
             epoch_keys = jax.random.split(epoch_key, local_devices_to_use)
+            disable_metrics_this_epoch = (
+                device_count > 1
+                and log_training_metrics
+                and it >= disable_metrics_after_checkpoint
+            )
+            if disable_metrics_this_epoch and it == disable_metrics_after_checkpoint:
+                logging.warning(
+                    "Disabling in-epoch training metrics after checkpoint %s on multi-GPU runs "
+                    "to avoid late jax.debug.callback stalls under pmap.",
+                    disable_metrics_after_checkpoint,
+                )
+            pmapped_training_epoch = (
+                training_epoch_without_metrics
+                if disable_metrics_this_epoch
+                else training_epoch_with_metrics
+            )
             (training_state, env_state, training_metrics) = training_epoch_with_timing(
-                training_state, env_state, epoch_keys
+                training_state, env_state, epoch_keys, pmapped_training_epoch
             )
             current_step = int(_unpmap(training_state.env_steps))
 

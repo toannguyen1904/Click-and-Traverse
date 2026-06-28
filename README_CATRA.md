@@ -20,9 +20,9 @@ Four task variants share the same environment dynamics, action space, terminatio
 | Robot | Unitree G1 humanoid |
 | Task | Pick up a box from a pillar, then carry it through obstacles |
 | Action space | 20 DOF (12 legs + 8 arms; TEMP: all 3 waist joints removed, held at default) |
-| Episode length | 1100 steps (22 s at 50 Hz) |
+| Episode length | 600 steps (12 s at 50 Hz) |
 | Stage 1 | Steps 0–(stage1_steps−1): stand-and-reach, pickup reward set. Set `stage1_steps=0` when using warm-start. |
-| Stage 2 | Steps stage1_steps to stage1_steps+999: PF-guided traversal + grasp-maintenance rewards |
+| Stage 2 | Steps stage1_steps to episode_length−1 (599): PF-guided traversal + grasp-maintenance rewards |
 | Box placement | 0.3 m in front of robot on a support pillar (default), or loaded from warm-start file |
 | Success criterion | Box lifted ≥ 10 cm in Stage 1 AND box still held + robot reaches PF target by Stage 2 end |
 
@@ -61,11 +61,11 @@ Wrist joints are not actuated. Action scale: `0.5`.
 | Stage | Steps | Duration | Command | Reward focus |
 |-------|-------|----------|---------|-------------|
 | Stage 1 — Pickup | 0–(stage1_steps−1) | `stage1_steps × 0.02` s | `[0, 0, 0, 0]` (stationary) | All 22 G1Pickup reward terms |
-| Stage 2 — Carry & Traverse | stage1_steps–(stage1_steps+999) | 20 s | PF-derived `[move_flag, vx, vy, yaw]` | CAT navigation rewards + 7 `_carry` grasp-maintenance terms + `feet_rotation` |
+| Stage 2 — Carry & Traverse | stage1_steps–(episode_length−1) | `(600 − stage1_steps) × 0.02` s | PF-derived `[move_flag, vx, vy, yaw]` | CAT navigation rewards + 7 `_carry` grasp-maintenance terms + `feet_rotation` |
 
 `stage1_steps` defaults to 100 (2 s pickup phase). When using warm-start (robot already holds the box at reset), set `stage1_steps=0` to skip Stage 1 entirely and start directly in Stage 2. This is done automatically by `train_ppo.py` when `--warmstart_states_path` is provided and `--stage1_steps` is not specified.
 
-The stage transition is a hard cut at `info["step"] == stage1_steps`. The policy receives a **stage flag** (0.0 in Stage 1, 1.0 in Stage 2) as part of its observation so it can learn stage-specific behaviors from a single policy.
+The stage transition is a hard cut at `info["step"] == stage1_steps`. The observation no longer carries an explicit stage flag — the policy infers the active stage from the `command` field (zeros in Stage 1, PF-derived in Stage 2) and learns stage-specific behavior implicitly.
 
 Command in Stage 1 is always `[0, 0, 0, 0]`. In Stage 2 the command is derived every step from PF (potential field) grid data via `compute_cmd_from_rtf`: a 4-dim vector `[move_flag, vx, vy, yaw]` in the navigation frame.
 
@@ -97,7 +97,7 @@ The PF subblock is **not additively noised** — only `gyro`/`gvec`/`joint_angle
 | `box_pos_local` | 3 | Box center position in pelvis frame |
 | `box_quat_local` | 4 | Box orientation in pelvis frame (wxyz) |
 | `box_size` | 3 | Box half-extents (hx, hy, hz) |
-| `stage_flag` | 1 | 0.0 in Stage 1, 1.0 in Stage 2 |
+| `box_mass` | 1 | Box mass in kg (DR-randomized per env) |
 | **Total** | **239** | |
 
 #### `privileged_state` (333-dim) — critic input only during training
@@ -106,7 +106,7 @@ Noiseless, world-frame version of the state block (without `box_pos_local`/`box_
 
 | Field | Dims | Notes |
 |-------|------|-------|
-| Noiseless state block | 232 | Same structure as state but noiseless and world-frame; body_pf(77) + box_pf(56) = 133; box_pos/quat_local omitted |
+| Noiseless state block | 232 | Same structure as state but noiseless and world-frame; body_pf(77) + box_pf(56) = 133; ends with box_size(3) + box_mass(1); box_pos/quat_local omitted |
 | `linvel_pelvis` | 3 | Pelvis linear velocity (world frame) |
 | `pelvis_pos` + `torso_pos` + `head_pos` | 9 | Absolute body positions |
 | `shlds_pos` + `hands_pos` + `knees_pos` + `feet_pos` | 24 | 2 sites × 4 body groups × 3 |
@@ -129,7 +129,7 @@ Teacher policy for distillation. **Not deployable** (uses ground-truth signals u
 
 #### `state` (302-dim) — actor input
 
-The actor sees the **same content as the G1CaTra `privileged_state`, minus the trailing 31 DR dims** (`rfi_lim_scale` + `kp_scale` + `kd_scale`). Implemented as a `priv[:-31]` slice in `G1CaTraPriEnv._get_obs` — no noise, current world-frame PF, body positions / velocities, box world pose and velocities, pelvis linvel, `navi_torso_rpy[:2]`, `gait_mask`, `feet_contact`, `stage_flag`.
+The actor sees the **same content as the G1CaTra `privileged_state`, minus the trailing 31 DR dims** (`rfi_lim_scale` + `kp_scale` + `kd_scale`). Implemented as a `priv[:-31]` slice in `G1CaTraPriEnv._get_obs` — no noise, current world-frame PF, body positions / velocities, box world pose and velocities, pelvis linvel, `navi_torso_rpy[:2]`, `gait_mask`, `feet_contact` (box size + mass are carried in the noiseless state block).
 
 | Field block | Dims | Notes |
 |-------|------|-------|
@@ -207,7 +207,8 @@ Navigation rewards (from `G1CatEnv`):
 | `upper_body_align` | -0.0 | Penalize XY drift of torso and head from pelvis (scaled off; previously −2.0) |
 | `headgf/handsgf/feetgf` | 0.0 | Body goal field tracking; set via `--overheadgf` / `--lateralgf` / `--groundgf` |
 | `headdf/handsdf/feetdf/kneesdf/shldsdf` | 0.0 | Body distance field penalties; set via `--overheaddf` / `--lateraldf` / `--grounddf` |
-| `boxdf` | 0.0 | Box-corner SDF collision penalty: `mean(softplus((0.05 − sdf) / 0.02))` over 8 corners; enable with `--box <scale>` |
+| `boxdf` | 0.0 | Box-corner SDF collision penalty: `mean(softplus((0.05 − sdf) / 0.02))` over 8 corners; enable with `--boxdf <scale>` |
+| `boxgf` | 0.0 | Box-corner guidance-field alignment over the 8 corners: rewards obstacle-driven lateral/vertical box motion along the guidance field, with the along-command component removed so it can't pull locomotion forward. Uses the inflated field `gf_inflation.npy` when `box_use_inflation=True` (default; `--box_inflation`), else regular `gf.npy`. Enable with `--boxgf <scale>` |
 
 Grasp-maintenance rewards (`_carry` suffix):
 
@@ -225,15 +226,18 @@ Grasp-maintenance rewards (`_carry` suffix):
 
 ## Termination Conditions
 
-| Condition | Threshold |
-|-----------|-----------|
-| Robot fall (gravity vector) | `gvec_z < 0` |
-| Robot fall (head height) | `head_z < 0.7 m` |
-| Box dropped | `box_z < 0.3 m` — active throughout full episode |
-| Body-obstacle SDF collision | any of head/torso/pelvis/feet/hands/knees/shoulders df < −4 cm (active after step `stage1_steps + 50`) |
-| Box-corner SDF collision | any of the 8 box corners df < −4 cm (same threshold; gated identically) |
-| NaN in qpos or qvel | any |
-| Episode timeout | 1100 steps (22 s) |
+| Condition | Threshold | Gating |
+|-----------|-----------|--------|
+| Robot fall (gravity vector) | `gvec_z < 0` | always |
+| Robot fall (head height) | `head_z < 0.7 m` | always |
+| Box dropped | `box_z < 0.3 m` (`box_drop_threshold`) | always |
+| Box–thigh collision | `box_geom` touches either thigh geom | always |
+| Box–head collision | `box_geom` touches the head geom | always |
+| Leg self-collision | foot↔foot, or either foot↔opposite shin | after step `stage1_steps + 50` |
+| Body-obstacle SDF collision | any of head/torso/pelvis/feet/hands/knees/shoulders df < −4 cm (`term_collision_threshold`) | after step `stage1_steps + 50` |
+| Box-corner SDF collision | any of the 8 box corners (`boxdf`) df < −4 cm | after step `stage1_steps + 50` |
+| NaN in qpos or qvel | any | always |
+| Episode timeout | 600 steps (12 s) | always |
 
 ---
 
@@ -309,12 +313,13 @@ MjxEnv (mujoco_playground)
 
 ### Key Implementation Details
 
-- **Stage flag in obs**: The scalar `0.0` (Stage 1) or `1.0` (Stage 2) appended as the last element of the proprioceptive block. Lets the policy learn stage-specific behavior from a single network. With warm-start (`stage1_steps=0`) the flag is always 1.0.
+- **Stage inference (no explicit flag)**: CaTra no longer appends a stage flag to the observation. The policy infers the Stage 1→2 transition from the `command` field (zeros in Stage 1, PF-derived in Stage 2). With warm-start (`stage1_steps=0`) the episode is entirely Stage 2.
+- **Box mass in obs**: Both actor `state` and critic `privileged_state` carry the (DR-randomized) box mass as a scalar alongside `box_size`, so the policy can adapt grasp/carry effort to the box's weight.
 - **Warm-start**: When `warmstart_states_path` is set, `reset()` loads `(qpos, qvel)` directly from the pre-generated `.npz` (no physics rollout inside reset). Box mass/size are carried exactly from the pickup generation run.
 - **G1CaTraPri obs construction**: `G1CaTraPriEnv._get_obs` calls `super()._get_obs()` and slices `priv[:-31]` to form the actor state. Because the slice is structural, the bit-exact identity `G1CaTra.privileged_state[:-31] == G1CaTraPri.state` holds for the same initial state.
 - **JIT-friendly reward gating**: Both stage reward dicts are computed every step; `jp.where(step < stage1_steps, ...)` gates which set contributes to the return. Dict shape is static — no dynamic branching.
 - **Push forces gated**: Random push perturbations are suppressed during Stage 1 (`step < stage1_steps`). Full pushes activate in Stage 2 when locomotion is expected.
-- **Box corner PF**: The obstacle fields (sdf, bf, gf) are sampled at all **8 corners** of the box each step and included in both the deployable state and privileged state (56 dims each: 8 corners × (gf:3 + bf:3 + sdf:1)). The same 5-step delay + nav-frame transform applied to body PF is applied to box corner PF in the deployable state. The `boxdf` reward is scaled 0.0 by default; enable with `--box <scale>`.
+- **Box corner PF**: The obstacle fields (sdf, bf, gf) are sampled at all **8 corners** of the box each step and included in both the deployable state and privileged state (56 dims each: 8 corners × (gf:3 + bf:3 + sdf:1)). The same 5-step delay + nav-frame transform applied to body PF is applied to box corner PF in the deployable state. The `boxdf` (SDF collision penalty) and `boxgf` (guidance-field alignment) rewards are both scaled 0.0 by default; enable with `--boxdf <scale>` / `--boxgf <scale>`. The `boxgf` reward samples the inflated field `gf_inflation.npy` when `box_use_inflation=True` (default, `--box_inflation`), so the scene's PF directory must contain that file.
 - **Box drop threshold**: Termination fires when `box_z < 0.3 m` (at or below pillar surface), allowing the box to move freely above that during carries.
 - **SDF termination gating**: Body/box-obstacle collision termination is suppressed until step `stage1_steps + 50`, giving the robot time to stabilize its carry before collision penalties apply.
 - **Navigation command sites**: `compute_cmd_from_rtf` builds the Stage 2 PF command from the pelvis + head + feet goal/body fields only. Hands were removed from this aggregation — they still appear in the observation PF subblock and are still affected by `handsdf` / `handsgf` rewards, but no longer steer the navigation command.
@@ -444,7 +449,7 @@ python train_ppo_catra.py \
     --groundgf 1.0 --grounddf 1.0 \
     --lateralgf 1.0 --lateraldf 0.4 \
     --overheadgf 1.0 --overheaddf 1.0 \
-    --box 1.0
+    --boxdf 1.0 --boxgf 1.0
 ```
 
 ### Train G1CaTraPri (privileged-actor teacher)
@@ -460,7 +465,7 @@ python train_ppo_catra.py \
     --groundgf 1.0 --grounddf 1.0 \
     --lateralgf 1.0 --lateraldf 0.4 \
     --overheadgf 1.0 --overheaddf 1.0 \
-    --box 1.0
+    --boxdf 1.0 --boxgf 1.0
 ```
 
 ### Train two-agent (G1CaTra2A / G1CaTra2APri)
@@ -476,7 +481,7 @@ python train_ppo_catra_2a.py \
     --groundgf 1.0 --grounddf 1.0 \
     --lateralgf 1.0 --lateraldf 0.4 \
     --overheadgf 1.0 --overheaddf 1.0 \
-    --box 1.0
+    --boxdf 1.0 --boxgf 1.0
 ```
 
 Per-agent losses are logged under `training/lower/*` and `training/upper/*`. ONNX is auto-exported on completion (two files — see below).
@@ -486,9 +491,10 @@ Per-agent losses are logged under `training/lower/*` and `training/upper/*`. ONN
 - `--groundgf` / `--grounddf` → `feetgf` / `feetdf`
 - `--lateralgf` / `--lateraldf` → `handsgf` / `handsdf` / `kneesdf` / `shldsdf`
 - `--overheadgf` / `--overheaddf` → `headgf` / `headdf`
-- `--box` → `boxdf` (box-corner SDF penalty)
+- `--boxdf` → `boxdf` (box-corner SDF collision penalty, G1CaTra only)
+- `--boxgf` → `boxgf` (box-corner guidance-field alignment, G1CaTra only)
 
-All default to 0 (disabled).
+All default to 0 (disabled). `--box_inflation` (default `True`) controls whether the `boxgf` reward samples the inflated field `gf_inflation.npy` (anticipatory) or the regular `gf.npy`; it sets `box_use_inflation` on the env config.
 
 ### Export to ONNX
 

@@ -1,7 +1,7 @@
 """CPU-based inference environment for the two-stage G1CaTra policy.
 
 Stage 1 (steps 0 -> stage1_steps - 1):  zero command, robot picks up box.
-Stage 2 (steps stage1_steps -> stage1_steps+999): PF-derived command, robot walks carrying box.
+Stage 2 (steps stage1_steps -> stage1_steps+499): PF-derived command, robot walks carrying box.
 
 Mirrors G1CaTraEnv._get_obs (195-dim state) for ONNX policy playback.
 """
@@ -153,8 +153,14 @@ class PlayG1CaTraEnv(BaseEnv):
     def action_size(self) -> int:
         return len(self.action_joint_names)
 
-    def reset(self, warmstart_idx: int = -1):
-        """Reset to default pose (box on pillar) or to a saved warm-start state."""
+    def reset(self, warmstart_idx: int = -1, pos_offset: float = 0.0, ang_offset_deg: float = 0.0):
+        """Reset to default pose (box on pillar) or to a saved warm-start state.
+
+        pos_offset / ang_offset_deg (>0) randomly perturb the initial robot+box pose to
+        test generalization to unseen starting configurations relative to the obstacle
+        field: an xy displacement in [-pos_offset, pos_offset] m and a yaw rotation in
+        [-ang_offset_deg, ang_offset_deg] deg, applied as a single rigid transform so the
+        box stays in the robot's grasp."""
         if self._ws_qpos is not None:
             # --- Warm-start path: load saved holding-box state ---
             N = self._ws_qpos.shape[0]
@@ -186,6 +192,8 @@ class PlayG1CaTraEnv(BaseEnv):
             self.mj_data.qpos[BOX_QPOS_START + 3:BOX_QPOS_START + 7] = box_quat
             self.mj_data.qpos[SUPPORT_QPOS_START:SUPPORT_QPOS_START + 3] = [box_xy[0], box_xy[1], surface_z]
             self.mj_data.qpos[SUPPORT_QPOS_START + 3:SUPPORT_QPOS_START + 7] = box_quat
+
+        self._perturb_init_pose(pos_offset, ang_offset_deg)
 
         mujoco.mj_forward(self.mj_model, self.mj_data)
         if not self.headless:
@@ -238,6 +246,7 @@ class PlayG1CaTraEnv(BaseEnv):
             "last_flags": np.zeros(2),
             "odom_delay": self.mj_data.qpos[:7].copy(),
             "box_size": box_size,
+            "box_mass": self.mj_model.body_mass[self._box_body_id].copy(),
             "headgf": headgf, "headbf": headbf, "headdf": headdf,
             "pelvgf": pelvgf, "pelvbf": pelvbf, "pelvdf": pelvdf,
             "torsgf": torsgf, "torsbf": torsbf, "torsdf": torsdf,
@@ -253,6 +262,39 @@ class PlayG1CaTraEnv(BaseEnv):
 
         obs = self.get_obs(info)
         return State(info, obs)
+
+    def _perturb_init_pose(self, pos_offset: float, ang_offset_deg: float) -> None:
+        """Randomly offset the initial robot+box pose to test generalization.
+
+        Samples an xy displacement in [-pos_offset, pos_offset] m and a yaw rotation in
+        [-ang_offset_deg, ang_offset_deg] deg, then applies them as a single rigid 2D
+        transform (yaw about the robot base, then translation) to both the robot root and
+        the carried box freejoint in qpos/qvel. Rotating both about the robot base and
+        translating them together preserves their relative pose, so the box stays gripped.
+        No-op when both magnitudes are <= 0."""
+        if pos_offset <= 0.0 and ang_offset_deg <= 0.0:
+            return
+        dx, dy = np.random.uniform(-pos_offset, pos_offset, size=2)
+        dyaw = np.deg2rad(np.random.uniform(-ang_offset_deg, ang_offset_deg))
+        c, s = np.cos(dyaw), np.sin(dyaw)
+        Rz = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+        yaw_quat = np.array([np.cos(dyaw / 2), 0.0, 0.0, np.sin(dyaw / 2)])  # wxyz
+        pivot = self.mj_data.qpos[:2].copy()  # rotate about the robot base xy
+        delta_xy = np.array([dx, dy])
+
+        def xform(pos_start: int, quat_start: int, lin_start: int, ang_start: int) -> None:
+            pos = self.mj_data.qpos[pos_start:pos_start + 3].copy()
+            pos[:2] = Rz[:2, :2] @ (pos[:2] - pivot) + pivot + delta_xy
+            self.mj_data.qpos[pos_start:pos_start + 3] = pos
+            self.mj_data.qpos[quat_start:quat_start + 4] = _quat_mul(
+                yaw_quat, self.mj_data.qpos[quat_start:quat_start + 4]
+            )
+            self.mj_data.qvel[lin_start:lin_start + 3] = Rz @ self.mj_data.qvel[lin_start:lin_start + 3]
+            self.mj_data.qvel[ang_start:ang_start + 3] = Rz @ self.mj_data.qvel[ang_start:ang_start + 3]
+
+        xform(0, 3, 0, 3)  # robot root
+        xform(BOX_QPOS_START, BOX_QPOS_START + 3, BOX_QVEL_START, BOX_QVEL_START + 3)  # carried box
+        print(f"[PlayG1CaTraEnv] init perturbation: dxy=({dx:.3f}, {dy:.3f}) m, dyaw={np.rad2deg(dyaw):.1f} deg")
 
     def step(self, state: State, action: np.ndarray) -> State:
         """Apply PD control; gate command to zero in stage 1 (step < 100)."""
@@ -380,14 +422,12 @@ class PlayG1CaTraEnv(BaseEnv):
         box_quat_local = _quat_mul(pelvis_conj, box_quat_world)
         box_size = info["box_size"]
 
-        stage_flag = np.array([1.0]) if info["step"] >= self._config.stage1_steps else np.array([0.0])
-
         gait_phase = np.hstack([np.cos(info["phase"]), np.sin(info["phase"])])
         ids = self.action_joint_ids
 
         if self.pri:
             # G1CaTraPri actor obs: noiseless world-frame state + body pos/vel + box world pose/vel,
-            # minus the trailing 31 DR dims (rfi_lim_scale + kp_scale + kd_scale). Total 302 dims.
+            # minus the trailing 31 DR dims (rfi_lim_scale + kp_scale + kd_scale). Total 302 dims (incl. box_mass, no stage_flag).
             # PF block uses the stored (delayed, normalized) info values — same approximation as the
             # G1CatPri play branch in play_cat.py.
             pf_noiseless = np.hstack([
@@ -429,7 +469,7 @@ class PlayG1CaTraEnv(BaseEnv):
                 info["command"], np.array([info["foot_height"]]), gait_phase,
                 pf_noiseless,
                 box_size,
-                stage_flag,
+                np.array([info["box_mass"]]),
                 # privileged extras (matches env_catra.py L1124-1130; DR dims dropped)
                 linvel_pelvis,
                 pelv_pos.reshape(-1), tors_pos.reshape(-1), info["head_pos"].reshape(-1),
@@ -503,7 +543,7 @@ class PlayG1CaTraEnv(BaseEnv):
             cmd, np.array([info["foot_height"]]), gait_phase,
             pf,
             box_pos_local, box_quat_local, box_size,
-            stage_flag,
+            np.array([info["box_mass"]]),
         ])
 
         return {"state": np.nan_to_num(state)}

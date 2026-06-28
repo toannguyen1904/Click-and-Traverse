@@ -239,6 +239,7 @@ def train(
     restore_checkpoint_path: Optional[str] = None,
     restore_params: Optional[Any] = None,
     restore_value_fn: bool = False,
+    dagger_config: Optional[Any] = None,
 ):
     """PPO training.
 
@@ -391,6 +392,30 @@ def train(
     )
     make_policy = networks_2a.make_inference_fn_2a(ppo_network)
 
+    # ---- DAgger distillation setup (two-agent teachers -> two-agent student) ----
+    from cat_ppo.learning.policy.ppo.train import _cfg_get, _stack_trees, _uint64_lt
+
+    use_dagger = bool(_cfg_get(dagger_config, "enable", False))
+    teacher_checkpoint_paths = list(_cfg_get(dagger_config, "teacher_checkpoint_paths", []))
+    dagger_timesteps = int(_cfg_get(dagger_config, "dagger_timesteps", 0))
+    teacher_normalizer_params = None
+    teacher_policy_lower_params = None
+    teacher_policy_upper_params = None
+    if use_dagger:
+        if _cfg_get(dagger_config, "loss", "kl") != "kl":
+            raise ValueError("Only the 'kl' DAgger loss is implemented")
+        if str(_cfg_get(dagger_config, "teacher_kind", "2a")) != "2a":
+            raise ValueError(
+                "The two-agent student requires two-agent teachers (teacher_kind='2a')."
+            )
+        if not teacher_checkpoint_paths:
+            raise ValueError("dagger_config.enable=True requires teacher_checkpoint_paths")
+        # Two-agent checkpoint: (normalizer, policy_lower, policy_upper, value_l, value_u).
+        teacher_params = tuple(checkpoint.load(path) for path in teacher_checkpoint_paths)
+        teacher_normalizer_params = _stack_trees([p[0] for p in teacher_params])
+        teacher_policy_lower_params = _stack_trees([p[1] for p in teacher_params])
+        teacher_policy_upper_params = _stack_trees([p[2] for p in teacher_params])
+
     optimizer = optax.adam(learning_rate=learning_rate)
     if max_grad_norm is not None:
         optimizer = optax.chain(
@@ -398,16 +423,37 @@ def train(
             optax.adam(learning_rate=learning_rate),
         )
 
-    loss_fn = functools.partial(
-        losses_2a.compute_ppo_loss_2a,
-        ppo_network=ppo_network,
-        entropy_cost=entropy_cost,
-        discounting=discounting,
-        reward_scaling=reward_scaling,
-        gae_lambda=gae_lambda,
-        clipping_epsilon=clipping_epsilon,
-        normalize_advantage=normalize_advantage,
-    )
+    if use_dagger:
+        loss_fn = functools.partial(
+            losses_2a.compute_dagger_then_ppo_loss_2a,
+            ppo_network=ppo_network,
+            teacher_normalizer_params=teacher_normalizer_params,
+            teacher_policy_lower_params=teacher_policy_lower_params,
+            teacher_policy_upper_params=teacher_policy_upper_params,
+            num_teachers=len(teacher_checkpoint_paths),
+            kl_eps=_cfg_get(dagger_config, "kl_eps", 1e-5),
+            teacher_obs_key=_cfg_get(dagger_config, "teacher_obs_key", None),
+            teacher_privileged_obs_key=_cfg_get(dagger_config, "teacher_privileged_obs_key", None),
+            entropy_cost=entropy_cost,
+            discounting=discounting,
+            reward_scaling=reward_scaling,
+            gae_lambda=gae_lambda,
+            clipping_epsilon=clipping_epsilon,
+            normalize_advantage=normalize_advantage,
+            actor_loss_scale=_cfg_get(dagger_config, "actor_loss_scale", 1.0),
+            value_loss_scale=_cfg_get(dagger_config, "value_loss_scale", 1.0),
+        )
+    else:
+        loss_fn = functools.partial(
+            losses_2a.compute_ppo_loss_2a,
+            ppo_network=ppo_network,
+            entropy_cost=entropy_cost,
+            discounting=discounting,
+            reward_scaling=reward_scaling,
+            gae_lambda=gae_lambda,
+            clipping_epsilon=clipping_epsilon,
+            normalize_advantage=normalize_advantage,
+        )
 
     gradient_update_fn = gradients.gradient_update_fn(
         loss_fn, optimizer, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True
@@ -430,16 +476,27 @@ def train(
         carry,
         data: types.Transition,
         normalizer_params: running_statistics.RunningStatisticsState,
+        dagger_phase: jnp.ndarray,
     ):
         optimizer_state, params, key = carry
         key, key_loss = jax.random.split(key)
-        (_, metrics), params, optimizer_state = gradient_update_fn(
-            params,
-            normalizer_params,
-            data,
-            key_loss,
-            optimizer_state=optimizer_state,
-        )
+        if use_dagger:
+            (_, metrics), params, optimizer_state = gradient_update_fn(
+                params,
+                normalizer_params,
+                data,
+                key_loss,
+                dagger_phase,
+                optimizer_state=optimizer_state,
+            )
+        else:
+            (_, metrics), params, optimizer_state = gradient_update_fn(
+                params,
+                normalizer_params,
+                data,
+                key_loss,
+                optimizer_state=optimizer_state,
+            )
 
         return (optimizer_state, params, key), metrics
 
@@ -448,6 +505,7 @@ def train(
         unused_t,
         data: types.Transition,
         normalizer_params: running_statistics.RunningStatisticsState,
+        dagger_phase: jnp.ndarray,
     ):
         optimizer_state, params, key = carry
         key, key_perm, key_grad = jax.random.split(key, 3)
@@ -471,7 +529,11 @@ def train(
 
         shuffled_data = jax.tree_util.tree_map(convert_data, data)
         (optimizer_state, params, _), metrics = jax.lax.scan(
-            functools.partial(minibatch_step, normalizer_params=normalizer_params),
+            functools.partial(
+                minibatch_step,
+                normalizer_params=normalizer_params,
+                dagger_phase=dagger_phase,
+            ),
             (optimizer_state, params, key_grad),
             shuffled_data,
             length=num_minibatches,
@@ -479,7 +541,7 @@ def train(
         return (optimizer_state, params, key), metrics
 
     def training_step(
-        carry: Tuple[TrainingState, envs.State, PRNGKey], unused_t
+        carry: Tuple[TrainingState, envs.State, PRNGKey], unused_t, *, enable_metrics: bool
     ) -> Tuple[Tuple[TrainingState, envs.State, PRNGKey], Metrics]:
         training_state, state, key = carry
         key_sgd, key_generate_unroll, new_key = jax.random.split(key, 3)
@@ -492,6 +554,13 @@ def train(
             )
         )
 
+        extra_fields = (
+            "truncation", "episode_metrics", "episode_done",
+            "reward_lower", "reward_upper",
+        )
+        if use_dagger:
+            extra_fields = extra_fields + ("pf_id",)
+
         def f(carry, unused_t):
             current_state, current_key = carry
             current_key, next_key = jax.random.split(current_key)
@@ -501,10 +570,7 @@ def train(
                 policy,
                 current_key,
                 unroll_length,
-                extra_fields=(
-                    "truncation", "episode_metrics", "episode_done",
-                    "reward_lower", "reward_upper",
-                ),
+                extra_fields=extra_fields,
             )
             return (next_state, next_key), data
 
@@ -521,7 +587,7 @@ def train(
         )
         assert data.discount.shape[1:] == (unroll_length,)
 
-        if log_training_metrics:  # log unroll metrics
+        if enable_metrics:  # log unroll metrics
             jax.debug.callback(
                 metrics_aggregator.update_episode_metrics,
                 data.extras["state_extras"]["episode_metrics"],
@@ -534,9 +600,16 @@ def train(
             _remove_pixels(data.observation),
             pmap_axis_name=_PMAP_AXIS_NAME,
         )
+        # DAgger phase: imitate teachers while env_steps < dagger_timesteps, then PPO.
+        dagger_phase = _uint64_lt(training_state.env_steps, dagger_timesteps)
 
         (optimizer_state, params, _), metrics = jax.lax.scan(
-            functools.partial(sgd_step, data=data, normalizer_params=normalizer_params),
+            functools.partial(
+                sgd_step,
+                data=data,
+                normalizer_params=normalizer_params,
+                dagger_phase=dagger_phase,
+            ),
             (training_state.optimizer_state, training_state.params, key_sgd),
             (),
             length=num_updates_per_batch,
@@ -551,10 +624,10 @@ def train(
         return (new_training_state, state, new_key), metrics
 
     def training_epoch(
-        training_state: TrainingState, state: envs.State, key: PRNGKey
+        training_state: TrainingState, state: envs.State, key: PRNGKey, *, enable_metrics: bool
     ) -> Tuple[TrainingState, envs.State, Metrics]:
         (training_state, state, _), loss_metrics = jax.lax.scan(
-            training_step,
+            functools.partial(training_step, enable_metrics=enable_metrics),
             (training_state, state, key),
             (),
             length=num_training_steps_per_epoch,
@@ -562,16 +635,26 @@ def train(
         loss_metrics = jax.tree_util.tree_map(jnp.mean, loss_metrics)
         return training_state, state, loss_metrics
 
-    training_epoch = jax.pmap(training_epoch, axis_name=_PMAP_AXIS_NAME)
+    training_epoch_with_metrics = jax.pmap(
+        functools.partial(training_epoch, enable_metrics=log_training_metrics),
+        axis_name=_PMAP_AXIS_NAME,
+    )
+    training_epoch_without_metrics = jax.pmap(
+        functools.partial(training_epoch, enable_metrics=False),
+        axis_name=_PMAP_AXIS_NAME,
+    )
 
     # Note that this is NOT a pure jittable method.
     def training_epoch_with_timing(
-        training_state: TrainingState, env_state: envs.State, key: PRNGKey
+        training_state: TrainingState,
+        env_state: envs.State,
+        key: PRNGKey,
+        pmapped_training_epoch: Callable[[TrainingState, envs.State, PRNGKey], Tuple[TrainingState, envs.State, Metrics]],
     ) -> Tuple[TrainingState, envs.State, Metrics]:
         nonlocal training_walltime
         t = time.time()
         training_state, env_state = _strip_weak_type((training_state, env_state))
-        result = training_epoch(training_state, env_state, key)
+        result = pmapped_training_epoch(training_state, env_state, key)
         training_state, env_state, metrics = _strip_weak_type(result)
 
         metrics = jax.tree_util.tree_map(jnp.mean, metrics)
@@ -692,6 +775,7 @@ def train(
     training_metrics = {}
     training_walltime = 0
     current_step = 0
+    disable_metrics_after_checkpoint = 4
     for it in range(num_evals_after_init):
         logging.info("starting iteration %s %s", it, time.time() - xt)
 
@@ -699,8 +783,24 @@ def train(
             # optimization
             epoch_key, local_key = jax.random.split(local_key)
             epoch_keys = jax.random.split(epoch_key, local_devices_to_use)
+            disable_metrics_this_epoch = (
+                device_count > 1
+                and log_training_metrics
+                and it >= disable_metrics_after_checkpoint
+            )
+            if disable_metrics_this_epoch and it == disable_metrics_after_checkpoint:
+                logging.warning(
+                    "Disabling in-epoch training metrics after checkpoint %s on multi-GPU runs "
+                    "to avoid late jax.debug.callback stalls under pmap.",
+                    disable_metrics_after_checkpoint,
+                )
+            pmapped_training_epoch = (
+                training_epoch_without_metrics
+                if disable_metrics_this_epoch
+                else training_epoch_with_metrics
+            )
             (training_state, env_state, training_metrics) = training_epoch_with_timing(
-                training_state, env_state, epoch_keys
+                training_state, env_state, epoch_keys, pmapped_training_epoch
             )
             current_step = int(_unpmap(training_state.env_steps))
 
