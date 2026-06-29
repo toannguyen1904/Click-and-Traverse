@@ -315,3 +315,69 @@ def compute_dagger_then_ppo_loss_2a(
     return total_loss, metrics
 
   return jax.lax.cond(dagger_phase, dagger_loss, ppo_loss, operand=None)
+
+
+def compute_blended_dagger_ppo_loss_2a(
+    params: PPONetworkParams2A,
+    normalizer_params: Any,
+    data: types.Transition,
+    rng: jnp.ndarray,
+    lambda_dagger: jnp.ndarray,
+    ppo_network: ppo_networks_2a.PPONetworks2A,
+    teacher_normalizer_params: Any,
+    teacher_policy_lower_params: Any,
+    teacher_policy_upper_params: Any,
+    num_teachers: int,
+    kl_eps: float = 1e-5,
+    entropy_cost: float = 1e-4,
+    discounting: float = 0.9,
+    reward_scaling: float = 1.0,
+    gae_lambda: float = 0.95,
+    clipping_epsilon: float = 0.3,
+    normalize_advantage: bool = True,
+    actor_loss_scale: float = 1.0,
+    value_loss_scale: float = 1.0,
+    teacher_obs_key: Optional[str] = None,
+    teacher_privileged_obs_key: Optional[str] = None,
+) -> Tuple[jnp.ndarray, types.Metrics]:
+  """Curriculum-blended two-agent objective: lambda_ppo*L_PPO + lambda_dagger*L_DAgger.
+
+  DAgger is never turned off (lambda_dagger is floored upstream). Blends the whole
+  two-agent PPO and DAgger losses; since the weights sum to 1 and both carry the
+  per-head value regression, the critics stay trained while the actors hand off
+  from per-head imitation to PPO.
+  """
+  rng_ppo, rng_dagger = jax.random.split(rng)
+  lambda_ppo = 1.0 - lambda_dagger
+
+  ppo_total, ppo_metrics = compute_ppo_loss_2a(
+      params, normalizer_params, data, rng_ppo, ppo_network=ppo_network,
+      entropy_cost=entropy_cost, discounting=discounting, reward_scaling=reward_scaling,
+      gae_lambda=gae_lambda, clipping_epsilon=clipping_epsilon,
+      normalize_advantage=normalize_advantage,
+  )
+  dagger_total, dagger_metrics = compute_dagger_loss_2a(
+      params, normalizer_params, data, rng_dagger, ppo_network=ppo_network,
+      teacher_normalizer_params=teacher_normalizer_params,
+      teacher_policy_lower_params=teacher_policy_lower_params,
+      teacher_policy_upper_params=teacher_policy_upper_params,
+      num_teachers=num_teachers, kl_eps=kl_eps, discounting=discounting,
+      reward_scaling=reward_scaling, gae_lambda=gae_lambda,
+      actor_loss_scale=actor_loss_scale, value_loss_scale=value_loss_scale,
+      teacher_obs_key=teacher_obs_key, teacher_privileged_obs_key=teacher_privileged_obs_key,
+  )
+
+  total_loss = lambda_ppo * ppo_total + lambda_dagger * dagger_total
+  metrics = {
+      **ppo_metrics,
+      "total_loss": total_loss,
+      "ppo_total_loss": ppo_total,
+      "dagger_total_loss": dagger_total,
+      "dagger_kl": dagger_metrics["dagger_kl"],
+      "student_std": dagger_metrics["student_std"],
+      "teacher_std": dagger_metrics["teacher_std"],
+      "lambda_dagger": lambda_dagger,
+      "lambda_ppo": lambda_ppo,
+      "loss_mode": jnp.full_like(total_loss, 2.0),
+  }
+  return total_loss, metrics

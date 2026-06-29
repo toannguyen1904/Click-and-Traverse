@@ -393,11 +393,19 @@ def train(
     make_policy = networks_2a.make_inference_fn_2a(ppo_network)
 
     # ---- DAgger distillation setup (two-agent teachers -> two-agent student) ----
-    from cat_ppo.learning.policy.ppo.train import _cfg_get, _stack_trees, _uint64_lt
+    from cat_ppo.learning.policy.ppo.train import (
+        _cfg_get, _stack_trees, _uint64_lt, _uint64_to_float,
+    )
 
     use_dagger = bool(_cfg_get(dagger_config, "enable", False))
     teacher_checkpoint_paths = list(_cfg_get(dagger_config, "teacher_checkpoint_paths", []))
     dagger_timesteps = int(_cfg_get(dagger_config, "dagger_timesteps", 0))
+    # Schedule: "two_phase" (DAgger then PPO) or "blend" (curriculum-weighted sum).
+    dagger_mode = str(_cfg_get(dagger_config, "dagger_mode", "two_phase"))
+    blend_lambda_floor = float(_cfg_get(dagger_config, "blend_lambda_floor", 0.1))
+    blend_anneal_timesteps = float(
+        _cfg_get(dagger_config, "blend_anneal_timesteps", 0) or (num_timesteps // 2)
+    )
     teacher_normalizer_params = None
     teacher_policy_lower_params = None
     teacher_policy_upper_params = None
@@ -408,6 +416,8 @@ def train(
             raise ValueError(
                 "The two-agent student requires two-agent teachers (teacher_kind='2a')."
             )
+        if dagger_mode not in ("two_phase", "blend"):
+            raise ValueError(f"Unsupported dagger_mode: {dagger_mode!r}")
         if not teacher_checkpoint_paths:
             raise ValueError("dagger_config.enable=True requires teacher_checkpoint_paths")
         # Two-agent checkpoint: (normalizer, policy_lower, policy_upper, value_l, value_u).
@@ -424,8 +434,15 @@ def train(
         )
 
     if use_dagger:
+        # Both schedules thread one scalar through the SGD step: blend mode passes
+        # lambda_dagger; two_phase passes the boolean DAgger-vs-PPO switch.
+        dagger_loss_builder = (
+            losses_2a.compute_blended_dagger_ppo_loss_2a
+            if dagger_mode == "blend"
+            else losses_2a.compute_dagger_then_ppo_loss_2a
+        )
         loss_fn = functools.partial(
-            losses_2a.compute_dagger_then_ppo_loss_2a,
+            dagger_loss_builder,
             ppo_network=ppo_network,
             teacher_normalizer_params=teacher_normalizer_params,
             teacher_policy_lower_params=teacher_policy_lower_params,
@@ -600,8 +617,13 @@ def train(
             _remove_pixels(data.observation),
             pmap_axis_name=_PMAP_AXIS_NAME,
         )
-        # DAgger phase: imitate teachers while env_steps < dagger_timesteps, then PPO.
-        dagger_phase = _uint64_lt(training_state.env_steps, dagger_timesteps)
+        # Scalar threaded into the loss. two_phase: boolean DAgger-vs-PPO switch.
+        # blend: lambda_dagger = max(floor, 1 - env_steps/anneal_timesteps).
+        if dagger_mode == "blend":
+            progress = _uint64_to_float(training_state.env_steps) / blend_anneal_timesteps
+            dagger_phase = jnp.maximum(blend_lambda_floor, 1.0 - progress)
+        else:
+            dagger_phase = _uint64_lt(training_state.env_steps, dagger_timesteps)
 
         (optimizer_state, params, _), metrics = jax.lax.scan(
             functools.partial(

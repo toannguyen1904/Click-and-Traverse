@@ -54,7 +54,13 @@ class DaggerArgs(Args):
     # "single" -> G1CaTraPri teachers; "2a" -> G1CaTra2APri teachers; "auto"
     # detects from the first teacher's config.json (and asserts all agree).
     teacher_kind: str = "auto"
+    # "two_phase": DAgger KL until --dagger_timesteps, then PPO.
+    # "blend": every step lambda_ppo*L_PPO + lambda_dagger*L_DAgger, lambda_dagger
+    #          annealed max(floor, 1 - env_steps/blend_anneal_timesteps) (never off).
+    dagger_mode: str = "two_phase"
     dagger_timesteps: int = 0
+    blend_lambda_floor: float = 0.1
+    blend_anneal_timesteps: int = 0  # 0 -> num_timesteps // 2 (paper's K/2)
     dagger_actor_loss_scale: float = 1.0
     dagger_value_loss_scale: float = 1.0
     pf_sampling_weights: list[float] = field(default_factory=list)
@@ -181,7 +187,12 @@ def _prepare_dagger_config(policy_cfg, env_config, args: DaggerArgs, student_is_
     dagger_cfg.teacher_restore_names = teacher_names
     dagger_cfg.teacher_checkpoint_paths = teacher_checkpoint_paths
     dagger_cfg.teacher_kind = teacher_kind
+    if args.dagger_mode not in ("two_phase", "blend"):
+        raise ValueError(f"--dagger_mode must be 'two_phase' or 'blend', got {args.dagger_mode!r}")
+    dagger_cfg.dagger_mode = args.dagger_mode
     dagger_cfg.dagger_timesteps = args.dagger_timesteps or (policy_cfg.num_timesteps // 2)
+    dagger_cfg.blend_lambda_floor = args.blend_lambda_floor
+    dagger_cfg.blend_anneal_timesteps = args.blend_anneal_timesteps or (policy_cfg.num_timesteps // 2)
     if args.dagger_actor_loss_scale <= 0:
         raise ValueError("dagger_actor_loss_scale must be > 0 (DAgger phase trains the actor).")
     dagger_cfg.actor_loss_scale = args.dagger_actor_loss_scale
@@ -207,7 +218,10 @@ def train(args: DaggerArgs):
     dagger_keys = (
         "teacher_restore_names",
         "teacher_kind",
+        "dagger_mode",
         "dagger_timesteps",
+        "blend_lambda_floor",
+        "blend_anneal_timesteps",
         "dagger_actor_loss_scale",
         "dagger_value_loss_scale",
         "pf_sampling_weights",

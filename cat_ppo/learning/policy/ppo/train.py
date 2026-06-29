@@ -240,6 +240,15 @@ def _uint64_lt(value: types.UInt64, other: int) -> jnp.ndarray:
     return (value.hi < other_hi) | ((value.hi == other_hi) & (value.lo < other_lo))
 
 
+def _uint64_to_float(value: types.UInt64) -> jnp.ndarray:
+    """env_steps (UInt64 hi/lo) -> float for the blend-mode curriculum schedule.
+
+    float32 is fine here: the value only feeds a progress ratio, where a few-step
+    rounding error over hundreds of millions of steps is negligible.
+    """
+    return value.hi.astype(jnp.float32) * float(1 << 32) + value.lo.astype(jnp.float32)
+
+
 def _teacher_logits_all(
     teacher_kind: str,
     teacher_observation: Any,
@@ -440,6 +449,77 @@ def compute_dagger_then_ppo_loss(
         return total_loss, metrics
 
     return jax.lax.cond(dagger_phase, dagger_loss, ppo_loss, operand=None)
+
+
+def compute_blended_dagger_ppo_loss(
+    params: ppo_losses.PPONetworkParams,
+    normalizer_params: Any,
+    data: types.Transition,
+    rng: jnp.ndarray,
+    lambda_dagger: jnp.ndarray,
+    ppo_network: ppo_networks.PPONetworks,
+    teacher_normalizer_params: Any,
+    teacher_policy_params: Any,
+    num_teachers: int,
+    teacher_kind: str = "single",
+    teacher_policy_apply_lower: Optional[Callable] = None,
+    teacher_policy_apply_upper: Optional[Callable] = None,
+    kl_eps: float = 1e-5,
+    entropy_cost: float = 1e-4,
+    discounting: float = 0.9,
+    reward_scaling: float = 1.0,
+    gae_lambda: float = 0.95,
+    clipping_epsilon: float = 0.3,
+    normalize_advantage: bool = True,
+    actor_loss_scale: float = 1.0,
+    value_loss_scale: float = 1.0,
+    teacher_obs_key: Optional[str] = None,
+    teacher_privileged_obs_key: Optional[str] = None,
+) -> Tuple[jnp.ndarray, types.Metrics]:
+    """Curriculum-blended objective: ``lambda_ppo*L_PPO + lambda_dagger*L_DAgger``.
+
+    DAgger is never turned off (lambda_dagger is floored upstream). Because the two
+    weights sum to 1 and both losses carry the same value-regression term, the
+    critic stays trained throughout while the actor smoothly hands off from
+    imitation to PPO.
+    """
+    rng_ppo, rng_dagger = jax.random.split(rng)
+    lambda_ppo = 1.0 - lambda_dagger
+
+    ppo_total, ppo_metrics = ppo_losses.compute_ppo_loss(
+        params, normalizer_params, data, rng_ppo,
+        ppo_network=ppo_network, entropy_cost=entropy_cost, discounting=discounting,
+        reward_scaling=reward_scaling, gae_lambda=gae_lambda,
+        clipping_epsilon=clipping_epsilon, normalize_advantage=normalize_advantage,
+    )
+    dagger_total, dagger_metrics = compute_dagger_loss(
+        params, normalizer_params, data, rng_dagger,
+        ppo_network=ppo_network,
+        teacher_normalizer_params=teacher_normalizer_params,
+        teacher_policy_params=teacher_policy_params,
+        num_teachers=num_teachers, teacher_kind=teacher_kind,
+        teacher_policy_apply_lower=teacher_policy_apply_lower,
+        teacher_policy_apply_upper=teacher_policy_apply_upper,
+        kl_eps=kl_eps, discounting=discounting, reward_scaling=reward_scaling,
+        gae_lambda=gae_lambda, actor_loss_scale=actor_loss_scale,
+        value_loss_scale=value_loss_scale, teacher_obs_key=teacher_obs_key,
+        teacher_privileged_obs_key=teacher_privileged_obs_key,
+    )
+
+    total_loss = lambda_ppo * ppo_total + lambda_dagger * dagger_total
+    metrics = {
+        **ppo_metrics,
+        "total_loss": total_loss,
+        "ppo_total_loss": ppo_total,
+        "dagger_total_loss": dagger_total,
+        "dagger_kl": dagger_metrics["dagger_kl"],
+        "student_std": dagger_metrics["student_std"],
+        "teacher_std": dagger_metrics["teacher_std"],
+        "lambda_dagger": lambda_dagger,
+        "lambda_ppo": lambda_ppo,
+        "loss_mode": jnp.full_like(total_loss, 2.0),
+    }
+    return total_loss, metrics
 
 
 def train(
@@ -651,6 +731,12 @@ def train(
     teacher_checkpoint_paths = list(_cfg_get(dagger_config, "teacher_checkpoint_paths", []))
     dagger_timesteps = int(_cfg_get(dagger_config, "dagger_timesteps", 0))
     teacher_kind = str(_cfg_get(dagger_config, "teacher_kind", "single"))
+    # Schedule: "two_phase" (DAgger then PPO) or "blend" (curriculum-weighted sum).
+    dagger_mode = str(_cfg_get(dagger_config, "dagger_mode", "two_phase"))
+    blend_lambda_floor = float(_cfg_get(dagger_config, "blend_lambda_floor", 0.1))
+    blend_anneal_timesteps = float(
+        _cfg_get(dagger_config, "blend_anneal_timesteps", 0) or (num_timesteps // 2)
+    )
     teacher_normalizer_params = None
     teacher_policy_params = None
     teacher_policy_apply_lower = None
@@ -661,6 +747,8 @@ def train(
             raise ValueError(f"Unsupported DAgger loss: {loss_name!r}; only 'kl' is implemented")
         if teacher_kind not in ("single", "2a"):
             raise ValueError(f"Unsupported dagger teacher_kind: {teacher_kind!r}")
+        if dagger_mode not in ("two_phase", "blend"):
+            raise ValueError(f"Unsupported dagger_mode: {dagger_mode!r}")
         if not teacher_checkpoint_paths:
             raise ValueError("dagger_config.enable=True requires teacher_checkpoint_paths")
         teacher_params = tuple(checkpoint.load(path) for path in teacher_checkpoint_paths)
@@ -701,8 +789,15 @@ def train(
         )
 
     if use_dagger:
+        # Both schedules thread one scalar through the SGD step (the slot the
+        # two-phase `dagger_phase` bool occupies): blend mode passes lambda_dagger.
+        dagger_loss_builder = (
+            compute_blended_dagger_ppo_loss
+            if dagger_mode == "blend"
+            else compute_dagger_then_ppo_loss
+        )
         loss_fn = functools.partial(
-            compute_dagger_then_ppo_loss,
+            dagger_loss_builder,
             ppo_network=ppo_network,
             teacher_normalizer_params=teacher_normalizer_params,
             teacher_policy_params=teacher_policy_params,
@@ -876,8 +971,14 @@ def train(
             _remove_pixels(data.observation),
             pmap_axis_name=_PMAP_AXIS_NAME,
         )
-        # DAgger phase: imitate teachers while env_steps < dagger_timesteps, then PPO.
-        dagger_phase = _uint64_lt(training_state.env_steps, dagger_timesteps)
+        # Scalar threaded into the loss. two_phase: boolean DAgger-vs-PPO switch
+        # (imitate while env_steps < dagger_timesteps). blend: lambda_dagger from
+        # the curriculum max(floor, 1 - env_steps/anneal_timesteps).
+        if dagger_mode == "blend":
+            progress = _uint64_to_float(training_state.env_steps) / blend_anneal_timesteps
+            dagger_phase = jnp.maximum(blend_lambda_floor, 1.0 - progress)
+        else:
+            dagger_phase = _uint64_lt(training_state.env_steps, dagger_timesteps)
 
         (optimizer_state, params, _), metrics = jax.lax.scan(
             functools.partial(

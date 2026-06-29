@@ -16,6 +16,7 @@ import onnxruntime as rt
 import tyro
 
 import cat_ppo
+from cat_ppo.eval.mj_onnx_test import _episode_status
 
 
 @dataclass
@@ -26,6 +27,7 @@ class Args:
     onnx_path: str = None
     pri: bool = False
     obs_path: str = 'data/assets/TypiObs/empty'
+    goal_x: float = 1.8       # base x (m) counted as a completed traversal (success)
     box_inflation: bool = True  # G1CaTra: box observes gf_inflation.npy (True) or regular gf.npy (False). Read from the checkpoint's config.json when available; this is only a fallback.
     yaw: float = 0.0          # initial robot yaw in degrees (0 = default forward direction)
     box_size: str = None      # box half-extents as "x,y,z" in metres (e.g. "0.15,0.20,0.15")
@@ -144,6 +146,7 @@ def play(args: Args):
         env.mj_data.qpos[3:7] = [np.cos(angle/2), 0, 0, np.sin(angle/2)]  # wxyz pure yaw quaternion
         mujoco.mj_forward(env.mj_model, env.mj_data)
     _ctr = 0
+    max_steps = int(env_cfg.episode_length) if hasattr(env_cfg, "episode_length") else 10 ** 9
 
     try:
         while True:
@@ -164,6 +167,14 @@ def play(args: Args):
                 writer.append_data(frame)
 
             _ctr += 1
+
+            # Episode outcome (matches mj_onnx_test scoring): stop and report at the terminal event.
+            status, base_x = _episode_status(env, state, env_cfg, args.goal_x, max_steps)
+            if status is not None:
+                outcome = "SUCCESS" if status == "success" else f"FAIL ({status})"
+                print(f"[mj_onnx_play] episode ended at step {int(state.info['step'])}: "
+                      f"{outcome}  base_x={base_x:.3f}  goal_x={args.goal_x}")
+                break
     except KeyboardInterrupt:
         pass
     finally:

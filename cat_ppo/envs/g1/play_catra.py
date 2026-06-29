@@ -57,6 +57,10 @@ _BOX_CORNER_SIGNS = np.array([
 @cat_ppo.registry.register("G1CaTraPri", "play_env_class")
 @cat_ppo.registry.register("G1CaTra2A", "play_env_class")
 @cat_ppo.registry.register("G1CaTra2APri", "play_env_class")
+# DAgger students share the same deployable actor obs/action as their PPO counterparts,
+# so playback uses this same CPU env (G1CaTra*DaggerEnv extend G1CaTra*Env).
+@cat_ppo.registry.register("G1CaTraDagger", "play_env_class")
+@cat_ppo.registry.register("G1CaTra2ADagger", "play_env_class")
 class PlayG1CaTraEnv(BaseEnv):
     """CPU inference env for two-stage G1CaTra. Set self.pri=True to use the privileged actor obs.
 

@@ -49,7 +49,15 @@ def _add_dagger_config(
         # config.json by train_ppo_dagger.py.
         teacher_policy_hidden_layer_sizes=[],
         kl_eps=1e-5,
+        # Schedule: "two_phase" (DAgger KL until dagger_timesteps, then PPO) or
+        # "blend" (every step: lambda_ppo*L_PPO + lambda_dagger*L_DAgger, with
+        # lambda_dagger = max(blend_lambda_floor, 1 - env_steps/blend_anneal_timesteps)
+        # so DAgger is never fully turned off). dagger_timesteps is only used by
+        # two_phase; blend_anneal_timesteps (0 -> num_timesteps//2) by blend.
+        dagger_mode="two_phase",
         dagger_timesteps=0,
+        blend_lambda_floor=0.1,
+        blend_anneal_timesteps=0,
         actor_loss_scale=1.0,
         value_loss_scale=1.0,
         # The student rollout env additionally exposes the privileged-teacher
