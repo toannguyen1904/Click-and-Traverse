@@ -1,7 +1,7 @@
-"""CPU-based inference environment for the two-stage G1CaTra policy.
+"""CPU-based inference environment for the single-stage G1CaTra policy.
 
-Stage 1 (steps 0 -> stage1_steps - 1):  zero command, robot picks up box.
-Stage 2 (steps stage1_steps -> stage1_steps+499): PF-derived command, robot walks carrying box.
+The robot is warm-started already holding the box and walks through the obstacle
+scene carrying it (PF-derived command every step). There is no pickup stage.
 
 Mirrors G1CaTraEnv._get_obs (195-dim state) for ONNX policy playback.
 """
@@ -68,7 +68,7 @@ _BOX_CORNER_SIGNS = np.array([
 @cat_ppo.registry.register("G1CaTraDagger", "play_env_class")
 @cat_ppo.registry.register("G1CaTra2ADagger", "play_env_class")
 class PlayG1CaTraEnv(BaseEnv):
-    """CPU inference env for two-stage G1CaTra. Set self.pri=True to use the privileged actor obs.
+    """CPU inference env for single-stage G1CaTra. Set self.pri=True to use the privileged actor obs.
 
     Shared by single-agent (G1CaTra/G1CaTraPri) and two-agent (G1CaTra2A/G1CaTra2APri) tasks:
     the actor observation is identical; the two-agent case just runs two policies and
@@ -243,11 +243,10 @@ class PlayG1CaTraEnv(BaseEnv):
         boxbf_noisy = self.sample_field(self.bf,  box_corners_noisy)
         boxdf_noisy = self.sample_field(self.sdf, box_corners_noisy)
 
+        init_step = 0
         if self._ws_qpos is not None:
-            init_step = self._config.stage1_steps
             init_motor_targets = self.mj_data.qpos[7:7 + NUM_ROBOT_JOINTS].copy()
         else:
-            init_step = 0
             init_motor_targets = self._default_qpos.copy()
 
         info = {
@@ -317,7 +316,7 @@ class PlayG1CaTraEnv(BaseEnv):
         print(f"[PlayG1CaTraEnv] init perturbation: dxy=({dx:.3f}, {dy:.3f}) m, dyaw={np.rad2deg(dyaw):.1f} deg")
 
     def step(self, state: State, action: np.ndarray) -> State:
-        """Apply PD control; gate command to zero in stage 1 (step < 100)."""
+        """Apply PD control; PF-derived command is active every step."""
         lower_motor_targets = np.clip(
             state.info["motor_targets"][self.action_joint_ids] + action * self._config.action_scale,
             self._soft_lowers[self.action_joint_ids],
@@ -368,14 +367,12 @@ class PlayG1CaTraEnv(BaseEnv):
         headbf, pelvbf, torsbf, feetbf, handsbf, kneesbf, shldsbf = np.split(all_bf, [1, 2, 3, 5, 7, 9], axis=0)
         headdf, pelvdf, torsdf, feetdf, handsdf, kneesdf, shldsdf = np.split(all_df, [1, 2, 3, 5, 7, 9], axis=0)
 
-        # PF-derived command (4-dim); gated to zero in stage 1
-        cmd_pf = self._compute_cmd_4d(
+        # PF-derived command (4-dim); active every step
+        command = self._compute_cmd_4d(
             pelvgf.reshape(-1),
             np.concatenate([headgf, feetgf], axis=0),
             np.concatenate([headbf, feetbf], axis=0),
         )
-        step = state.info["step"]
-        command = np.zeros(4) if step < self._config.stage1_steps else cmd_pf
 
         # Gait update
         self._update_phase(state, command)
@@ -408,7 +405,7 @@ class PlayG1CaTraEnv(BaseEnv):
         boxbf_noisy = boxbf_noisy / (np.linalg.norm(boxbf_noisy, axis=-1, keepdims=True) + EPS)
 
         state.info.update({
-            "step": step + 1,
+            "step": state.info["step"] + 1,
             "command": command,
             "last_act": action.copy(),
             "odom_delay": odom_delay,

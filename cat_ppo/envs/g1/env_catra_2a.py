@@ -44,25 +44,23 @@ from cat_ppo.envs.g1.env_catra import (
 from cat_ppo.envs.g1.env_catra_pri import _DR_TAIL_DIMS
 
 # Regularizers that act on all joints / all action dims and must be split per joint-group.
-_SPLIT_REGULARIZERS = ("joint_torque", "joint_limits", "smoothness_joint", "smoothness", "smoothness_action")
+_SPLIT_REGULARIZERS = ("joint_torque", "joint_limits", "smoothness_joint", "smoothness_action")
 
 # Reward grouping (excluding the split regularizers, which are classified by their _lower/_upper suffix).
 # SHARED terms go to BOTH agents; LOWER/UPPER terms go to the corresponding agent only.
 _SHARED_KEYS = frozenset({
-    "lift", "lift_carry", "box_pillar_contact", "box_vertical", "hold_stable",
-    "box_yaw_stable", "box_centering", "box_upright", "box_upright_carry", "boxdf", "boxgf",
+    "lift_carry", "box_upright_carry", "boxdf", "boxgf",
     # hands/shoulders are articulated by the arms (upper) but their world position also
     # depends on torso/pelvis pose driven by the legs (lower) -> obstacle terms are shared.
     "handsgf", "handsdf", "shldsdf",
 })
 _UPPER_KEYS = frozenset({
-    "reach", "reach_carry", "hand_contact", "hand_contact_carry",
-    "grasp_symmetry", "grasp_symmetry_carry", "palm_orient", "palm_orient_carry",
-    "hands_level", "hands_level_carry", "upper_body_align",
+    "reach_carry", "hand_contact_carry", "grasp_symmetry_carry",
+    "palm_orient_carry", "hands_level_carry", "upper_body_align",
 })
 _LOWER_KEYS = frozenset({
-    "foot_contact", "foot_contact_trav", "foot_slip", "foot_slip_trav",
-    "straight_knee", "straight_knee_trav", "foot_balance", "foot_balance_trav",
+    "foot_contact_trav", "foot_slip_trav",
+    "straight_knee_trav", "foot_balance_trav",
     "body_rotation", "foot_clearance", "foot_far", "feet_rotation", "bent_knee_trav",
     "hip_yaw_lim", "feet_apart",
     "feetgf", "feetdf", "kneesdf",
@@ -70,7 +68,7 @@ _LOWER_KEYS = frozenset({
     "headgf", "headdf",
     # root / locomotion (assigned to the lower agent per design decision)
     "tracking_root_field", "tracking_orientation", "body_motion",
-    "forward_progress", "base_height", "upright",
+    "forward_progress",
 })
 
 
@@ -185,14 +183,8 @@ class G1CaTra2AEnv(G1CaTraEnv):
         smj_lower = _smj(leg)
         smj_upper = _smj(arm)
 
-        # smoothness (stage 1): -sum((act - last_act)^2), per action-dim group
+        # smoothness_action: sum(sq(1st diff) + sq(2nd diff)), per action-dim group
         act, la, lla = action, info["last_act"], info["last_last_act"]
-        def _sm1(sl):
-            return -jp.sum((act[sl] - la[sl]) ** 2)
-        sm_lower = _sm1(self._leg_slice)
-        sm_upper = _sm1(self._arm_slice)
-
-        # smoothness_action (stage 2): sum(sq(1st diff) + sq(2nd diff)), per action-dim group
         def _sma(sl):
             return jp.sum(jp.square(act[sl] - la[sl]) + jp.square(act[sl] - 2 * la[sl] + lla[sl]))
         sma_lower = _sma(self._leg_slice)
@@ -202,7 +194,6 @@ class G1CaTra2AEnv(G1CaTraEnv):
             "joint_torque_lower": jt_lower, "joint_torque_upper": jt_upper,
             "joint_limits_lower": jl_lower, "joint_limits_upper": jl_upper,
             "smoothness_joint_lower": smj_lower, "smoothness_joint_upper": smj_upper,
-            "smoothness_lower": sm_lower, "smoothness_upper": sm_upper,
             "smoothness_action_lower": sma_lower, "smoothness_action_upper": sma_upper,
         }
 
@@ -213,27 +204,27 @@ class G1CaTra2AEnv(G1CaTraEnv):
         rewards.update(self._split_regularizers(data, action, info))
         return rewards
 
-    def _agent_rewards(self, rewards: dict, in_stage2: jax.Array):
+    def _agent_rewards(self, rewards: dict):
         """Return the (lower, upper) scalar rewards. SHARED terms count toward both;
-        each is scaled by dt and stage-2 clipped exactly like the single-agent reward."""
+        each is scaled by dt and clipped exactly like the single-agent reward."""
         lower_raw = sum(v for k, v in rewards.items() if k in self._lower_reward_keys) * self.dt
         upper_raw = sum(v for k, v in rewards.items() if k in self._upper_reward_keys) * self.dt
-        lower = jp.where(in_stage2, jp.clip(lower_raw, 0.0, 10000.0), lower_raw)
-        upper = jp.where(in_stage2, jp.clip(upper_raw, 0.0, 10000.0), upper_raw)
+        lower = jp.clip(lower_raw, 0.0, 10000.0)
+        upper = jp.clip(upper_raw, 0.0, 10000.0)
         return lower, upper
 
     def _extra_reward_info(self):
         # Per-agent rewards carried in info (read by the trainer via extra_fields).
         return {"reward_lower": jp.zeros(()), "reward_upper": jp.zeros(())}
 
-    def _record_agent_rewards(self, info: dict, rewards: dict, in_stage2: jax.Array) -> None:
-        lower, upper = self._agent_rewards(rewards, in_stage2)
+    def _record_agent_rewards(self, info: dict, rewards: dict) -> None:
+        lower, upper = self._agent_rewards(rewards)
         info["reward_lower"] = lower
         info["reward_upper"] = upper
 
-    def _assemble_reward(self, rewards: dict, in_stage2: jax.Array) -> jax.Array:
+    def _assemble_reward(self, rewards: dict) -> jax.Array:
         # Scalar reward for brax wrappers/metrics; per-agent split lives in info.
-        lower, upper = self._agent_rewards(rewards, in_stage2)
+        lower, upper = self._agent_rewards(rewards)
         return lower + upper
 
 

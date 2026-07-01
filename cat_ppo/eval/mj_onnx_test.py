@@ -1,4 +1,4 @@
-"""Headless ONNX evaluation for the two-stage G1CaTra (pickup + carry & traverse) policy.
+"""Headless ONNX evaluation for the single-stage G1CaTra (box carry & traverse) policy.
 
 Mirrors cat_ppo/eval/mj_onnx_test.py for the Cat task, adapted to CaTra:
   * the play env (play_catra.PlayG1CaTraEnv) does NOT compute success/termination, so the
@@ -50,7 +50,6 @@ def _is_two_agent(task: str) -> bool:
 # Read from the checkpoint's config.json (registry defaults can differ from the run).
 _CKPT_OVERRIDE_FIELDS = (
     "box_use_inflation",
-    "stage1_steps",
     "episode_length",
     "term_collision_threshold",
     "box_drop_threshold",
@@ -102,8 +101,8 @@ def _set_box_noise(env_cfg, enabled: bool):
 
 def _apply_ckpt_config(env_cfg, exp_name):
     """Override playback-relevant env_config fields from the run's checkpoints/config.json,
-    so scoring (stage1_steps, thresholds), the box field (box_use_inflation) and warm-start
-    match how the policy was actually trained rather than the registry defaults."""
+    so scoring (thresholds), the box field (box_use_inflation) and warm-start match how the
+    policy was actually trained rather than the registry defaults."""
     if exp_name is None:
         print("[mj_onnx_test] no --exp-name; using registry config (pass explicit onnx paths).")
         return
@@ -171,11 +170,13 @@ def _episode_status(env, state, cfg, goal_x, max_steps):
     if float(env.get_gravity("pelvis")[2]) < 0.0 or float(info["head_pos"][2]) < 0.7:
         return "fall", base_x
 
-    # Obstacle SDF penetration — active only after the pickup phase settles. Split into
-    # robot-body collision and carried-box collision (boxdf). Single-stage tasks (e.g.
-    # G1Pickup) have no `stage1_steps` and no obstacles, so this check is skipped for them.
-    stage1_steps = getattr(cfg, "stage1_steps", None)
-    if stage1_steps is not None and step >= stage1_steps + 50:
+    # Obstacle SDF penetration — active only after a short settle window (step >= 50),
+    # matching env_catra._get_termination. Split into robot-body collision and
+    # carried-box collision (boxdf). Only G1CaTra (warm-start box transport) traverses
+    # obstacles; obstacle-less tasks (e.g. G1Pickup) lack `warmstart_states_path` and
+    # skip this check.
+    is_catra = hasattr(cfg, "warmstart_states_path")
+    if is_catra and step >= 50:
         thr = cfg.term_collision_threshold
         robot_keys = ("headdf", "pelvdf", "torsdf", "feetdf", "handsdf", "kneesdf", "shldsdf")
         if any(np.any(info[k] < -thr) for k in robot_keys):

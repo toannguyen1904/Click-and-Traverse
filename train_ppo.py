@@ -63,8 +63,7 @@ class Args:
     box_inflation: bool = True  # G1CaTra only: boxgf reward uses gf_inflation.npy (True) or regular gf.npy (False) for the box
     term_collision_threshold: float = 0.04  # SDF below -threshold triggers collision termination
     obs_path: str = 'data/assets/TypiObs/empty'  # path to the obstacle grid files: sdf.npy, bf.npy, gf.npy.
-    stage1_steps: int = -1  # for G1CaTra: number of steps in stage 1 (pickup); -1 = use task default
-    warmstart_states_path: str = ""  # path to pre-generated .npz from generate_warmstart_states.py; enables file-load warm-start in G1CaTra
+    warmstart_states_path: str = ""  # path to pre-generated .npz from generate_warmstart_states.py; required for G1CaTra (single-stage transport)
     def generate_exp_name(self):
         # generate a unique experiment name based on the task, difficulty, and seed
         exp_name_parts = [self.exp_name]
@@ -168,12 +167,8 @@ def _apply_args_to_config(args: Args, policy_cfg, env_config, debug: bool):
     if hasattr(env_config, "box_use_inflation"):
         env_config.box_use_inflation = args.box_inflation  # boxgf: use gf_inflation.npy (True) vs regular gf.npy (False)
     env_config.term_collision_threshold = args.term_collision_threshold  # SDF below -threshold triggers collision termination
-    if args.stage1_steps >= 0 and hasattr(env_config, "stage1_steps"):
-        env_config.stage1_steps = args.stage1_steps  # override stage 1 length (G1CaTra only)
     if args.warmstart_states_path and hasattr(env_config, "warmstart_states_path"):
         env_config.warmstart_states_path = args.warmstart_states_path
-        if args.stage1_steps < 0:
-            env_config.stage1_steps = 0
         # If the task config opted out of DR (e.g. G1CaTraPri teacher), keep DR off and
         # use a stripped-down warm-start fn that only handles box mass/size + index dispatch.
         # Otherwise use the full DR-on warm-start fn (existing G1CaTra behavior).

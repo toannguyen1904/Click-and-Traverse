@@ -15,7 +15,7 @@ but evaluated instantaneously (no lookahead) on the live rollout:
 On the first step past --min_pickup_steps where all three hold, the live pickup
 terminal state (qpos/qvel/box_mass/box_size) is injected as a 1-element warm-start
 array into the CATRA play env and its existing warm-start reset path takes over
-(Stage 2, box already carried) -- no new reset logic. If the gate is never reached
+(box already carried, single-stage transport) -- no new reset logic. If the gate is never reached
 within --max_pickup_steps, the run reports failure and exits without running CATRA.
 
 Example:
@@ -174,9 +174,7 @@ def play(args: Args):
     if hasattr(catra_cfg, "box_use_inflation"):
         catra_cfg.box_use_inflation = _read_box_use_inflation(args.catra_exp_name, args.box_inflation)
         print(f"[pickup_catra] box_use_inflation = {catra_cfg.box_use_inflation}")
-    # We hand off a state that is already holding the box, so start CATRA in Stage 2.
-    if hasattr(catra_cfg, "stage1_steps"):
-        catra_cfg.stage1_steps = 0
+    # We hand off a state that is already holding the box; CATRA is single-stage transport.
     _set_box_noise(catra_cfg, args.box_noise)
     catra_env_class = cat_ppo.registry.get(args.catra_task, "play_env_class")
     catra_env = catra_env_class(task_type=catra_cfg.task_type, config=catra_cfg, headless=args.record)
@@ -259,7 +257,7 @@ def play(args: Args):
         ho_box_mass = float(pickup_env.mj_model.body_mass[pickup_env._box_body_id])
 
         # Inject a 1-element warm-start batch so PlayG1CaTraEnv.reset() takes its warm-start
-        # branch (loads this exact holding-box state, starts in Stage 2 with the box carried).
+        # branch (loads this exact holding-box state; single-stage transport with the box carried).
         catra_env._ws_qpos = ho_qpos[None]
         catra_env._ws_qvel = ho_qvel[None]
         catra_env._ws_box_size = ho_box_size[None]

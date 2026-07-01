@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Two-stage CaTra environment: stage 1 pickup (steps 0 -> stage1_steps-1) + stage 2 carry & traverse (steps stage1_steps -> stage1_steps+499)."""
+"""Single-stage CaTra environment: box carry & traverse (500 steps).
+
+The robot is always initialized from a warm-start state (already holding the box);
+there is no pickup stage. Every step uses the PF-derived command and the navigation
++ carry-maintenance rewards.
+"""
 
 from typing import Any, Dict, Optional, Union
 
@@ -352,11 +357,11 @@ def make_warmstart_only_catra(states_path: str):
 
 
 def g1_catra_task_config() -> config_dict.ConfigDict:
-    """Config for two-stage G1CaTra.
+    """Config for single-stage G1CaTra (box carry & traverse).
 
-    Episode: 600 steps (12 s @ 50 Hz).
-      Stage 1 (steps   0 –> stage1_steps-1): zero command, pickup rewards (22 terms).
-      Stage 2 (steps stage1_steps -> stage1_steps+499): PF-derived command, navigation + carry rewards.
+    Episode: 500 steps (10 s @ 50 Hz). The robot is warm-started already holding
+    the box; every step uses the PF-derived command and the navigation + carry
+    rewards. There is no pickup stage.
 
     Observation dimensions:
       num_obs = 239  (state, deployable; PF subblock delayed + nav-frame, not additively noised)
@@ -366,8 +371,7 @@ def g1_catra_task_config() -> config_dict.ConfigDict:
         task_type="flat_terrain_catra",
         ctrl_dt=0.02,
         sim_dt=0.002,
-        episode_length=600,
-        stage1_steps=100,
+        episode_length=500,
         action_repeat=1,
         action_scale=0.5,
         history_len=15,
@@ -404,42 +408,12 @@ def g1_catra_task_config() -> config_dict.ConfigDict:
         ),
         reward_config=config_dict.create(
             scales=config_dict.create(
-                # --- Always active (both stages) ---
+                # --- Always active ---
                 joint_torque=-1e-4,
                 smoothness_joint=-1e-6,
                 joint_limits=-1.0,
                 hip_yaw_lim=-2.0,    # penalize hip-yaw joints outside [-0.5, 0.5] rad
-                # --- Stage 1 only: Pickup rewards ---
-                # reach=1.5,
-                # lift=2.0,
-                # hand_contact=2.0,
-                # box_pillar_contact=-1.5,
-                # grasp_symmetry=-2.0,
-                # palm_orient=2.0,
-                # hands_level=-1.0,
-                # box_vertical=-0.5,
-                # CHANGED
-                reach=0.0,
-                lift=0.0,
-                hand_contact=0.0,
-                box_pillar_contact=0.0,
-                grasp_symmetry=0.0,
-                palm_orient=0.0,
-                hands_level=0.0,
-                box_vertical=0.0,
-
-                hold_stable=0.0,
-                box_yaw_stable=0.0,
-                box_centering=0.0,
-                box_upright=0.0,
-                upright=3.0,
-                foot_contact=-0.5,
-                foot_slip=-0.1,
-                straight_knee=-5.0,
-                smoothness=1e-3,
-                base_height=1.0,
-                foot_balance=-30.0,
-                # --- Stage 2 only: navigation rewards (CAT scales) ---
+                # --- Navigation rewards (CAT scales) ---
                 tracking_orientation=2.0,
                 tracking_root_field=1.0,
                 body_motion=-0.5,
@@ -465,7 +439,7 @@ def g1_catra_task_config() -> config_dict.ConfigDict:
                 shldsdf=0.0,   # overwritten by --lateraldf
                 boxdf=0.0,     # box-corner SDF collision penalty (set non-zero to enable)
                 boxgf=0.0,     # box-corner inflation-GF alignment (set via --boxgf)
-                # --- Stage 2 only: carry maintenance (same scales as Pickup) ---
+                # --- Carry maintenance ---
                 reach_carry=3.0,
                 lift_carry=0.0, #2.0,
                 hand_contact_carry=2.0,
@@ -473,13 +447,6 @@ def g1_catra_task_config() -> config_dict.ConfigDict:
                 palm_orient_carry=2.0,
                 hands_level_carry=-1.0,
                 box_upright_carry=2.0,
-                # # CHANGED
-                # reach_carry=0.0,
-                # lift_carry=0.0,
-                # hand_contact_carry=0.0,
-                # grasp_symmetry_carry=0.0,
-                # palm_orient_carry=0.0,
-                # hands_level_carry=0.0,
             ),
             base_height_target=0.75,
             foot_height_stance=0.0,
@@ -518,7 +485,7 @@ def g1_catra_task_config() -> config_dict.ConfigDict:
         madrona_backend=False,
         augment_pixels=False,
         num_envs=32768,
-        episode_length=600,
+        episode_length=500,
         action_repeat=1,
         wrap_env_fn=None,
         randomization_fn=domain_randomize_catra,
@@ -573,11 +540,11 @@ cat_ppo.registry.register("G1CaTra", "config")(g1_catra_task_config())
 
 @cat_ppo.registry.register("G1CaTra", "train_env_class")
 class G1CaTraEnv(G1CatEnv):
-    """Two-stage G1 humanoid: stage 1 pickup, stage 2 carry & traverse.
+    """Single-stage G1 humanoid: box carry & traverse.
 
-    Stage 1 (steps 0 -> stage1_steps-1): robot stands, uses Pickup rewards (22 terms).
-    Stage 2 (steps stage1_steps -> stage1_steps+499): robot walks with box, uses CAT navigation rewards
-    + 6 carry-maintenance terms.
+    The robot is warm-started already holding the box and walks through the
+    obstacle scene for the full 500-step episode, using CAT navigation rewards
+    + carry-maintenance terms. There is no pickup stage.
 
     Action space: 20 DOF (12 leg + 8 arm joints; TEMP: all 3 waist joints removed).
     State:       239-dim (deployable, noisy).
@@ -647,103 +614,46 @@ class G1CaTraEnv(G1CatEnv):
             for side in ["left", "right"]
         ])
 
-        # Warm-start: load pre-generated states from file if configured
-        self._ws_qpos = None
-        self._ws_qvel = None
+        # Warm-start is mandatory: single-stage CaTra always initializes from a
+        # pre-generated "robot already holding box" state (there is no pickup stage).
         ws_path = getattr(self._config, "warmstart_states_path", None)
-        if ws_path:
-            npz = np.load(ws_path)
-            self._ws_qpos = jp.array(npz["qpos"])   # (N, nq)
-            self._ws_qvel = jp.array(npz["qvel"])   # (N, nv)
-            N = int(self._ws_qpos.shape[0])
-            print(f"[G1CaTraEnv] Loaded {N} warm-start states from {ws_path}")
+        if not ws_path:
+            raise ValueError(
+                "G1CaTra is single-stage (box transport only) and requires warm-start "
+                "initialization: set env_config.warmstart_states_path (e.g. via "
+                "train_ppo.py --warmstart_states_path <states.npz>)."
+            )
+        npz = np.load(ws_path)
+        self._ws_qpos = jp.array(npz["qpos"])   # (N, nq)
+        self._ws_qvel = jp.array(npz["qvel"])   # (N, nv)
+        N = int(self._ws_qpos.shape[0])
+        print(f"[G1CaTraEnv] Loaded {N} warm-start states from {ws_path}")
 
     @property
     def action_size(self) -> int:
         return len(self.action_joint_names)  # 20
 
     def reset(self, rng: jax.Array) -> mjx_env.State:
-        """Reset: loads a pre-generated warm-start state if configured, else random init."""
-        if self._ws_qpos is not None:
-            # --- Warm-start path: load saved (qpos, qvel) exactly as recorded ---
-            # State index for this env is encoded in qpos0[0] by domain_randomize_catra_warmstart.
-            state_idx = jp.round(self.mjx_model.qpos0[0]).astype(jp.int32)
-            qpos = self._ws_qpos[state_idx]      # (nq,) full state: root + joints + box + support
-            qvel = self._ws_qvel[state_idx]      # (nv,)
-            data = mjx_env.init(self.mjx_model, qpos=qpos, qvel=qvel, ctrl=qpos[7:7 + NUM_ROBOT_JOINTS])
-            data = mjx.forward(self.mjx_model, data)
+        """Reset: loads a pre-generated warm-start state (robot already holding box)."""
+        # --- Warm-start (only) path: load saved (qpos, qvel) exactly as recorded ---
+        # State index for this env is encoded in qpos0[0] by the warm-start DR fn.
+        state_idx = jp.round(self.mjx_model.qpos0[0]).astype(jp.int32)
+        qpos = self._ws_qpos[state_idx]      # (nq,) full state: root + joints + box + support
+        qvel = self._ws_qvel[state_idx]      # (nv,)
+        data = mjx_env.init(self.mjx_model, qpos=qpos, qvel=qvel, ctrl=qpos[7:7 + NUM_ROBOT_JOINTS])
+        data = mjx.forward(self.mjx_model, data)
 
-            last_act_init = jp.zeros(self.action_size)
-            motor_targets_init = qpos[7:7 + NUM_ROBOT_JOINTS]   # PD targets match saved pose
-            last_jv_init = qvel[6:6 + NUM_ROBOT_JOINTS]
+        last_act_init = jp.zeros(self.action_size)
+        motor_targets_init = qpos[7:7 + NUM_ROBOT_JOINTS]   # PD targets match saved pose
+        last_jv_init = qvel[6:6 + NUM_ROBOT_JOINTS]
 
-            # Ancillary scalars needed by info dict below; derive from saved state / model.
-            surface_z = self._config.box_surface_height_range[0]
-            support_half_z = self.mjx_model.geom_size[self._box_support_geom_id][2]
-            box_xy = qpos[BOX_QPOS_START:BOX_QPOS_START + 2]
-            box_quat_ws = qpos[BOX_QPOS_START + 3:BOX_QPOS_START + 7]
-            box_yaw = jp.arctan2(2 * (box_quat_ws[0] * box_quat_ws[3] + box_quat_ws[1] * box_quat_ws[2]),
-                                  1 - 2 * (box_quat_ws[2] ** 2 + box_quat_ws[3] ** 2))
-        else:
-            # --- Default random-init path (unchanged) ---
-            qpos = self._init_q.copy()
-            qvel = jp.zeros(self.mjx_model.nv)
-
-            rng, key = jax.random.split(rng)
-            dxy = jax.random.uniform(key, (2,), minval=-1.0, maxval=1.0)
-            qpos = qpos.at[0:2].set(qpos[0:2] + dxy)
-            qpos = qpos.at[2].set(0.8)
-
-            rng, key = jax.random.split(rng)
-            yaw = jax.random.uniform(key, (1,), minval=-np.pi / 2, maxval=np.pi / 2)
-            quat = math.axis_angle_to_quat(jp.array([0, 0, 1]), yaw)
-            new_quat = math.quat_mul(qpos[3:7], quat)
-            qpos = qpos.at[3:7].set(new_quat)
-
-            rng, key = jax.random.split(rng)
-            rand_qpos = qpos[7:7 + NUM_ROBOT_JOINTS] * jax.random.uniform(
-                key, (NUM_ROBOT_JOINTS,), minval=0.5, maxval=1.5
-            )
-            rand_qpos = jp.clip(rand_qpos, self._soft_lowers, self._soft_uppers)
-            qpos = qpos.at[7:7 + NUM_ROBOT_JOINTS].set(rand_qpos)
-
-            data = mjx_env.init(self.mjx_model, qpos=qpos, qvel=qvel, ctrl=qpos[7:7 + NUM_ROBOT_JOINTS])
-
-            # Box 0.3 m in front along robot forward direction
-            w, x, y, z = qpos[3], qpos[4], qpos[5], qpos[6]
-            forward_xy = jp.array([1 - 2 * (y ** 2 + z ** 2), 2 * (x * y + w * z)])
-            box_xy = qpos[:2] + 0.3 * forward_xy
-
-            # Box yaw: robot yaw ± 10°
-            rng, key = jax.random.split(rng)
-            box_yaw_offset = jax.random.uniform(key, minval=-np.pi / 18, maxval=np.pi / 18)
-            robot_yaw = yaw[0]
-            box_yaw = robot_yaw + box_yaw_offset
-            box_quat = math.axis_angle_to_quat(jp.array([0, 0, 1]), jp.array([box_yaw]))
-
-            # Fixed surface height
-            surface_z = self._config.box_surface_height_range[0]   # 0.3 m
-            box_half_z = self.mjx_model.geom_size[self._box_geom_id][2]
-            support_half_z = self.mjx_model.geom_size[self._box_support_geom_id][2]
-            box_z = surface_z + support_half_z + box_half_z
-
-            new_qpos = data.qpos.at[BOX_QPOS_START:BOX_QPOS_START + 3].set(
-                jp.array([box_xy[0], box_xy[1], box_z])
-            )
-            new_qpos = new_qpos.at[BOX_QPOS_START + 3:BOX_QPOS_START + 7].set(box_quat)
-            data = data.replace(qpos=new_qpos)
-
-            new_qpos = data.qpos.at[SUPPORT_QPOS_START:SUPPORT_QPOS_START + 3].set(
-                jp.array([box_xy[0], box_xy[1], surface_z])
-            )
-            new_qpos = new_qpos.at[SUPPORT_QPOS_START + 3:SUPPORT_QPOS_START + 7].set(box_quat)
-            data = data.replace(qpos=new_qpos)
-
-            data = mjx.forward(self.mjx_model, data)
-
-            last_act_init = jp.zeros(self.action_size)
-            motor_targets_init = self._default_qpos.copy()
-            last_jv_init = jp.zeros(NUM_ROBOT_JOINTS)
+        # Ancillary scalars needed by info dict below; derive from saved state / model.
+        surface_z = self._config.box_surface_height_range[0]
+        support_half_z = self.mjx_model.geom_size[self._box_support_geom_id][2]
+        box_xy = qpos[BOX_QPOS_START:BOX_QPOS_START + 2]
+        box_quat_ws = qpos[BOX_QPOS_START + 3:BOX_QPOS_START + 7]
+        box_yaw = jp.arctan2(2 * (box_quat_ws[0] * box_quat_ws[3] + box_quat_ws[1] * box_quat_ws[2]),
+                              1 - 2 * (box_quat_ws[2] ** 2 + box_quat_ws[3] ** 2))
 
         # --- DR scalars (kp/kd/rfi, sampled fresh each reset) ---
         rng, key_kp, key_kd, key_rfi = jax.random.split(rng, 4)
@@ -815,7 +725,7 @@ class G1CaTraEnv(G1CatEnv):
         boxbf_delay_init = self.sample_field(self.bf, box_corners_noisy)
         boxdf_delay_init = self.sample_field(self.sdf, box_corners_noisy)
 
-        # Stage 1 command is always zero; stage 2 command is PF-derived (computed in step())
+        # Command is PF-derived (computed each step); zero at reset before the first step.
         command = jp.zeros(4)
 
         # --- Push interval ---
@@ -936,7 +846,7 @@ class G1CaTraEnv(G1CatEnv):
         return mjx_env.State(data, obs, reward, done, metrics, info)
 
     def step(self, state: mjx_env.State, action: jax.Array) -> mjx_env.State:
-        """Step with 23-dim action; pushes gated to stage 2, command switches at step 100."""
+        """Step with the transport action; PF-derived command and pushes active every step."""
         state.info["rng"], push1_rng, push2_rng = jax.random.split(state.info["rng"], 3)
 
         push_theta = jax.random.uniform(push1_rng, maxval=2 * jp.pi)
@@ -946,20 +856,11 @@ class G1CaTraEnv(G1CatEnv):
             maxval=self._config.push_config.magnitude_range[1],
         )
         push_signal = jp.mod(state.info["push_step"] + 1, state.info["push_interval_steps"]) == 0
-        push_signal = push_signal & (state.info["step"] >= self._config.stage1_steps)   # only in stage 2
         push = jp.array([jp.cos(push_theta), jp.sin(push_theta)])
         push *= push_signal
         push *= self._config.push_config.enable
         qvel = state.data.qvel.at[:2].set(state.data.qvel[:2] + push * push_magnitude)
 
-        # # One-time kick at stage transition to break standing-still inertia
-        # state.info["rng"], kick_rng = jax.random.split(state.info["rng"])
-        # kick_theta = jax.random.uniform(kick_rng, maxval=2 * jp.pi)
-        # kick = jp.array([jp.cos(kick_theta), jp.sin(kick_theta)]) * 2.0 # 2.0m/s is the kick magnitude
-        # at_transition = (state.info["step"] == self._config.stage1_steps)
-        # qvel = qvel.at[:2].set(qvel[:2] + kick * at_transition)
-
-        
         state = state.replace(data=state.data.replace(qvel=qvel))
 
         # Motor targets
@@ -1048,13 +949,13 @@ class G1CaTraEnv(G1CatEnv):
         boxdf = self.sample_field(self.sdf, box_corners)
         box_corners_vel = (box_corners - state.info["box_corners"]) / self.dt  # per-corner velocity for the boxgf reward
 
-        # PF-derived command (always computed; gated to zero in stage 1)
+        # PF-derived command (active every step)
         cmd_pf = self.compute_cmd_from_rtf(
             pelvgf.reshape(-1),
             jp.concat([headgf, feetgf], axis=0),
             jp.concat([headbf, feetbf], axis=0),
         )
-        state.info["command"] = jp.where(state.info["step"] < self._config.stage1_steps, jp.zeros(4), cmd_pf)
+        state.info["command"] = cmd_pf
 
         # Delay buffer update
         update_pf = (state.info["step"] % 5) == 0
@@ -1104,8 +1005,6 @@ class G1CaTraEnv(G1CatEnv):
             jp.concat([headgf_delay, feetgf_delay], axis=0),
             jp.concat([headbf_delay, feetbf_delay], axis=0),
         )
-        # Gate delayed command same as primary command
-        command_delay = jp.where(state.info["step"] < self._config.stage1_steps, jp.zeros(4), command_delay)
 
         # Update info
         state.info["odom_delay"] = odom_delay.copy()
@@ -1144,10 +1043,8 @@ class G1CaTraEnv(G1CatEnv):
         rewards = self._get_reward(data, action, state.info, done, feet_contact)
         rewards = {k: v * self._config.reward_config.scales[k] for k, v in rewards.items()}
 
-        # Clip reward for stage 2, just like in CAT
-        in_stage2 = state.info["step"] >= self._config.stage1_steps
-        reward = self._assemble_reward(rewards, in_stage2)
-        self._record_agent_rewards(state.info, rewards, in_stage2)
+        reward = self._assemble_reward(rewards)
+        self._record_agent_rewards(state.info, rewards)
 
         timeout = state.info["step"] >= self._config.episode_length
         state.info["step"] = jp.where(done | timeout, 0, state.info["step"])
@@ -1168,20 +1065,20 @@ class G1CaTraEnv(G1CatEnv):
         """Scalar reward placed in State at reset."""
         return jp.zeros(())
 
-    def _assemble_reward(self, rewards: dict[str, jax.Array], in_stage2: jax.Array) -> jax.Array:
+    def _assemble_reward(self, rewards: dict[str, jax.Array]) -> jax.Array:
         """Collapse the scaled per-term reward dict into the scalar env reward.
-        Stage-2 reward is clipped to [0, 1e4] exactly as in CAT. The two-agent env
+        The reward is clipped to [0, 1e4] exactly as in CAT. The two-agent env
         overrides this to return the (lower + upper) sum so the brax wrappers still see a
         scalar; the per-agent split is carried in info via `_record_agent_rewards`."""
         raw_reward = sum(rewards.values()) * self.dt
-        return jp.where(in_stage2, jp.clip(raw_reward, 0.0, 10000.0), raw_reward)
+        return jp.clip(raw_reward, 0.0, 10000.0)
 
     def _extra_reward_info(self) -> dict[str, jax.Array]:
         """Extra info keys (e.g. per-agent rewards) added at reset. Empty for the
         single-agent env; the two-agent env adds 'reward_lower' / 'reward_upper'."""
         return {}
 
-    def _record_agent_rewards(self, info: dict, rewards: dict[str, jax.Array], in_stage2: jax.Array) -> None:
+    def _record_agent_rewards(self, info: dict, rewards: dict[str, jax.Array]) -> None:
         """Hook to stash per-agent rewards into info during step. No-op for single agent."""
         pass
 
@@ -1402,7 +1299,7 @@ class G1CaTraEnv(G1CatEnv):
         }
 
     def _get_termination(self, data: mjx.Data, info: dict[str, Any]) -> jax.Array:
-        """Fall + body-obstacle SDF collision (active after step 150) + box drop (always active)."""
+        """Fall + body-obstacle SDF collision (active after step 50) + box drop (always active)."""
         fall_termination = self.get_gravity(data, "pelvis")[2] < 0.0
         fall_termination |= info["head_pos"][2] < 0.7
 
@@ -1420,8 +1317,9 @@ class G1CaTraEnv(G1CatEnv):
         contact_termination |= jp.any(info['shldsdf'] < -thr)
         contact_termination |= jp.any(info['boxdf'] < -thr)
 
-        # Body-obstacle SDF collision active only after step 150 (allow pickup phase to settle)
-        contact_termination &= (info["step"] >= self._config.stage1_steps + 50)
+        # Body-obstacle SDF collision active only after a short settle window
+        # (lets the warm-start pose stabilize before collision penalties apply).
+        contact_termination &= (info["step"] >= 50)
 
         # Box–thigh collision (box bumps into the upper legs while carried)
         box_thigh_termination = collision.geoms_colliding(data, self._box_geom_id, self._thigh_geom_ids[0])
@@ -1445,9 +1343,7 @@ class G1CaTraEnv(G1CatEnv):
             done: jax.Array,
             feet_contact: jax.Array,
     ) -> dict[str, jax.Array]:
-        """Two-stage reward: stage 1 uses Pickup terms, stage 2 uses navigation + carry terms."""
-        stage1_active = info["step"] < self._config.stage1_steps
-
+        """Single-stage reward: navigation (CAT) + carry-maintenance terms."""
         # -----------------------------------------------------------------------
         # Always-active terms
         # -----------------------------------------------------------------------
@@ -1457,11 +1353,9 @@ class G1CaTraEnv(G1CatEnv):
         hip_yaw_lim    = self._cost_hip_yaw(data.qpos[self._hip_yaw_indices + 7])
 
         # -----------------------------------------------------------------------
-        # Stage 1: Pickup reward computation
+        # Grasp quantities reused by the carry-maintenance rewards below
         # -----------------------------------------------------------------------
         box_pos = data.xpos[self._box_body_id]
-        box_z = box_pos[2]
-        box_half_z = info["box_size"][2]
         box_half_y = info["box_size"][1]
 
         left_palm_pos  = data.site_xpos[self._hands_site_id[0]]
@@ -1478,9 +1372,6 @@ class G1CaTraEnv(G1CatEnv):
         left_contact  = geoms_colliding(data, self._hand_geom_ids[0], self._box_geom_id)
         right_contact = geoms_colliding(data, self._hand_geom_ids[1], self._box_geom_id)
         hand_contact  = 0.5 * (left_contact.astype(jp.float32) + right_contact.astype(jp.float32))
-
-        # Box–pillar contact
-        box_pillar_contact = geoms_colliding(data, self._box_geom_id, self._box_support_geom_id).astype(jp.float32)
 
         # Grasp symmetry
         box_up_axis  = math.rotate(jp.array([0., 0., 1.]), box_quat)
@@ -1505,95 +1396,26 @@ class G1CaTraEnv(G1CatEnv):
         hands_level = hands_vec[2] ** 2 / (jp.dot(hands_vec, hands_vec) + 1e-6)
 
         # Lift
-        lift_height = box_z - (info["surface_z"] + info["support_half_z"] + box_half_z)
+        box_half_z = info["box_size"][2]
+        lift_height = box_pos[2] - (info["surface_z"] + info["support_half_z"] + box_half_z)
         lift = jp.clip(lift_height, 0.0, 0.10) / 0.10 - jp.clip(lift_height - 0.10, 0.0, None)
 
-        # Box vertical drift (gated on both hands touching)
-        both_hands = left_contact & right_contact
-        box_xy_drift = jp.linalg.norm(box_pos[:2] - info["box_xy_init"])
-        box_vertical = jp.where(both_hands, box_xy_drift ** 2, 0.0)
-
-        # Hold stable
-        box_linvel_raw = data.qvel[BOX_QVEL_START:BOX_QVEL_START + 3]
-        box_angvel_raw = data.qvel[BOX_QVEL_START + 3:BOX_QVEL_START + 6]
-        hold_stable = -(jp.linalg.norm(box_linvel_raw) + jp.linalg.norm(box_angvel_raw))
-
-        # Box yaw stable
-        qw, qz = box_quat[0], box_quat[3]
-        box_yaw_now = 2.0 * jp.arctan2(qz, qw)
-        yaw_diff = (box_yaw_now - info["box_yaw_init"] + jp.pi) % (2 * jp.pi) - jp.pi
-        box_yaw_stable = jp.where(both_hands, yaw_diff ** 2, 0.0)
-
-        # Box upright
+        # Box upright (tilt angle from the box quaternion)
         qx, qy = box_quat[1], box_quat[2]
         box_tilt_cos = jp.clip(1.0 - 2.0 * (qx ** 2 + qy ** 2), -1.0, 1.0)
         box_tilt_angle = jp.arccos(box_tilt_cos)
-        box_upright = jp.where(lift_height > 0.0, jp.exp(-box_tilt_angle ** 2), 0.0)
-
-        # Box centering
-        torso_rot = data.site_xmat[self._torso_imu_site_id].reshape(3, 3)
-        torso_pos = data.site_xpos[self._torso_imu_site_id]
-        torso_right = torso_rot[:, 1]
-        lateral_offset = jp.dot(box_pos - torso_pos, torso_right)
-        box_centering = lateral_offset ** 2
-
-        # Robot upright
-        pelvis_rot = data.site_xmat[self._pelvis_imu_site_id].reshape(3, 3)
-        pelvis_rpy = jp.array(jaxlie.SO3.from_matrix(pelvis_rot).as_rpy_radians())
-        torso_rpy  = jp.array(jaxlie.SO3.from_matrix(torso_rot).as_rpy_radians())
-        err_roll        = jp.abs(pelvis_rpy[0]) + jp.abs(torso_rpy[0])
-        err_pitch_back  = jp.abs(jp.clip(torso_rpy[1], -jp.pi, 0.0))
-        err_pitch_any   = jp.abs(torso_rpy[1])
-        upright = jp.exp(-0.5 * (err_roll + err_pitch_back + err_pitch_any)) - err_pitch_back
-
-        # Foot stability (stage 1: stance only)
-        stance_gait = jp.ones(2)
-        foot_contact_s1  = self._cost_foot_contact(data, feet_contact, stance_gait, jp.array(1.0))
-        foot_slip_s1     = self._cost_foot_slip(data, stance_gait)
-        straight_knee_s1 = self._cost_straight_knee(data.qpos[jp.array(self._knee_indices) + 7])
-        smoothness_s1    = -jp.sum((action - info["last_act"]) ** 2)
-        base_height      = self._reward_base_height(data.qpos[2], jp.zeros(()))
-
-        # Foot balance
-        pelvis_com_xy = data.subtree_com[self.body_id_pelvis][:2]
-        left_foot_xy  = data.site_xpos[self._feet_site_id[0]][:2]
-        right_foot_xy = data.site_xpos[self._feet_site_id[1]][:2]
-        foot_center   = left_foot_xy + right_foot_xy - 2 * pelvis_com_xy
-        centering_cost = jp.sum(jp.square(foot_center))
-        feet_site_pos = data.site_xpos[self._feet_site_id]
-        foot_dist     = jp.linalg.norm(feet_site_pos[0] - feet_site_pos[1])
-        spread_penalty = jp.where(foot_dist < 0.35, (0.35 - foot_dist) * 10, 0.0)
-        foot_balance_s1 = centering_cost * (1 + spread_penalty)
-
-        stage1_dict = {
-            "reach":            reach,
-            "lift":             lift,
-            "hand_contact":     hand_contact,
-            "box_pillar_contact": box_pillar_contact,
-            "grasp_symmetry":   grasp_symmetry,
-            "palm_orient":      palm_orient,
-            "hands_level":      hands_level,
-            "hold_stable":      hold_stable,
-            "box_yaw_stable":   box_yaw_stable,
-            "box_centering":    box_centering,
-            "box_vertical":     box_vertical,
-            "box_upright":      box_upright,
-            "upright":          upright,
-            "foot_contact":     foot_contact_s1,
-            "foot_slip":        foot_slip_s1,
-            "straight_knee":    straight_knee_s1,
-            "smoothness":       smoothness_s1,
-            "base_height":      base_height,
-            "foot_balance":     foot_balance_s1,
-        }
 
         # -----------------------------------------------------------------------
-        # Stage 2: navigation (CAT) + carry maintenance
+        # Navigation (CAT) + carry maintenance
         # -----------------------------------------------------------------------
         move_flag = info["command"][0]
         cmd_vel   = info["command"][1:].copy()
 
-        stage2_dict = {
+        rewards = {
+            "joint_torque":    joint_torque,
+            "smoothness_joint": smoothness_joint,
+            "joint_limits":    joint_limits,
+            "hip_yaw_lim":     hip_yaw_lim,
             "tracking_orientation": self._reward_orientation(
                 info["navi_pelvis_rpy"], info["navi_torso_rpy"],
                 info["head_pos"][2] > (self._config.torso_height[1] + 0.1),
@@ -1629,7 +1451,7 @@ class G1CaTraEnv(G1CatEnv):
                 info["boxgf"], info["box_corners_vel"], info["boxdf"],
                 (move_flag[None] < 0.5) | (info["box_corners"][..., 0] > 1.5),
                 cmd_vel, tau=1.5),
-            # Carry maintenance (reuse computed Pickup values)
+            # Carry maintenance (reuse the grasp quantities computed above)
             "reach_carry":          reach,
             "lift_carry":           lift,
             "hand_contact_carry":   hand_contact,
@@ -1638,20 +1460,6 @@ class G1CaTraEnv(G1CatEnv):
             "hands_level_carry":    hands_level,
             "box_upright_carry":    jp.exp(-box_tilt_angle ** 2),
         }
-
-        # -----------------------------------------------------------------------
-        # Gate and combine
-        # -----------------------------------------------------------------------
-        rewards = {
-            "joint_torque":    joint_torque,
-            "smoothness_joint": smoothness_joint,
-            "joint_limits":    joint_limits,
-            "hip_yaw_lim":     hip_yaw_lim,
-        }
-        for k, v in stage1_dict.items():
-            rewards[k] = jp.where(stage1_active, v, 0.0)
-        for k, v in stage2_dict.items():
-            rewards[k] = jp.where(stage1_active, 0.0, v)
 
         for k, v in rewards.items():
             rewards[k] = jp.where(jp.isnan(v), 0.0, v)

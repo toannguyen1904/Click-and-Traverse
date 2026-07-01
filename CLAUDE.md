@@ -57,13 +57,13 @@ MjxEnv → G1Env → G1LocoEnv → G1CatEnv → G1CaTraEnv → G1PickupEnv
 
 - **G1LocoEnv**: joystick-guided walking, 12-DOF legs, gait clock, base domain randomization
 - **G1CatEnv** (`G1Cat`): collision-aware traversal with HumanoidPF fields. 162-dim state, 250-dim privileged_state.
-- **G1CaTraEnv** (`G1CaTra`): extends G1CatEnv with 23-DOF action (legs + waist + arms) and a carried box (freejoint). Adds box freejoint handling in qpos/qvel slicing.
+- **G1CaTraEnv** (`G1CaTra`): extends G1CatEnv with a carried box (freejoint) and box freejoint handling in qpos/qvel slicing. Single-stage box transport (500 steps): warm-started already holding the box, then PF-guided traversal + `_carry` grasp-maintenance rewards. Warm-start init is mandatory (no pickup stage). Action space is currently 20-DOF (12 legs + 8 arms; 3 waist joints TEMP held at default).
 - **G1PickupEnv** (`G1Pickup`): overrides G1CaTraEnv to 11-DOF action (waist + arms only), legs held at default. Compact obs (61-dim state / 99-dim privileged), pickup-specific rewards.
 
 ### Registered Tasks
 - `G1Loco` / `G1LocoDis` — baseline locomotion
 - `G1Cat` / `G1CatPri` — collision-aware traversal
-- `G1CaTra` — carry and traverse (23-DOF, box freejoint)
+- `G1CaTra` — single-stage box carry & traverse (500 steps, warm-start only, box freejoint)
 - `G1Pickup` — box pickup, Phase 1 of CaTra curriculum
 
 ### Key Files

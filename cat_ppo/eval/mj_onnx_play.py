@@ -33,8 +33,7 @@ class Args:
     box_size: str = None      # box half-extents as "x,y,z" in metres (e.g. "0.15,0.20,0.15")
     box_mass: float = None    # box mass in kg (e.g. 1.5)
     box_noise: bool = True    # add box position/orientation tracking noise to the deployable obs (False -> ground-truth box)
-    stage1_steps: int = -1    # for G1CaTra: override stage 1 length; -1 = use task default
-    warmstart_states_path: str = None  # path to .npz warm-start file; starts episode in Stage 2
+    warmstart_states_path: str = None  # path to .npz warm-start file (required for G1CaTra: robot starts holding the box)
     warmstart_idx: int = -1   # which saved state to load (-1 = random)
     init_pos_offset: float = 0.0  # G1CaTra: random xy offset (m) for robot+box init pose in [-v, v]; 0 disables
     init_ang_offset: float = 0.0  # G1CaTra: random yaw offset (deg) for robot+box init pose in [-v, v]; 0 disables
@@ -80,12 +79,8 @@ def play(args: Args):
     if hasattr(env_cfg, "box_use_inflation"):
         env_cfg.box_use_inflation = _read_box_use_inflation(args.exp_name, args.box_inflation)
         print(f"[mj_onnx_play] box_use_inflation = {env_cfg.box_use_inflation}")
-    if args.stage1_steps >= 0 and hasattr(env_cfg, "stage1_steps"):
-        env_cfg.stage1_steps = args.stage1_steps
     if args.warmstart_states_path and hasattr(env_cfg, "warmstart_states_path"):
         env_cfg.warmstart_states_path = args.warmstart_states_path
-        if args.stage1_steps < 0 and hasattr(env_cfg, "stage1_steps"):
-            env_cfg.stage1_steps = 0
     _set_box_noise(env_cfg, args.box_noise)
     env = env_class(task_type=env_cfg.task_type, config=env_cfg, headless=args.record)
     env.pri = args.pri
