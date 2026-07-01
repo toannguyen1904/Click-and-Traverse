@@ -154,8 +154,10 @@ def _episode_status(env, state, cfg, goal_x, max_steps):
         return "fall", base_x
 
     # Obstacle SDF penetration — active only after the pickup phase settles. Split into
-    # robot-body collision and carried-box collision (boxdf).
-    if step >= cfg.stage1_steps + 50:
+    # robot-body collision and carried-box collision (boxdf). Single-stage tasks (e.g.
+    # G1Pickup) have no `stage1_steps` and no obstacles, so this check is skipped for them.
+    stage1_steps = getattr(cfg, "stage1_steps", None)
+    if stage1_steps is not None and step >= stage1_steps + 50:
         thr = cfg.term_collision_threshold
         robot_keys = ("headdf", "pelvdf", "torsdf", "feetdf", "handsdf", "kneesdf", "shldsdf")
         if any(np.any(info[k] < -thr) for k in robot_keys):

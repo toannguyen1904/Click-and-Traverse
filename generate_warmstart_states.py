@@ -29,8 +29,11 @@ def main():
                         help="Latest step from which a snapshot can be taken (inclusive).")
     parser.add_argument("--lookahead", type=int, default=20,
                         help="Steps after snapshot to verify the box is still held.")
-    parser.add_argument("--oversample", type=float, default=1.5,
-                        help="Multiplier on num_states for envs to run before filtering (e.g. 1.5).")
+    parser.add_argument("--batch_size", type=int, default=None,
+                        help="Envs to roll out per batch (default: num_states). Lower this if the GPU OOMs; "
+                             "batches run sequentially until num_states valid states are collected.")
+    parser.add_argument("--max_batches", type=int, default=50,
+                        help="Safety cap on number of batches before giving up.")
     parser.add_argument("--seed", type=int, default=0,
                         help="PRNG seed for reproducibility.")
     parser.add_argument("--output", default="data/warmstart/catra_pickup_states.npz",
@@ -44,7 +47,8 @@ def main():
         sample_start=args.sample_start,
         sample_end=args.sample_end,
         lookahead=args.lookahead,
-        oversample=args.oversample,
+        batch_size=args.batch_size,
+        max_batches=args.max_batches,
         seed=args.seed,
         output_path=args.output,
     )

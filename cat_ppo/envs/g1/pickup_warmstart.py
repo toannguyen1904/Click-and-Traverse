@@ -34,7 +34,7 @@ def load_pickup_inference_fn(checkpoint_path: str) -> Callable:
     Reads ppo_network_config.json from inside the checkpoint directory,
     reconstructs the network, and returns inference_fn(obs_dict, rng) -> (action, extra).
 
-    obs_dict must have keys "state" (96,) and "privileged_state" (135,).
+    obs_dict must have keys "state" (97,) and "privileged_state" (135,).
     """
     ckpt_path = Path(checkpoint_path)
     if not ckpt_path.exists():
@@ -83,7 +83,7 @@ def pickup_obs_from_data(
     noise_config: Any,
     dt: float,
 ) -> tuple[dict[str, jax.Array], jax.Array]:
-    """Compute 96-dim state and 135-dim privileged_state from mjx.Data.
+    """Compute 97-dim state and 135-dim privileged_state from mjx.Data.
 
     Returns (obs_dict, updated_rng). The updated_rng reflects the noise-sampling
     splits consumed internally, so callers can thread it forward.
@@ -136,11 +136,20 @@ def pickup_obs_from_data(
 
     nl = noise_config.level
     ns = noise_config.scales
-    rng, k1, k2, k3, k4 = jax.random.split(info["rng"], 5)
+    rng, k1, k2, k3, k4, k5, k6, k7 = jax.random.split(info["rng"], 8)
     noisy_gyro = gyro_pelvis + (2 * jax.random.uniform(k1, (3,)) - 1) * nl * ns.gyro
     noisy_gvec = gvec_pelvis + (2 * jax.random.uniform(k2, (3,)) - 1) * nl * ns.gravity
     noisy_ja = joint_angles + (2 * jax.random.uniform(k3, joint_angles.shape) - 1) * nl * ns.joint_pos
     noisy_jv = joint_vel + (2 * jax.random.uniform(k4, joint_vel.shape) - 1) * nl * ns.joint_vel
+
+    # Box pose noise (mimics imperfect box tracking at deployment): +/- box_pos per xyz axis,
+    # and a random-axis, +/- box_ori axis-angle perturbation on the measured quat.
+    noisy_box_pos_local = box_pos_local + (2 * jax.random.uniform(k5, box_pos_local.shape) - 1) * nl * ns.box_pos
+    rand_axis = jax.random.normal(k6, (3,))
+    rand_axis = rand_axis / (jp.linalg.norm(rand_axis) + 1e-6)
+    rand_angle = (2 * jax.random.uniform(k7) - 1) * nl * ns.box_ori
+    noise_quat = math.axis_angle_to_quat(rand_axis, rand_angle)
+    noisy_box_quat_local = math.quat_mul(box_quat_local, noise_quat)
 
     state = jp.hstack([
         noisy_gyro, noisy_gvec,
@@ -148,7 +157,8 @@ def pickup_obs_from_data(
         noisy_jv[action_joint_ids],
         info["last_act"],
         info["motor_targets"][action_joint_ids],
-        box_pos_local, box_quat_local, box_size,
+        noisy_box_pos_local, noisy_box_quat_local, box_size,
+        info["box_mass"].reshape(1),
     ])
 
     obs = {

@@ -8,7 +8,7 @@ Phase 1 of the CaTra curriculum:
 - Terminal states feed into the CaTra traversal policy.
 
 Observation dimensions:
-  num_obs = 96   (state, deployable with sensor noise)
+  num_obs = 97   (state, deployable with sensor noise)
   num_pri = 135  (privileged_state, built from scratch with noiseless sensors)
 """
 
@@ -62,6 +62,18 @@ PICKUP_ACTION_JOINT_NAMES = [
     "right_shoulder_yaw_joint",
     "right_elbow_joint",
 ]
+
+# Arm joints occupy the last 8 entries of PICKUP_ACTION_JOINT_NAMES (indices 12–19).
+_ARM_ACTION_SLICE = slice(12, 20)
+
+# Box domain-randomization ranges, shared by training DR (domain_randomize_pickup)
+# and eval playback (PlayG1PickupEnv.reset). Half-extent maxima equal the XML
+# nominal size (0.15, 0.20, 0.15), so DR'd boxes are never larger than nominal —
+# keeps the precomputed collision rbound valid and box placement non-embedding.
+BOX_HALF_X_RANGE = (0.10, 0.15)
+BOX_HALF_Y_RANGE = (0.10, 0.20)
+BOX_HALF_Z_RANGE = (0.10, 0.15)
+BOX_MASS_RANGE = (0.5, 3.0)
 
 
 # ---------------------------------------------------------------------------
@@ -122,18 +134,18 @@ def _make_domain_randomize_pickup():
             # reset() uses the nominal half_z (0.15 m, the XML max) to compute box_z, so
             # DR'd boxes are always placed at or slightly above the pillar top — never embedded.
             rng, key = jax.random.split(rng)
-            box_half_x = jax.random.uniform(key, minval=0.10, maxval=0.15)
+            box_half_x = jax.random.uniform(key, minval=BOX_HALF_X_RANGE[0], maxval=BOX_HALF_X_RANGE[1])
             rng, key = jax.random.split(rng)
-            box_half_y = jax.random.uniform(key, minval=0.10, maxval=0.20)
+            box_half_y = jax.random.uniform(key, minval=BOX_HALF_Y_RANGE[0], maxval=BOX_HALF_Y_RANGE[1])
             rng, key = jax.random.split(rng)
-            box_half_z = jax.random.uniform(key, minval=0.10, maxval=0.15)
+            box_half_z = jax.random.uniform(key, minval=BOX_HALF_Z_RANGE[0], maxval=BOX_HALF_Z_RANGE[1])
             geom_size = model.geom_size.at[_box_geom_id].set(
                 jp.array([box_half_x, box_half_y, box_half_z])
             )
 
             # Box mass: override the globally-scaled value
             rng, key = jax.random.split(rng)
-            box_mass = jax.random.uniform(key, minval=1.0, maxval=4.0)
+            box_mass = jax.random.uniform(key, minval=BOX_MASS_RANGE[0], maxval=BOX_MASS_RANGE[1])
             body_mass = body_mass.at[_box_body_id].set(box_mass)
 
             return (pair_friction, dof_frictionloss, dof_armature, body_ipos, body_mass, qpos0, geom_size)
@@ -177,17 +189,17 @@ def g1_pickup_task_config() -> config_dict.ConfigDict:
     """Config for G1Pickup: stationary manipulation with crouching support.
 
     Observation dimensions:
-      num_obs = 96   (state, deployable)
+      num_obs = 97   (state, deployable)
       num_pri = 135  (privileged_state)
     """
     env_config = config_dict.create(
         task_type="flat_terrain_catra",
         ctrl_dt=0.02,
         sim_dt=0.002,
-        episode_length=200,
+        episode_length=1000,
         action_repeat=1,
-        action_scale=0.5,
-        num_obs=96,
+        action_scale=0.2,
+        num_obs=97,
         num_pri=135,
         num_act=20,
         soft_joint_pos_limit_factor=0.95,
@@ -231,22 +243,24 @@ def g1_pickup_task_config() -> config_dict.ConfigDict:
                 joint_vel=1.5,
                 gravity=0.05,
                 gyro=0.2,
+                box_pos=0.05,                 # +/- 5 cm per xyz axis (box tracking error)
+                box_ori=float(np.deg2rad(5.0)),  # +/- 5 deg random axis-angle perturbation
             ),
         ),
         reward_config=config_dict.create(
             scales=config_dict.create(
-                reach=1.5,
+                reach=3.0, #1.5,
                 lift=2.0,
                 hand_contact=2.0,
                 box_pillar_contact=-1.5,
                 grasp_symmetry=-2.0,
                 palm_orient=2.0,
                 hands_level=-1.0,
-                hold_stable=0.0,
+                hold_stable=0.5,
                 box_yaw_stable=0.0, # -2.0
                 box_centering=0.0,  # -2.0
                 box_vertical=-0.5,   # -5.0
-                box_upright=0.0,
+                box_upright=2.0,
                 upright=3.0,    # 1.0 in CAT
                 foot_contact=-0.5,
                 foot_slip=-0.1,
@@ -254,6 +268,7 @@ def g1_pickup_task_config() -> config_dict.ConfigDict:
                 joint_torque=-1e-4,
                 smoothness_joint=-1e-6,
                 smoothness=1e-3,
+                arm_smoothness=0., #10,
                 joint_limits=-1.0,
                 base_height=1.0,
                 foot_balance=-30.0,
@@ -276,7 +291,7 @@ def g1_pickup_task_config() -> config_dict.ConfigDict:
         madrona_backend=False,
         augment_pixels=False,
         num_envs=32768,
-        episode_length=200,
+        episode_length=1000,
         action_repeat=1,
         wrap_env_fn=None,
         randomization_fn=domain_randomize_pickup,
@@ -602,7 +617,7 @@ class G1PickupEnv(G1CaTraEnv):
         return state
 
     def _get_obs(self, data: mjx.Data, info: dict[str, Any]) -> mjx_env.Observation:
-        """96-dim state (deployable, noisy) and 135-dim privileged_state (noiseless + extras).
+        """97-dim state (deployable, noisy) and 135-dim privileged_state (noiseless + extras).
 
         Thin wrapper around pickup_obs_from_data.
         """
@@ -710,10 +725,15 @@ class G1PickupEnv(G1CaTraEnv):
         box_xy_drift = jp.linalg.norm(box_pos[:2] - info["box_xy_init"])
         box_vertical = jp.where(both_hands, box_xy_drift ** 2, 0.0)
 
-        # Hold stable: penalize box tumbling and translation
+        # Hold stable: penalize box tumbling and translation, but only once the box is
+        # lifted ≥7 cm off the surface. Without this gate the reward is maximized by leaving
+        # the box resting (stationary) on the pillar — and it would actively punish the lift
+        # maneuver. Gating makes "box resting" worth 0 here while earning no lift reward, so
+        # it can only be improved by holding a lifted box steady.
         box_linvel = data.qvel[BOX_QVEL_START:BOX_QVEL_START + 3]
         box_angvel = data.qvel[BOX_QVEL_START + 3:BOX_QVEL_START + 6]
-        hold_stable = -(jp.linalg.norm(box_linvel) + jp.linalg.norm(box_angvel))
+        holding = lift_height >= 0.07
+        hold_stable = jp.where(holding, -(jp.linalg.norm(box_linvel) + jp.linalg.norm(box_angvel)), 0.0)
 
         # Box yaw stable: penalize yaw deviation from initial box yaw, gated on both hands touching.
         # Extracts current box yaw from quaternion via atan2 and compares to reset yaw.
@@ -758,6 +778,8 @@ class G1PickupEnv(G1CaTraEnv):
         joint_torque = self._cost_torque(data.actuator_force)
         smoothness_joint = self._cost_smoothness_joint(data, info["last_joint_vel"])
         smoothness = -jp.sum((action - info["last_act"]) ** 2)
+        arm_delta = action[_ARM_ACTION_SLICE] - info["last_act"][_ARM_ACTION_SLICE]
+        arm_smoothness = -jp.sum(arm_delta ** 2)
 
         # Joint limits (only robot joints; box freejoint has no meaningful range)
         joint_limits = self._cost_joint_pos_limits(data.qpos[7:7 + NUM_ROBOT_JOINTS])
@@ -797,6 +819,7 @@ class G1PickupEnv(G1CaTraEnv):
             "joint_torque": joint_torque,
             "smoothness_joint": smoothness_joint,
             "smoothness": smoothness,
+            "arm_smoothness": arm_smoothness,
             "joint_limits": joint_limits,
             "base_height": base_height,
             "foot_balance": foot_balance,
