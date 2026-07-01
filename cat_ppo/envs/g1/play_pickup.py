@@ -158,6 +158,7 @@ class PlayG1PickupEnv(BaseEnv):
             "surface_z": float(surface_z),
             "support_half_z": support_half_z,
             "box_size": box_size,
+            "box_mass": float(self.mj_model.body_mass[self._box_body_id]),
             "box_z_init": float(box_z),
         }
 
@@ -200,7 +201,7 @@ class PlayG1PickupEnv(BaseEnv):
         return State(state.info, obs)
 
     def get_obs(self, info: dict) -> dict:
-        """Build 108-dim deployable state with sensor noise (matches G1PickupEnv._get_obs)."""
+        """Build 97-dim deployable state with sensor noise (matches G1PickupEnv._get_obs)."""
         nl = self._config.noise_config.level
         ns = self._config.noise_config.scales
 
@@ -237,6 +238,7 @@ class PlayG1PickupEnv(BaseEnv):
             info["last_act"],
             info["motor_targets"][ids],
             box_pos_local, box_quat_local, box_size,
+            np.array([info["box_mass"]]),
         ])
         return {"state": np.nan_to_num(state)}
 

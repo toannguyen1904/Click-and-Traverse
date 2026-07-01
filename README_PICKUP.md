@@ -14,7 +14,7 @@ This is **Phase 1** of a two-phase curriculum. The pickup policy produces divers
 | Task | Reach, grasp, and lift a box from a support surface |
 | Action space | 20 DOF (all leg joints × 2 + arms × 8; waist joints held at default) |
 | Legs | All 12 leg joints actuated (hip pitch/roll/yaw, knee, ankle pitch/roll × 2) |
-| Episode length | 200 steps (4 s at 50 Hz) |
+| Episode length | 1000 steps (20 s at 50 Hz) |
 | Box placement | 0.3 m in front of robot, on a support pillar (0.4 × 0.5 m top, 0.6 m tall) |
 | Success criterion | Box lifted ≥ 10 cm above the support pillar top |
 
@@ -47,13 +47,13 @@ right_shoulder_yaw_joint
 right_elbow_joint
 ```
 
-Waist (yaw/roll/pitch) and wrist joints are **not actuated** — the PD controller holds them at their default pose. Action scale: `0.5`.
+Waist (yaw/roll/pitch) and wrist joints are **not actuated** — the PD controller holds them at their default pose. Action scale: `0.2`.
 
 ---
 
 ## Observation Space
 
-### State (96-dim) — deployable on real robot
+### State (97-dim) — deployable on real robot
 
 All sensor readings include realistic noise to match real deployment conditions.
 
@@ -68,7 +68,8 @@ All sensor readings include realistic noise to match real deployment conditions.
 | `box_pos_local` | 3 | Box center position in pelvis frame |
 | `box_quat_local` | 4 | Box orientation in pelvis frame (wxyz) |
 | `box_size` | 3 | Box half-extents (l, w, h) — pre-determined at deployment |
-| **Total** | **96** | |
+| `box_mass` | 1 | Box mass (DR'd per environment, U[0.5, 4.0] kg) — pre-determined at deployment |
+| **Total** | **97** | |
 
 ### Privileged State (135-dim) — critic only during training
 
@@ -85,7 +86,7 @@ Built from scratch with **noiseless** sensor readings. The critic sees clean ver
 | `box_pos_local` | 3 | Same as state |
 | `box_quat_local` | 4 | Same as state |
 | `box_size` | 3 | Same as state |
-| `box_mass` | 1 | Box mass (DR'd per environment, U[1, 2] kg) |
+| `box_mass` | 1 | Box mass (DR'd per environment, U[0.5, 4.0] kg); also in deployable state |
 | `box_vel_local` | 3 | Box linear velocity in pelvis frame |
 | `box_angvel` | 3 | Box angular velocity (world frame) |
 | `left_hand_pos` | 3 | Absolute left palm position |
@@ -100,7 +101,7 @@ Built from scratch with **noiseless** sensor readings. The critic sees clean ver
 | `right_hand_vel` | 3 | Right palm linear velocity |
 | `kp_scale` | 1 | PD gain DR scalar |
 | `kd_scale` | 1 | PD gain DR scalar |
-| **Total** | **135** | 96 state (noiseless) + 39 privileged-only |
+| **Total** | **135** | 97 state (noiseless) + 38 privileged-only |
 
 ---
 
@@ -110,18 +111,18 @@ All rewards are multiplied by `dt` and clipped to `[0, 10000]`.
 
 | Term | Formula | Scale | Purpose |
 |------|---------|-------|---------|
-| `reach` | `−‖left_palm − left_face‖ − ‖right_palm − right_face‖` | 1.5 | Pull each hand to its own box face; zero when both palms touch their respective sides |
+| `reach` | `−‖left_palm − left_face‖ − ‖right_palm − right_face‖` | 3.0 | Pull each hand to its own box face; zero when both palms touch their respective sides |
 | `lift` | `clip(h, 0, 0.10) / 0.10 − clip(h − 0.10, 0, ∞)` where `h = box_z − surface_z − support_half_z − half_z` | 2.0 | Ramps to 1.0 at +10 cm; penalizes lifting beyond 10 cm |
 | `hand_contact` | `0.5 · (left_touching_box + right_touching_box)` | 2.0 | 0.5 per hand in contact with box; 1.0 for bilateral grasp |
 | `box_pillar_contact` | `1` if box touching pillar, else `0` | -1.5 | Penalize box remaining on pillar; encourages liftoff |
 | `grasp_symmetry` | `(Δheight)² + (Δdepth)²` along box local Z/X axes | -2.0 | Penalize height and front-back asymmetry between the two palms |
 | `palm_orient` | `0.5 · (clip(left_normal · left_desired, 0, 1) + clip(right_normal · right_desired, 0, 1))` | 2.0 | Reward palm normals (site local +Y for left, -Y for right — mirrored frames) pointing toward their respective box face; 1.0 when both palms face squarely inward |
 | `hands_level` | `(left_z - right_z)^2 / (‖left_palm - right_palm‖^2 + 1e-6)` | -1.0 | Penalize the line connecting the two palms tilting out of the world XY plane; 0 when both hands are at the same height, 1 when the hand-to-hand vector is vertical |
-| `hold_stable` | `−‖box_linvel‖ − ‖box_angvel‖` | 0.1 | Penalize box translation and tumbling |
-| `box_yaw_stable` | `wrap(yaw_now − yaw_init)²`, gated on both hands touching box | -2.0 | Penalize box yaw deviation from its initial orientation during active bilateral grasp |
-| `box_centering` | `(dot(box_pos − torso_pos, torso_right))²` | -2.0 | Penalize box being laterally offset from the torso's forward axis |
+| `hold_stable` | `−‖box_linvel‖ − ‖box_angvel‖` | 0.5 | Penalize box translation and tumbling |
+| `box_yaw_stable` | `wrap(yaw_now − yaw_init)²`, gated on both hands touching box | 0.0 | Penalize box yaw deviation from its initial orientation during active bilateral grasp; **currently disabled** |
+| `box_centering` | `(dot(box_pos − torso_pos, torso_right))²` | 0.0 | Penalize box being laterally offset from the torso's forward axis; **currently disabled** |
 | `box_vertical` | `‖box_xy − box_xy_init‖²`, gated on both hands touching box | -0.5 | Penalize XY drift from pillar center during active bilateral grasp; box should rise straight up |
-| `box_upright` | `exp(−θ²)` where θ = box tilt angle, gated on `lift_height > 0` | 1.0 | Keep box vertical once lifted; zero while resting on pillar to avoid free reward |
+| `box_upright` | `exp(−θ²)` where θ = box tilt angle, gated on `lift_height > 0` | 2.0 | Keep box vertical once lifted; zero while resting on pillar to avoid free reward |
 | `upright` | `exp(−0.5(‖roll‖ + \|pitch_back\| + \|pitch\|)) − \|pitch_back\|` | 3.0 | Asymmetric: backward lean is double-penalised; matches CAT orientation reward |
 | `base_height` | target pelvis height 0.75 m; capped when above target | 1.0 | Encourage upright stance height while reaching |
 | `foot_contact` | stance contact mismatch cost | -0.5 | Encourage both feet to stay in contact with the floor |
@@ -135,7 +136,7 @@ All rewards are multiplied by `dt` and clipped to `[0, 10000]`.
 
 **Notes:**
 - `reach` targets each hand to its respective face: `left_face = box_pos + box_left_axis·half_y`, `right_face = box_pos − box_left_axis·half_y`, where `box_left_axis = rotate([0,1,0], box_quat)` is the box local +Y in world frame — which points to the robot's **left** in this setup. This prevents the crossed-hands failure mode.
-- `hold_stable` scale is 0.1 (reduced from 0.5) since contact forces naturally cause small box rotations even at rest.
+- `hold_stable` scale is 0.5; contact forces naturally cause small box rotations even at rest, so this term is kept light.
 - `box_upright`: θ is computed from box quaternion as `arccos(1 − 2(qx² + qy²))`, the angle between the box z-axis and world z-axis.
 - `upright` uses CAT's asymmetric formula: `‖roll‖ = |roll_pelvis| + |roll_torso|`; `pitch_back = clip(torso_pitch, −π, 0)` (backward lean only); backward lean enters the exponential twice and also subtracts linearly, making the robot significantly more reluctant to fall backward.
 - `base_height` calls `_reward_base_height(qpos[2], move_flag=0)`: rewards reaching the 0.75 m pelvis target; output is capped at 0.5 when above target (no bonus for extra height).
@@ -153,9 +154,9 @@ All rewards are multiplied by `dt` and clipped to `[0, 10000]`.
 |-----------|-----------|
 | Robot fall (gravity vector) | `gvec_z < 0` |
 | Robot fall (head height) | `head_z < 0.5 m` |
-| Box dropped to floor | `box_z < surface_z − 0.1 m` |
+| Box dropped | `box_z < box_z_init − 0.1 m` (0.1 m below its reset height) |
 | NaN in qpos or qvel | any |
-| Episode timeout | 200 steps (4 s) |
+| Episode timeout | 1000 steps (20 s) |
 
 ---
 
@@ -185,8 +186,8 @@ All rewards are multiplied by `dt` and clipped to `[0, 10000]`.
 | qpos0 perturbation | `U[−0.05, 0.05]` per joint | Shifts nominal pose |
 | Box half-size x | `U[0.10, 0.15]` m | Per-environment |
 | Box half-size y | `U[0.10, 0.20]` m | Per-environment |
-| Box half-size z | `U[0.10, 0.15]` m | Per-environment; reset uses nominal 0.15 m for placement (box starts at or above pillar top) |
-| Box mass | `U[1.0, 2.0]` kg | Per-environment |
+| Box half-size z | `U[0.10, 0.15]` m | Per-environment; reset places the box at `pillar_top + box_half_z` so it rests exactly on the pillar top |
+| Box mass | `U[0.5, 3.0]` kg | Per-environment; included in the deployable obs |
 | KP scale | `U[0.75, 1.25]` | PD gain randomization |
 | KD scale | `U[0.75, 1.25]` | PD gain randomization |
 | RFI | Disabled | Legs not actively controlled; perturbations risk toppling |

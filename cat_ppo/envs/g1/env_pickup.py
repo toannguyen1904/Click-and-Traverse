@@ -8,7 +8,7 @@ Phase 1 of the CaTra curriculum:
 - Terminal states feed into the CaTra traversal policy.
 
 Observation dimensions:
-  num_obs = 96   (state, deployable with sensor noise)
+  num_obs = 97   (state, deployable with sensor noise)
   num_pri = 135  (privileged_state, built from scratch with noiseless sensors)
 """
 
@@ -73,7 +73,7 @@ _ARM_ACTION_SLICE = slice(12, 20)
 BOX_HALF_X_RANGE = (0.10, 0.15)
 BOX_HALF_Y_RANGE = (0.10, 0.20)
 BOX_HALF_Z_RANGE = (0.10, 0.15)
-BOX_MASS_RANGE = (1.0, 4.0)
+BOX_MASS_RANGE = (0.5, 3.0)
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +189,7 @@ def g1_pickup_task_config() -> config_dict.ConfigDict:
     """Config for G1Pickup: stationary manipulation with crouching support.
 
     Observation dimensions:
-      num_obs = 96   (state, deployable)
+      num_obs = 97   (state, deployable)
       num_pri = 135  (privileged_state)
     """
     env_config = config_dict.create(
@@ -199,7 +199,7 @@ def g1_pickup_task_config() -> config_dict.ConfigDict:
         episode_length=1000,
         action_repeat=1,
         action_scale=0.2,
-        num_obs=96,
+        num_obs=97,
         num_pri=135,
         num_act=20,
         soft_joint_pos_limit_factor=0.95,
@@ -615,7 +615,7 @@ class G1PickupEnv(G1CaTraEnv):
         return state
 
     def _get_obs(self, data: mjx.Data, info: dict[str, Any]) -> mjx_env.Observation:
-        """96-dim state (deployable, noisy) and 135-dim privileged_state (noiseless + extras).
+        """97-dim state (deployable, noisy) and 135-dim privileged_state (noiseless + extras).
 
         Thin wrapper around pickup_obs_from_data.
         """

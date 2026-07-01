@@ -34,7 +34,7 @@ def load_pickup_inference_fn(checkpoint_path: str) -> Callable:
     Reads ppo_network_config.json from inside the checkpoint directory,
     reconstructs the network, and returns inference_fn(obs_dict, rng) -> (action, extra).
 
-    obs_dict must have keys "state" (96,) and "privileged_state" (135,).
+    obs_dict must have keys "state" (97,) and "privileged_state" (135,).
     """
     ckpt_path = Path(checkpoint_path)
     if not ckpt_path.exists():
@@ -83,7 +83,7 @@ def pickup_obs_from_data(
     noise_config: Any,
     dt: float,
 ) -> tuple[dict[str, jax.Array], jax.Array]:
-    """Compute 96-dim state and 135-dim privileged_state from mjx.Data.
+    """Compute 97-dim state and 135-dim privileged_state from mjx.Data.
 
     Returns (obs_dict, updated_rng). The updated_rng reflects the noise-sampling
     splits consumed internally, so callers can thread it forward.
@@ -149,6 +149,7 @@ def pickup_obs_from_data(
         info["last_act"],
         info["motor_targets"][action_joint_ids],
         box_pos_local, box_quat_local, box_size,
+        info["box_mass"].reshape(1),
     ])
 
     obs = {
