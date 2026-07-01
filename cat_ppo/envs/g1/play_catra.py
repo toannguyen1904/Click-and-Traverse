@@ -47,6 +47,12 @@ def _quat_mul(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
     ])
 
 
+def _axis_angle_to_quat(axis: np.ndarray, angle: float) -> np.ndarray:
+    """wxyz quaternion for a rotation of `angle` rad about unit `axis`."""
+    s, c = np.sin(angle * 0.5), np.cos(angle * 0.5)
+    return np.array([c, axis[0] * s, axis[1] * s, axis[2] * s])
+
+
 _BOX_CORNER_SIGNS = np.array([
     [-1., -1., -1.], [-1., -1.,  1.], [-1.,  1., -1.], [-1.,  1.,  1.],
     [ 1., -1., -1.], [ 1., -1.,  1.], [ 1.,  1., -1.], [ 1.,  1.,  1.],
@@ -230,6 +236,13 @@ class PlayG1CaTraEnv(BaseEnv):
         boxbf = self.sample_field(self.bf,  box_corners)
         boxdf = self.sample_field(self.sdf, box_corners)
 
+        # Noisy box tracking estimate (single shared perturbation) for the deployable obs.
+        box_pos_noisy, box_quat_noisy = self._noisy_box_pose()
+        box_corners_noisy = self._box_corners_from_pose(box_pos_noisy, box_quat_noisy, box_size)
+        boxgf_noisy = self.sample_field(self.gf_box, box_corners_noisy)
+        boxbf_noisy = self.sample_field(self.bf,  box_corners_noisy)
+        boxdf_noisy = self.sample_field(self.sdf, box_corners_noisy)
+
         if self._ws_qpos is not None:
             init_step = self._config.stage1_steps
             init_motor_targets = self.mj_data.qpos[7:7 + NUM_ROBOT_JOINTS].copy()
@@ -259,6 +272,9 @@ class PlayG1CaTraEnv(BaseEnv):
             "kneesgf": kneesgf, "kneesbf": kneesbf, "kneesdf": kneesdf,
             "shldsgf": shldsgf, "shldsbf": shldsbf, "shldsdf": shldsdf,
             "boxgf": boxgf, "boxbf": boxbf, "boxdf": boxdf,
+            # Noised box PF + pose (deployable branch only; box-tracking error)
+            "boxgf_noisy": boxgf_noisy, "boxbf_noisy": boxbf_noisy, "boxdf_noisy": boxdf_noisy,
+            "box_pos_noisy": box_pos_noisy, "box_quat_noisy": box_quat_noisy,
             "head_pos": head_pos, "head_vel": np.zeros(3),
             "feet_pos": feet_pos, "feet_vel": np.zeros_like(feet_pos),
             "hands_pos": hands_pos, "hands_vel": np.zeros_like(hands_pos),
@@ -370,7 +386,8 @@ class PlayG1CaTraEnv(BaseEnv):
         headgf, pelvgf, torsgf, feetgf, handsgf, kneesgf, shldsgf = np.split(all_gf, [1, 2, 3, 5, 7, 9], axis=0)
         headbf, pelvbf, torsbf, feetbf, handsbf, kneesbf, shldsbf = np.split(all_bf, [1, 2, 3, 5, 7, 9], axis=0)
 
-        # Box corner PF (delayed, then move_flag-normalized)
+        # Box corner PF (delayed, then move_flag-normalized). Ground-truth corners feed the
+        # privileged (pri) actor path; a separate noised estimate feeds the deployable path.
         box_corners = self._box_corners_world(state.info["box_size"])
         box_corners_delay = delay_body_pos(p_gt, q_gt, p_odom, q_odom, box_corners)
         boxgf = self.sample_field(self.gf_box, box_corners_delay)
@@ -378,6 +395,17 @@ class PlayG1CaTraEnv(BaseEnv):
         boxdf = self.sample_field(self.sdf, box_corners_delay)
         boxgf = boxgf * (move_flag_val > 0.5) / (np.linalg.norm(boxgf, axis=-1, keepdims=True) + EPS)
         boxbf = boxbf / (np.linalg.norm(boxbf, axis=-1, keepdims=True) + EPS)
+
+        # Deployable box PF: sampled at the NOISY box estimate (imperfect box tracking).
+        # The same estimate feeds box_pos_local/box_quat_local in get_obs (via info).
+        box_pos_noisy, box_quat_noisy = self._noisy_box_pose()
+        box_corners_noisy = self._box_corners_from_pose(box_pos_noisy, box_quat_noisy, state.info["box_size"])
+        box_corners_noisy_delay = delay_body_pos(p_gt, q_gt, p_odom, q_odom, box_corners_noisy)
+        boxgf_noisy = self.sample_field(self.gf_box, box_corners_noisy_delay)
+        boxbf_noisy = self.sample_field(self.bf,  box_corners_noisy_delay)
+        boxdf_noisy = self.sample_field(self.sdf, box_corners_noisy_delay)
+        boxgf_noisy = boxgf_noisy * (move_flag_val > 0.5) / (np.linalg.norm(boxgf_noisy, axis=-1, keepdims=True) + EPS)
+        boxbf_noisy = boxbf_noisy / (np.linalg.norm(boxbf_noisy, axis=-1, keepdims=True) + EPS)
 
         state.info.update({
             "step": step + 1,
@@ -392,6 +420,8 @@ class PlayG1CaTraEnv(BaseEnv):
             "kneesgf": kneesgf, "kneesbf": kneesbf, "kneesdf": kneesdf,
             "shldsgf": shldsgf, "shldsbf": shldsbf, "shldsdf": shldsdf,
             "boxgf": boxgf, "boxbf": boxbf, "boxdf": boxdf,
+            "boxgf_noisy": boxgf_noisy, "boxbf_noisy": boxbf_noisy, "boxdf_noisy": boxdf_noisy,
+            "box_pos_noisy": box_pos_noisy, "box_quat_noisy": box_quat_noisy,
             "head_pos": head_pos, "head_vel": head_vel,
             "feet_pos": feet_pos, "feet_vel": feet_vel,
             "hands_pos": hands_pos, "hands_vel": hands_vel,
@@ -416,14 +446,15 @@ class PlayG1CaTraEnv(BaseEnv):
         noisy_ja   = joint_angles + (2 * np.random.rand(len(joint_angles)) - 1) * nl * ns.joint_pos
         noisy_jv   = joint_vel    + (2 * np.random.rand(len(joint_vel))    - 1) * nl * ns.joint_vel
 
-        # Box pose in pelvis frame
+        # Box pose in pelvis frame. Deployable state uses the NOISY box estimate (shared with
+        # the box-corner PF); the privileged (pri) state below uses the ground-truth world pose.
         pelvis_pos   = self.mj_data.xpos[self._pelvis_body_id]
         pelvis_xquat = self.mj_data.xquat[self._pelvis_body_id]
+        pelvis_conj    = pelvis_xquat * np.array([1., -1., -1., -1.])
         box_pos_world  = self.mj_data.xpos[self._box_body_id]
         box_quat_world = self.mj_data.xquat[self._box_body_id]
-        box_pos_local  = pelvis_xmat.T @ (box_pos_world - pelvis_pos)
-        pelvis_conj    = pelvis_xquat * np.array([1., -1., -1., -1.])
-        box_quat_local = _quat_mul(pelvis_conj, box_quat_world)
+        box_pos_local  = pelvis_xmat.T @ (info["box_pos_noisy"] - pelvis_pos)
+        box_quat_local = _quat_mul(pelvis_conj, info["box_quat_noisy"])
         box_size = info["box_size"]
 
         gait_phase = np.hstack([np.cos(info["phase"]), np.sin(info["phase"])])
@@ -522,10 +553,10 @@ class PlayG1CaTraEnv(BaseEnv):
         kneesbf = kneesbf * (info["kneesdf"] < 0.5); kneesdf = np.clip(info["kneesdf"], -1.0, 0.5)
         shldsbf = shldsbf * (info["shldsdf"] < 0.5); shldsdf = np.clip(info["shldsdf"], -1.0, 0.5)
 
-        boxgf_n = world_to_navi_vel(navi2world_pose, info["boxgf"].reshape(-1, 3))
-        boxbf_n = world_to_navi_vel(navi2world_pose, info["boxbf"].reshape(-1, 3))
-        boxbf_n = boxbf_n * (info["boxdf"] < 0.5)
-        boxdf_c = np.clip(info["boxdf"], -1.0, 0.5)
+        boxgf_n = world_to_navi_vel(navi2world_pose, info["boxgf_noisy"].reshape(-1, 3))
+        boxbf_n = world_to_navi_vel(navi2world_pose, info["boxbf_noisy"].reshape(-1, 3))
+        boxbf_n = boxbf_n * (info["boxdf_noisy"] < 0.5)
+        boxdf_c = np.clip(info["boxdf_noisy"], -1.0, 0.5)
 
         pf = np.hstack([
             headgf.reshape(-1), headbf.reshape(-1), headdf.reshape(-1),
@@ -609,12 +640,32 @@ class PlayG1CaTraEnv(BaseEnv):
         gait_mask = np.where(gait_cycle < -0.6, -1.0, gait_mask)
         state.info["gait_mask"] = np.float32(gait_mask)
 
-    def _box_corners_world(self, box_size: np.ndarray) -> np.ndarray:
-        # Returns (8, 3) world positions of box corners. box_size: (hx, hy, hz) half-extents.
-        box_pos  = self.mj_data.xpos [self._box_body_id]
-        box_quat = self.mj_data.xquat[self._box_body_id]  # wxyz
+    def _box_corners_from_pose(self, box_pos: np.ndarray, box_quat: np.ndarray, box_size: np.ndarray) -> np.ndarray:
+        # (8, 3) world corner positions for an explicit box pose (box_quat is wxyz).
         R_mat = R.from_quat([box_quat[1], box_quat[2], box_quat[3], box_quat[0]]).as_matrix()
         return box_pos + (_BOX_CORNER_SIGNS * box_size) @ R_mat.T
+
+    def _box_corners_world(self, box_size: np.ndarray) -> np.ndarray:
+        # Ground-truth box corners (privileged / pri actor path).
+        return self._box_corners_from_pose(
+            self.mj_data.xpos[self._box_body_id], self.mj_data.xquat[self._box_body_id], box_size)
+
+    def _noisy_box_pose(self) -> tuple[np.ndarray, np.ndarray]:
+        """Perturb the tracked box pose to mimic imperfect box tracking at deployment.
+
+        One shared estimate drives both box_pos_local/box_quat_local and the box-corner PF in
+        the deployable obs. Mirrors G1CaTraEnv._noisy_box_pose (uniform +/- box_pos per axis;
+        random-axis, +/- box_ori axis-angle). Gated by noise_config.level."""
+        nl = self._config.noise_config.level
+        ns = self._config.noise_config.scales
+        box_pos_world = self.mj_data.xpos[self._box_body_id]
+        box_quat_world = self.mj_data.xquat[self._box_body_id]
+        box_pos_noisy = box_pos_world + (2 * np.random.rand(3) - 1) * nl * ns.box_pos
+        axis = np.random.randn(3)
+        axis = axis / (np.linalg.norm(axis) + 1e-6)
+        angle = (2 * np.random.rand() - 1) * nl * ns.box_ori
+        box_quat_noisy = _quat_mul(box_quat_world, _axis_angle_to_quat(axis, angle))
+        return box_pos_noisy, box_quat_noisy
 
     def sample_field(self, field: np.ndarray, pos: np.ndarray) -> np.ndarray:
         """Trilinear interpolation of a 3D field at world-space positions (N,3) → (N,C)."""

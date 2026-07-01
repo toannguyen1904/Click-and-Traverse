@@ -797,7 +797,7 @@ def train(
     training_metrics = {}
     training_walltime = 0
     current_step = 0
-    disable_metrics_after_checkpoint = 4
+    disable_metrics_after_checkpoint = 3
     for it in range(num_evals_after_init):
         logging.info("starting iteration %s %s", it, time.time() - xt)
 

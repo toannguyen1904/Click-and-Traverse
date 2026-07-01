@@ -398,6 +398,8 @@ def g1_catra_task_config() -> config_dict.ConfigDict:
                 joint_vel=1.5,
                 gravity=0.05,
                 gyro=0.2,
+                box_pos=0.05,                 # +/- 5 cm per xyz axis (box tracking error)
+                box_ori=float(np.deg2rad(5.0)),  # +/- 5 deg random axis-angle perturbation
             ),
         ),
         reward_config=config_dict.create(
@@ -806,6 +808,13 @@ class G1CaTraEnv(G1CatEnv):
         boxdf = self.sample_field(self.sdf, box_corners)
         box_corners_vel = jp.zeros_like(box_corners)  # per-corner velocity for the boxgf reward
 
+        # Noisy box tracking estimate (single shared perturbation) for the deployable obs.
+        rng, box_pos_noisy, box_quat_noisy = self._noisy_box_pose(rng, data)
+        box_corners_noisy = self._box_corners_from_pose(box_pos_noisy, box_quat_noisy, box_size)
+        boxgf_delay_init = self.sample_field(self.gf_box, box_corners_noisy)
+        boxbf_delay_init = self.sample_field(self.bf, box_corners_noisy)
+        boxdf_delay_init = self.sample_field(self.sdf, box_corners_noisy)
+
         # Stage 1 command is always zero; stage 2 command is PF-derived (computed in step())
         command = jp.zeros(4)
 
@@ -899,9 +908,11 @@ class G1CaTraEnv(G1CatEnv):
             "shldsgf_delay": shldsgf.copy(), "shldsbf_delay": shldsbf.copy(), "shldsdf_delay": shldsdf.copy(),
             # Box corner HumanoidPF (8 corners): current world frame and delayed
             "boxgf": boxgf.copy(), "boxbf": boxbf.copy(), "boxdf": boxdf.copy(),
-            "boxgf_delay": boxgf.copy(), "boxbf_delay": boxbf.copy(), "boxdf_delay": boxdf.copy(),
+            "boxgf_delay": boxgf_delay_init.copy(), "boxbf_delay": boxbf_delay_init.copy(), "boxdf_delay": boxdf_delay_init.copy(),
             # Box corner kinematics (boxgf reward)
             "box_corners": box_corners.copy(), "box_corners_vel": box_corners_vel.copy(),
+            # Noisy box tracking estimate (shared by box_pos_local/quat_local + box PF in the deployable obs)
+            "box_pos_noisy": box_pos_noisy, "box_quat_noisy": box_quat_noisy,
             # Box state
             "box_pos": box_pos_init.copy(),
             # Box metadata (for reward computation)
@@ -1059,7 +1070,13 @@ class G1CaTraEnv(G1CatEnv):
         all_bf_delay = self.sample_field(self.bf, all_poses_delay)
         all_df_delay = self.sample_field(self.sdf, all_poses_delay)
 
-        box_corners_delay = delay_body_pos(p_gt, q_gt, p_odom, q_odom, box_corners)
+        # Deployable box PF is sampled at the NOISY box estimate (imperfect box tracking).
+        # The same estimate feeds box_pos_local/box_quat_local in _get_obs (via info).
+        state.info["rng"], box_pos_noisy, box_quat_noisy = self._noisy_box_pose(state.info["rng"], data)
+        state.info["box_pos_noisy"] = box_pos_noisy
+        state.info["box_quat_noisy"] = box_quat_noisy
+        box_corners_noisy = self._box_corners_from_pose(box_pos_noisy, box_quat_noisy, state.info["box_size"])
+        box_corners_delay = delay_body_pos(p_gt, q_gt, p_odom, q_odom, box_corners_noisy)
         boxgf_delay = self.sample_field(self.gf_box, box_corners_delay)
         boxbf_delay = self.sample_field(self.bf, box_corners_delay)
         boxdf_delay = self.sample_field(self.sdf, box_corners_delay)
@@ -1168,17 +1185,41 @@ class G1CaTraEnv(G1CatEnv):
         """Hook to stash per-agent rewards into info during step. No-op for single agent."""
         pass
 
-    def _box_corners_world(self, data: mjx.Data, box_size: jax.Array) -> jax.Array:
-        # Returns (8, 3) world positions of the box's corners. box_size is the (hx, hy, hz) half-extents.
+    def _box_corners_from_pose(self, box_pos: jax.Array, box_quat: jax.Array, box_size: jax.Array) -> jax.Array:
+        # Returns (8, 3) world positions of the box's corners for an explicit pose.
         corner_signs = jp.array([
             [-1., -1., -1.], [-1., -1.,  1.], [-1.,  1., -1.], [-1.,  1.,  1.],
             [ 1., -1., -1.], [ 1., -1.,  1.], [ 1.,  1., -1.], [ 1.,  1.,  1.],
         ], dtype=jp.float32)
-        box_pos = data.xpos[self._box_body_id]
-        box_quat = data.xquat[self._box_body_id]
         R = math.quat_to_mat(box_quat)
         local_corners = corner_signs * box_size
         return box_pos + local_corners @ R.T
+
+    def _box_corners_world(self, data: mjx.Data, box_size: jax.Array) -> jax.Array:
+        # Ground-truth box corners (used by reward + privileged critic PF).
+        return self._box_corners_from_pose(
+            data.xpos[self._box_body_id], data.xquat[self._box_body_id], box_size)
+
+    def _noisy_box_pose(self, rng: jax.Array, data: mjx.Data) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Perturb the tracked box pose to mimic imperfect box tracking at deployment.
+
+        A single estimate per call drives BOTH box_pos_local/box_quat_local and the box-corner
+        PF sampling, so the deployable policy sees one coherent noisy box estimate. Position:
+        uniform +/- box_pos per xyz axis. Orientation: random-axis, angle uniform in +/- box_ori.
+        Returns (rng, box_pos_noisy, box_quat_noisy).
+        """
+        box_pos_world = data.xpos[self._box_body_id]
+        box_quat_world = data.xquat[self._box_body_id]
+        lvl = self._config.noise_config.level
+        rng, pos_rng, axis_rng, angle_rng = jax.random.split(rng, 4)
+        box_pos_noisy = box_pos_world + (2 * jax.random.uniform(pos_rng, shape=box_pos_world.shape) - 1) \
+            * lvl * self._config.noise_config.scales.box_pos
+        rand_axis = jax.random.normal(axis_rng, shape=(3,))
+        rand_axis = rand_axis / (jp.linalg.norm(rand_axis) + 1e-6)
+        rand_angle = (2 * jax.random.uniform(angle_rng) - 1) * lvl * self._config.noise_config.scales.box_ori
+        noise_quat = math.axis_angle_to_quat(rand_axis, rand_angle)
+        box_quat_noisy = math.quat_mul(box_quat_world, noise_quat)
+        return rng, box_pos_noisy, box_quat_noisy
 
     def _re_boxgf(self, gf_vel: jax.Array, lin_vel: jax.Array, sdf: jax.Array,
                   crossed: jax.Array, cmd_vel: jax.Array, tau: float = 1.5) -> jax.Array:
@@ -1228,15 +1269,17 @@ class G1CaTraEnv(G1CatEnv):
         joint_vel = data.qvel[6:6 + NUM_ROBOT_JOINTS]
         gait_phase = jp.concatenate([jp.cos(info["phase"]), jp.sin(info["phase"])])
 
-        # Box pose in pelvis frame (for deployable state)
+        # Box pose in pelvis frame. The deployable state uses the NOISY box estimate
+        # (imperfect box tracking) shared with the box-corner PF; the privileged state below
+        # uses the ground-truth world pose.
         pelvis_pos = data.xpos[self._pelvis_body_id]
         pelvis_rot = data.site_xmat[self._pelvis_imu_site_id].reshape(3, 3)
         pelvis_xquat = data.xquat[self._pelvis_body_id]
+        pelvis_xquat_conj = pelvis_xquat * jp.array([1., -1., -1., -1.])
         box_pos_world = data.xpos[self._box_body_id]
         box_quat_world = data.xquat[self._box_body_id]
-        box_pos_local = pelvis_rot.T @ (box_pos_world - pelvis_pos)
-        pelvis_xquat_conj = pelvis_xquat * jp.array([1., -1., -1., -1.])
-        box_quat_local = math.quat_mul(pelvis_xquat_conj, box_quat_world)
+        noisy_box_pos_local = pelvis_rot.T @ (info["box_pos_noisy"] - pelvis_pos)
+        noisy_box_quat_local = math.quat_mul(pelvis_xquat_conj, info["box_quat_noisy"])
 
         # Box world-frame velocity (for privileged)
         box_linvel_world = data.qvel[BOX_QVEL_START:BOX_QVEL_START + 3]
@@ -1349,7 +1392,7 @@ class G1CaTraEnv(G1CatEnv):
             info["motor_targets"][self.action_joint_ids],
             command, info["foot_height"], gait_phase,
             pf,
-            box_pos_local, box_quat_local, info["box_size"],
+            noisy_box_pos_local, noisy_box_quat_local, info["box_size"],
             info["box_mass"].reshape(1),
         ])
 

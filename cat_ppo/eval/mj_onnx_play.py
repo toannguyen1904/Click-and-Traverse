@@ -16,7 +16,7 @@ import onnxruntime as rt
 import tyro
 
 import cat_ppo
-from cat_ppo.eval.mj_onnx_test import _episode_status
+from cat_ppo.eval.mj_onnx_test import _episode_status, _set_box_noise
 
 
 @dataclass
@@ -27,11 +27,12 @@ class Args:
     onnx_path: str = None
     pri: bool = False
     obs_path: str = 'data/assets/TypiObs/empty'
-    goal_x: float = 1.8       # base x (m) counted as a completed traversal (success)
+    goal_x: float = 1.6       # base x (m) counted as a completed traversal (success)
     box_inflation: bool = True  # G1CaTra: box observes gf_inflation.npy (True) or regular gf.npy (False). Read from the checkpoint's config.json when available; this is only a fallback.
     yaw: float = 0.0          # initial robot yaw in degrees (0 = default forward direction)
     box_size: str = None      # box half-extents as "x,y,z" in metres (e.g. "0.15,0.20,0.15")
     box_mass: float = None    # box mass in kg (e.g. 1.5)
+    box_noise: bool = True    # add box position/orientation tracking noise to the deployable obs (False -> ground-truth box)
     stage1_steps: int = -1    # for G1CaTra: override stage 1 length; -1 = use task default
     warmstart_states_path: str = None  # path to .npz warm-start file; starts episode in Stage 2
     warmstart_idx: int = -1   # which saved state to load (-1 = random)
@@ -85,6 +86,7 @@ def play(args: Args):
         env_cfg.warmstart_states_path = args.warmstart_states_path
         if args.stage1_steps < 0 and hasattr(env_cfg, "stage1_steps"):
             env_cfg.stage1_steps = 0
+    _set_box_noise(env_cfg, args.box_noise)
     env = env_class(task_type=env_cfg.task_type, config=env_cfg, headless=args.record)
     env.pri = args.pri
 

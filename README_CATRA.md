@@ -79,7 +79,7 @@ Both tasks use an **asymmetric actor-critic** design: the policy sees `state` an
 
 #### `state` (239-dim) — actor input, deployable on real robot
 
-The PF subblock is **not additively noised** — only `gyro`/`gvec`/`joint_angles`/`joint_vel` get noise injection. The body and box PF subblocks use 5-step-delayed samples transformed into the navigation frame (to simulate odometry latency at deployment).
+Additive noise is injected on `gyro`/`gvec`/`joint_angles`/`joint_vel`. The **body** PF subblock is not additively noised. The box pose (`box_pos_local`/`box_quat_local`) **and** the **box** PF subblock (`box_pf`) share a single noisy box-pose estimate that mimics imperfect box tracking: the box PF is sampled at the corners of the *noised* box pose (±5 cm / ±5°), not the ground-truth pose. The body and box PF subblocks additionally use 5-step-delayed samples transformed into the navigation frame (to simulate odometry latency at deployment).
 
 | Field | Dims | Notes |
 |-------|------|-------|
@@ -93,9 +93,9 @@ The PF subblock is **not additively noised** — only `gyro`/`gvec`/`joint_angle
 | `foot_height` | 1 | Target foot height for gait |
 | `gait_phase` | 4 | cos+sin of 2D gait clock (left + right) |
 | `body_pf` | 77 | Nav-frame PF fields (delayed) for 11 body sites: head, pelvis, torso (×1), feet, hands, knees, shoulders (×2); gf(3)+bf(3)+df(1)=7 per site |
-| `box_pf` | 56 | Nav-frame PF fields (delayed) for the **8 corners** of the box; gf(3)+bf(3)+df(1)=7 per corner; bf zeroed and df clipped to [−1, 0.5] when df > 0.5 |
-| `box_pos_local` | 3 | Box center position in pelvis frame |
-| `box_quat_local` | 4 | Box orientation in pelvis frame (wxyz) |
+| `box_pf` | 56 | Nav-frame PF fields (delayed) for the **8 corners** of the box, sampled at the **noised** box pose (box-tracking error); gf(3)+bf(3)+df(1)=7 per corner; bf zeroed and df clipped to [−1, 0.5] when df > 0.5 |
+| `box_pos_local` | 3 | Box center position in pelvis frame `[+ noise: ±5 cm per axis]` |
+| `box_quat_local` | 4 | Box orientation in pelvis frame (wxyz) `[+ noise: ±5° random axis-angle]` |
 | `box_size` | 3 | Box half-extents (hx, hy, hz) |
 | `box_mass` | 1 | Box mass in kg (DR-randomized per env) |
 | **Total** | **239** | |
@@ -315,6 +315,7 @@ MjxEnv (mujoco_playground)
 
 - **Stage inference (no explicit flag)**: CaTra no longer appends a stage flag to the observation. The policy infers the Stage 1→2 transition from the `command` field (zeros in Stage 1, PF-derived in Stage 2). With warm-start (`stage1_steps=0`) the episode is entirely Stage 2.
 - **Box mass in obs**: Both actor `state` and critic `privileged_state` carry the (DR-randomized) box mass as a scalar alongside `box_size`, so the policy can adapt grasp/carry effort to the box's weight.
+- **Box tracking noise (deployable obs only, single shared estimate)**: To mimic imperfect box tracking at deployment, one noisy box-pose estimate per step is drawn (`_noisy_box_pose`): uniform `±5 cm` per xyz axis on position, plus a random-axis, `±5°` axis-angle perturbation right-multiplied onto the orientation. Magnitudes are `noise_config.scales.box_pos` (0.05 m) and `noise_config.scales.box_ori` (`deg2rad(5)`), gated by `noise_config.level`. This single estimate (stashed in `info["box_pos_noisy"]`/`box_quat_noisy` by `reset`/`step`) drives **both** the deployable `box_pos_local`/`box_quat_local` (pelvis-frame transform in `_get_obs`) **and** the `box_pf` corners (`box_corners_delay` is built from the noised pose, so `boxgf_delay`/`boxbf_delay`/`boxdf_delay` inherit the same error) — so the policy sees one coherent noisy box estimate across both channels. The critic `privileged_state` keeps the noiseless world-frame `box_pos_world`/`box_quat_world` and the ground-truth `boxgf`/`boxbf`/`boxdf`; the `boxgf`/`boxdf` **rewards** and box-corner **termination** also use the ground-truth `box_corners`. The `*Pri` teachers (and DAgger `teacher_state`) use the clean privileged obs. Implemented in `G1CaTraEnv`, so it is inherited by `G1CaTra`, `G1CaTra2A`, and the DAgger student variants. The CPU inference env `play_catra.py` (used by `mj_onnx_play` / `mj_onnx_test`) mirrors the same shared-estimate box noise for the deployable actor obs — gated by `noise_config.level` (like the proprio noise it already applies), so playback/eval reflects real box-tracking conditions; the `--pri` teacher branch keeps the clean box pose + PF. Both eval scripts expose a `--box-noise` / `--no-box-noise` flag (default on) that toggles **only** the box position/orientation noise (by zeroing the `box_pos`/`box_ori` scales) while leaving the proprio noise intact — use `--no-box-noise` for a ground-truth-box eval.
 - **Warm-start**: When `warmstart_states_path` is set, `reset()` loads `(qpos, qvel)` directly from the pre-generated `.npz` (no physics rollout inside reset). Box mass/size are carried exactly from the pickup generation run.
 - **G1CaTraPri obs construction**: `G1CaTraPriEnv._get_obs` calls `super()._get_obs()` and slices `priv[:-31]` to form the actor state. Because the slice is structural, the bit-exact identity `G1CaTra.privileged_state[:-31] == G1CaTraPri.state` holds for the same initial state.
 - **JIT-friendly reward gating**: Both stage reward dicts are computed every step; `jp.where(step < stage1_steps, ...)` gates which set contributes to the return. Dict shape is static — no dynamic branching.

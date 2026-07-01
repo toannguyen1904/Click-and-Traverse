@@ -71,7 +71,7 @@ class Args:
     pri: bool = False
     num_episodes: int = 50
     seed: int = 42
-    goal_x: float = 1.8                 # base x (m) counted as a completed traversal
+    goal_x: float = 1.6                 # base x (m) counted as a completed traversal
     use_ckpt_config: bool = True        # apply the run's config.json over the registry config
     # generalization-test knobs (passed straight to env.reset)
     warmstart_path: Optional[str] = None    # override config.warmstart_states_path; loads holding-box states
@@ -80,6 +80,24 @@ class Args:
     ang_offset_deg: float = 0.0         # random init yaw [-v, v] deg
     max_steps: Optional[int] = None     # default -> env_config.episode_length
     render: bool = False                # launch the MuJoCo viewer (needs a display)
+    box_noise: bool = True              # add box position/orientation tracking noise to the deployable obs (False -> ground-truth box)
+
+
+def _set_box_noise(env_cfg, enabled: bool):
+    """Toggle box position/orientation observation noise for playback/eval.
+
+    When disabled, zero the box noise scales (box_pos/box_ori) so the deployable obs sees the
+    ground-truth box pose + PF. Proprio noise (gyro/gravity/joint) is left untouched. No-op if
+    the config predates the box noise scales."""
+    scales = getattr(getattr(env_cfg, "noise_config", None), "scales", None)
+    if scales is None or not hasattr(scales, "box_pos"):
+        return
+    if enabled:
+        print(f"[eval] box tracking noise ENABLED (box_pos={scales.box_pos}, box_ori={scales.box_ori})")
+        return
+    scales.box_pos = 0.0
+    scales.box_ori = 0.0
+    print("[eval] box tracking noise DISABLED (box_pos/box_ori scales set to 0)")
 
 
 def _apply_ckpt_config(env_cfg, exp_name):
@@ -181,6 +199,7 @@ def play(args: Args):
     env_cfg.pf_config.path = args.obs_path
     if args.warmstart_path is not None:
         env_cfg.warmstart_states_path = args.warmstart_path
+    _set_box_noise(env_cfg, args.box_noise)
 
     env_class = cat_ppo.registry.get(args.task, "play_env_class")
     env = env_class(task_type=env_cfg.task_type, config=env_cfg, headless=not args.render)
@@ -204,13 +223,28 @@ def play(args: Args):
             onnx_path = cat_ppo.get_latest_ckpt(args.exp_name) / "policy.onnx"
         policy = _Policy.load([onnx_path])
 
+    # Pre-select the warm-start index for every episode from a DEDICATED rng, independent of
+    # the global np.random stream consumed by per-step obs noise. This guarantees the same
+    # set of initial states across runs with the same --seed, regardless of the policy being
+    # evaluated or flags like --box-noise (which change how much global RNG each rollout uses).
+    if getattr(env, "_ws_qpos", None) is not None and args.warmstart_idx < 0:
+        n_ws = env._ws_qpos.shape[0]
+        episode_indices = np.random.default_rng(args.seed).integers(0, n_ws, size=args.num_episodes)
+        print(f"[mj_onnx_test] pre-selected {args.num_episodes} warm-start indices "
+              f"(seed={args.seed}, N={n_ws}): first 8 = {episode_indices[:8].tolist()}")
+    else:
+        episode_indices = np.full(args.num_episodes, args.warmstart_idx, dtype=int)
+
     list_succ = []
     list_completed = []
     reasons = Counter()
 
-    for _ in tqdm.tqdm(range(args.num_episodes), desc="Evaluating"):
+    for ep in tqdm.tqdm(range(args.num_episodes), desc="Evaluating"):
+        # Re-seed the global rng per episode so any init-pose perturbation and obs noise are
+        # reproducible run-to-run and independent of the previous episode's trajectory length.
+        np.random.seed(args.seed + ep)
         state = env.reset(
-            warmstart_idx=args.warmstart_idx,
+            warmstart_idx=int(episode_indices[ep]),
             pos_offset=args.pos_offset,
             ang_offset_deg=args.ang_offset_deg,
         )
