@@ -228,6 +228,13 @@ class PlayG1PickupEnv(BaseEnv):
         pelvis_conj = pelvis_xquat * np.array([1., -1., -1., -1.])
         box_quat_local = _quat_mul(pelvis_conj, box_xquat_world)
 
+        # Box pose noise (imperfect box tracking): +/- box_pos per axis; +/- box_ori axis-angle.
+        box_pos_local = box_pos_local + (2 * np.random.rand(3) - 1) * nl * ns.box_pos
+        rand_axis = np.random.randn(3)
+        rand_axis = rand_axis / (np.linalg.norm(rand_axis) + 1e-6)
+        rand_angle = (2 * np.random.rand() - 1) * nl * ns.box_ori
+        box_quat_local = _quat_mul(box_quat_local, _axis_angle_to_quat(rand_axis, rand_angle))
+
         box_size = info["box_size"]
 
         ids = self.action_joint_ids
@@ -372,3 +379,9 @@ def _quat_mul(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
         w1*y2 - x1*z2 + y1*w2 + z1*x2,
         w1*z2 + x1*y2 - y1*x2 + z1*w2,
     ])
+
+
+def _axis_angle_to_quat(axis: np.ndarray, angle: float) -> np.ndarray:
+    """wxyz quaternion for a rotation of `angle` rad about unit `axis`."""
+    s, c = np.sin(angle * 0.5), np.cos(angle * 0.5)
+    return np.array([c, axis[0] * s, axis[1] * s, axis[2] * s])

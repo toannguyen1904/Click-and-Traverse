@@ -243,6 +243,8 @@ def g1_pickup_task_config() -> config_dict.ConfigDict:
                 joint_vel=1.5,
                 gravity=0.05,
                 gyro=0.2,
+                box_pos=0.05,                 # +/- 5 cm per xyz axis (box tracking error)
+                box_ori=float(np.deg2rad(5.0)),  # +/- 5 deg random axis-angle perturbation
             ),
         ),
         reward_config=config_dict.create(
