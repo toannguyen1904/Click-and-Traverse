@@ -200,12 +200,16 @@ def _make_domain_randomize_catra():
 domain_randomize_catra = _make_domain_randomize_catra()
 
 
-def _make_domain_randomize_catra_warmstart(ws_box_mass: "jax.Array", ws_box_size: "jax.Array"):
+def _make_domain_randomize_catra_warmstart(ws_box_mass: "jax.Array", ws_box_size: "jax.Array",
+                                           indices: "jax.Array" = None):
     """Factory: returns a DR function that sources box mass/size from saved state file.
 
-    Each env i receives state index i (sequential), box_mass and box_size from
-    ws_box_mass[i] / ws_box_size[i].  The index is encoded in qpos0[0] so reset()
-    can retrieve it without knowing the env axis position.
+    Each env i receives state index `indices[i]` (default: i, sequential), with box_mass
+    and box_size from ws_box_mass[idx] / ws_box_size[idx].  The index is encoded in qpos0[0]
+    so reset() can retrieve it without knowing the env axis position.
+
+    `indices` lets an offline generator draw a different slice of the state pool per batch
+    (e.g. (arange(num_envs) + offset) % N); when None it falls back to arange(num_envs).
     """
     _mj = mujoco.MjModel.from_xml_path(str(consts.CATRA_FLAT_TERRAIN_XML))
     _box_geom_id = _mj.geom("box_geom").id
@@ -265,8 +269,8 @@ def _make_domain_randomize_catra_warmstart(ws_box_mass: "jax.Array", ws_box_size
             return (pair_friction, dof_frictionloss, dof_armature, body_ipos, body_mass, qpos0, geom_size)
 
         num_envs = rng.shape[0]
-        indices = jp.arange(num_envs)
-        (pair_friction, frictionloss, armature, body_ipos, body_mass, qpos0, geom_size) = rand_dynamics(rng, indices)
+        env_indices = jp.arange(num_envs) if indices is None else indices
+        (pair_friction, frictionloss, armature, body_ipos, body_mass, qpos0, geom_size) = rand_dynamics(rng, env_indices)
 
         in_axes = jax.tree_util.tree_map(lambda x: None, model)
         in_axes = in_axes.tree_replace({
@@ -300,6 +304,16 @@ def make_warmstart_domain_randomize_catra(states_path: str):
     ws_box_mass = jp.array(npz["box_mass"])   # (N,)
     ws_box_size = jp.array(npz["box_size"])   # (N, 3)
     return _make_domain_randomize_catra_warmstart(ws_box_mass, ws_box_size)
+
+
+def make_warmstart_domain_randomize_catra_indexed(states_path: str, indices: "jax.Array"):
+    """Like make_warmstart_domain_randomize_catra but loads warm-start states by an explicit
+    per-env `indices` array instead of arange(num_envs). Used by offline state generators that
+    roll out several batches and want each batch to draw a different slice of the state pool."""
+    npz = np.load(states_path)
+    ws_box_mass = jp.array(npz["box_mass"])   # (N,)
+    ws_box_size = jp.array(npz["box_size"])   # (N, 3)
+    return _make_domain_randomize_catra_warmstart(ws_box_mass, ws_box_size, indices=indices)
 
 
 def _make_warmstart_only_catra(ws_box_mass: "jax.Array", ws_box_size: "jax.Array"):
